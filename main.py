@@ -15,7 +15,6 @@ from fastapi import FastAPI, Form, Depends, HTTPException, status
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr
-from sklearn.cluster import KMeans
 from sqlalchemy.orm import Session
 import torch
 from ultralytics import YOLO
@@ -23,6 +22,8 @@ from ultralytics import YOLO
 from database import get_db, engine
 from models import Base, User, Match
 from tactical_engine import TacticalEngine
+from pitch_filters import (build_grass_mask, foot_on_grass, CameraMotion,
+                           StationaryFilter, extract_dominant_color)
 from auth import hash_password, verify_password, create_access_token, get_current_user
 
 Base.metadata.create_all(bind=engine)
@@ -36,25 +37,6 @@ executor = ThreadPoolExecutor(max_workers=4)
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 model = YOLO('yolov8x.pt' if device == 'cuda' else 'yolov8n.pt')
 print(f"🔥 Tactical AI Motor aktív: {device.upper()}")
-
-def extract_dominant_color(image_crop):
-    if image_crop.size == 0:
-        return [0, 0, 0]
-    h, w, _ = image_crop.shape
-    torso = image_crop[int(h * 0.2):int(h * 0.6), int(w * 0.2):int(w * 0.8)]
-    if torso.size == 0:
-        return [0, 0, 0]
-
-    torso_rgb = cv2.cvtColor(torso, cv2.COLOR_BGR2RGB)
-    pixels = torso_rgb.reshape(-1, 3)
-    if len(pixels) < 5:
-        return [0, 0, 0]
-
-    kmeans = KMeans(n_clusters=2, n_init=3, random_state=42)
-    kmeans.fit(pixels)
-    counts = np.bincount(kmeans.labels_)
-    dominant_color = kmeans.cluster_centers_[np.argmax(counts)]
-    return [int(c) for c in dominant_color]
 
 def check_color_match(hsv_frame, x1, y1, x2, y2, lower, upper):
     if np.array_equal(lower, np.array([0, 0, 0])) and np.array_equal(upper, np.array([179, 255, 255])):
@@ -137,6 +119,10 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
     roi_top_pct = max(config["roi_top_pct"], 0.28) # Felső horizont lejjebb hozva
     min_h = max(height * config["min_player_height_pct"], 50.0) # Min. 50px magas játékos
 
+    grass_lower, grass_upper = colors["grass"]
+    camera_motion = CameraMotion()
+    stationary_filter = StationaryFilter(fps, config["stationary_window_sec"], config["stationary_max_move"])
+
     process = subprocess.Popen([
         "ffmpeg.exe", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
         "-s", f"{width}x{height}", "-pix_fmt", "bgr24", "-r", str(fps),
@@ -149,7 +135,10 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
     with open(debug_log_path, "w", encoding="utf-8") as debug_file:
         debug_file.write(f"=== TACTICAL ANALYZER RUN LOG: {clip_id} ===\n")
         debug_file.write(f"Videó felbontás: {width}x{height} @ {fps} FPS, Összes képkocka: {total_frames}\n")
-        debug_file.write(f"Dinamikus Felső ROI Százalék: {roi_top_pct:.2f}, Min Magasság: {min_h:.1f}px\n\n")
+        debug_file.write(f"Dinamikus Felső ROI Százalék: {roi_top_pct:.2f}, Min Magasság: {min_h:.1f}px\n")
+        debug_file.write(f"Fix trapéz szűrő: {'BE' if config['use_static_roi'] else 'KI'}, "
+                         f"Fű arány min.: {config['grass_min_ratio']:.2f}, "
+                         f"Álló alak ablak: {config['stationary_window_sec']:.1f}s\n\n")
 
         while cap.isOpened():
             ret, frame = cap.read()
@@ -158,6 +147,10 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
 
             current_time_sec = start_sec + (frames_done / fps)
             hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            grass_mask, grass_scale = build_grass_mask(hsv_frame, grass_lower, grass_upper)
+            camera_motion.update(frame)
+            if frames_done % 250 == 0:
+                stationary_filter.prune(frames_done)
             results = model.track(frame, persist=True, tracker="bytetrack.yaml", device=device, verbose=False)
 
             raw_detections = []
@@ -188,18 +181,32 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
                             debug_file.write(f"F#{frames_done} ID#{tid}: ELDOBVA -> Nem álló alak (Arány={box_w/box_h:.2f})\n")
                             continue
 
-                        # 3. Dinamikus Trapéz Pályahatár Szűrés
-                        in_pitch, reason = is_point_in_pitch_trapezoid(foot_x, foot_y, width, height, roi_top_pct, config["roi_bottom_pct"])
-                        if not in_pitch:
-                            debug_file.write(f"F#{frames_done} ID#{tid}: ELDOBVA -> {reason}\n")
-                            continue
+                        # 3. Fix trapéz pályahatár (csak álló kamerához – a forgó Veo képnél kikapcsolva)
+                        if config["use_static_roi"]:
+                            in_pitch, reason = is_point_in_pitch_trapezoid(foot_x, foot_y, width, height, roi_top_pct, config["roi_bottom_pct"])
+                            if not in_pitch:
+                                debug_file.write(f"F#{frames_done} ID#{tid}: ELDOBVA -> {reason}\n")
+                                continue
 
-                        crop = frame[max(0, y1):min(height, y2), max(0, x1):min(width, x2)]
-                        dominant_color = extract_dominant_color(crop)
+                        # 4. Fűszűrő: a lábnak füvön kell állnia (lelátó, kispad, reklámtábla mögött nincs fű)
+                        on_grass, grass_ratio = foot_on_grass(grass_mask, grass_scale, x1, x2, y2, config["grass_min_ratio"])
+                        if not on_grass:
+                            debug_file.write(f"F#{frames_done} ID#{tid}: ELDOBVA -> Nem füvön áll (fű arány={grass_ratio:.2f})\n")
+                            continue
 
                         is_k1 = check_color_match(hsv_frame, x1, y1, x2, y2, colors["keeper1"][0], colors["keeper1"][1])
                         is_k2 = check_color_match(hsv_frame, x1, y1, x2, y2, colors["keeper2"][0], colors["keeper2"][1])
                         is_keeper = is_k1 or is_k2
+
+                        # 5. Álló alak szűrő (néző, edző) – a kapus kivétel, ő sokáig állhat egy helyben
+                        stab_x, stab_y = camera_motion.stabilize(foot_x, foot_y)
+                        is_static = stationary_filter.update(tid, frames_done, stab_x, stab_y, box_h)
+                        if is_static and not is_keeper:
+                            debug_file.write(f"F#{frames_done} ID#{tid}: ELDOBVA -> Mozdulatlan alak ({config['stationary_window_sec']:.1f}s)\n")
+                            continue
+
+                        crop = frame[max(0, y1):min(height, y2), max(0, x1):min(width, x2)]
+                        dominant_color = extract_dominant_color(crop, grass_lower, grass_upper)
 
                         if is_k1 or check_color_match(hsv_frame, x1, y1, x2, y2, colors["team1"][0], colors["team1"][1]):
                             team_id = 1
@@ -273,6 +280,10 @@ async def cut_raw_endpoint(
     roi_top_pct: float = Form(0.28),
     roi_bottom_pct: float = Form(0.10),
     min_player_height_pct: float = Form(0.048),
+    use_static_roi: bool = Form(False),
+    grass_min_ratio: float = Form(0.3),
+    stationary_window_sec: float = Form(4.0),
+    stationary_max_move: float = Form(0.5),
     grass_hsv_lower: str = Form("30,40,40"), grass_hsv_upper: str = Form("85,255,255"),
     ref_hsv_lower: str = Form("0,0,0"), ref_hsv_upper: str = Form("179,255,255"),
     team1_hsv_lower: str = Form("0,0,0"), team1_hsv_upper: str = Form("179,255,255"),
@@ -282,6 +293,8 @@ async def cut_raw_endpoint(
 ):
     config = {
         "roi_top_pct": roi_top_pct, "roi_bottom_pct": roi_bottom_pct, "min_player_height_pct": min_player_height_pct,
+        "use_static_roi": use_static_roi, "grass_min_ratio": grass_min_ratio,
+        "stationary_window_sec": stationary_window_sec, "stationary_max_move": stationary_max_move,
         "grass_lower": [int(x) for x in grass_hsv_lower.split(',')], "grass_upper": [int(x) for x in grass_hsv_upper.split(',')],
         "ref_lower": [int(x) for x in ref_hsv_lower.split(',')], "ref_upper": [int(x) for x in ref_hsv_upper.split(',')],
         "team1_lower": [int(x) for x in team1_hsv_lower.split(',')], "team1_upper": [int(x) for x in team1_hsv_upper.split(',')],
