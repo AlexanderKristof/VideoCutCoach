@@ -1,0 +1,15 @@
+bin/
+obj/
+.vs/
+__pycache__/
+venv/
+.venv/
+runs/
+*.zip
+*.pt
+*.onnx
+*.engine
+*.mp4
+*.mov
+*.avi
+*.mkv
