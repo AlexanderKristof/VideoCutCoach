@@ -17,3 +17,11 @@ runs/
 # Szintetikus teszt-meccs (tools/synth_match.py) kimenetei
 *_gt.json
 e2e_summary.json
+
+# Helyi titkos kulcs, naplók, letöltött modellek (app_paths.py, engine_launcher.py)
+.tacanaly_secret.key
+logs/
+models/
+packaging/build/
+packaging/dist/
+packaging/.venv*/

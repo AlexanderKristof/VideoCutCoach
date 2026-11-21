@@ -24,7 +24,8 @@ kapus események, hőtérkép, jelenetek kivágása, taktikai tábla és felüln
    pip install -r requirements.txt
    ```
 5. Focira tanított modell (ajánlott): lásd `docs/MODELL_BEALLITAS.md`. Enélkül az általános
-   `yolov8x.pt` / `yolov8n.pt` modellt használja (első indításkor letölti).
+   `yolov8x.pt` / `yolov8n.pt` modellt használja (az első elemzéskor tölti be / tölti le – a szerver
+   indulását ez nem lassítja; a `models\` mappába tett súlyfájlt is megtalálja).
 
 ## Indítás
 
@@ -46,6 +47,13 @@ Hasznos kapcsolók (`python elemzes.py --help`):
   (nélküle a program a pályavonalakból kalibrál)
 - `--csapat1-balra` – ha a hazai csapat az 1. félidőben balra támad
 
+**Asztali alkalmazásként (MAUI-ból indítva, Python nélkül):** a motor PyInstallerrel önálló
+programmá csomagolható (`packaging\build_engine.ps1`); a MAUI a `tacanaly_engine.exe --port 0
+--parent-pid <pid>` paranccsal indítja, a `TACANALY_READY port=...` sorból olvassa a portot, és
+`/health`, `/shutdown`, `/models/*` végpontokkal kezeli. Ilyenkor az adatok a
+`%LOCALAPPDATA%\TacAnaly` mappába kerülnek. Részletek: `packaging/README_CSOMAGOLAS.md`.
+Fejlesztéshez ugyanez: `python engine_launcher.py --port 0 --data-dir adat --console`.
+
 ## Mit kapsz eredményül (a kimeneti mappában)
 
 - `match_<id>.mp4` – a meccs a szünet nélkül; `half1_` / `half2_` – a félidők
@@ -61,6 +69,7 @@ Hasznos kapcsolók (`python elemzes.py --help`):
 - `docs/FEJLESZTESI_TERV.md` – a teljes felépítés, minden végpont mezőkkel
 - `docs/HATTERFELADATOK.md` – háttérfeladatok (haladásjelzés a MAUI-ban), parancssor
 - `docs/MODELL_BEALLITAS.md` – modell, gyors mód, osztálynevek
+- `packaging/README_CSOMAGOLAS.md` – telepítő, a motor indítása / leállítása a MAUI-ból, licencek
 
 ## Tesztek
 

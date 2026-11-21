@@ -6,7 +6,8 @@ Forrás (erősorrendben):
        TACTICAL_MODEL_WEIGHTS   – a .pt súlyfájl útvonala (mindkét eszközre)
        TACTICAL_DETECT_EVERY_N  – csak minden N. képkockán fut felismerés (gyors mód)
        TACTICAL_MODEL_CONFIG    – a JSON beállítófájl útvonala
-  2. model_config.json (opcionális, a main.py mellett)
+  2. model_config.json (opcionális, a main.py mellett; a telepített alkalmazásban az adatmappában,
+     lásd app_paths.py)
   3. alapértelmezés: yolov8x.pt (CUDA) / yolov8n.pt (CPU), COCO osztályok, minden képkocka
 
 Ez a modul szándékosan nem importál torch-ot / ultralytics-et, hogy önállóan tesztelhető legyen.
@@ -67,8 +68,9 @@ def load_model_config(config_path=None, env=None):
     cfg = dict(DEFAULTS)
 
     if config_path is None:
-        config_path = env.get("TACTICAL_MODEL_CONFIG") or os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), DEFAULT_CONFIG_FILENAME)
+        # fejlesztői módban a main.py mellett, alkalmazás-módban az adatmappában (app_paths.py)
+        import app_paths
+        config_path = env.get("TACTICAL_MODEL_CONFIG") or app_paths.model_config_path(env)
 
     if config_path and os.path.isfile(config_path):
         try:
