@@ -598,6 +598,13 @@ def print_report(results, gt, tol, h_err, ideal=None):
     row = f"{'helyezkedési hiba':18s} {'':6s} " + " ".join(f"{r['events']['_total']['positioning_errors']:>16d}"
                                                        for r in results.values())
     print(row)
+    # gól: megerősített (középkezdés / a vonal mögött maradt) vs. 'Valószínű GÓL' (megerősítetlen)
+    gc = []
+    for r in results.values():
+        goals = [e for e in r.get("detected_events", []) if e["type"] == "goal"]
+        conf = sum(1 for e in goals if e.get("confirmed", True))
+        gc.append(f"{conf} megerősített / {len(goals) - conf} valószínű")
+    print(f"{'gól megerősítés':18s} {'':6s} " + " ".join(f"{c:>16s}" for c in gc))
     if ideal is not None:
         tot = ideal["_total"]
         per = ", ".join(f"{EVENT_LABELS[t]} {ideal[t]['tp']}/{ideal[t]['gt']}" for t in EVENT_TYPES if ideal[t]["gt"])
@@ -703,7 +710,7 @@ def main():
                 "players": score_players(r["records"], gt, r["min_h_pct"] * gt["height"]),
                 "events": score_events(r["events"], gt["events"], tol),
                 "elapsed": r["elapsed"], "fake_stats": r["fake_stats"],
-                "detected_events": [{k: e.get(k) for k in ("type", "time", "team")} for e in r["events"]],
+                "detected_events": [{k: e.get(k) for k in ("type", "time", "team", "confirmed", "confirmation")} for e in r["events"]],
                 "pitch_tracking": r["pitch_tracking"], "calib_names": r["calib_names"],
             }
             if frames_dir and r["out_video"] and not oracle_mode(mode) and MODES[mode][4]:

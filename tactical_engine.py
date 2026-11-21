@@ -96,6 +96,36 @@ class TacticalEngine:
             return None
         return real_x, real_y
 
+    # LABDA-ÁTHELYEZÉS: a hálóban nyugvó labda (gól után; x a [-2,5; 0] / [105; 107,5] sávban, y a
+    # kapufák ±1 m-én) érvényes labda-pozíció. A labda KÖZÉPPONTJÁNAK vetülete ráadásul a kamerától
+    # távolabb esik (a szintetikus mérésben kb. 1 m), ezért a régi ±2 m-es doboz a hálóban lévő labdát
+    # szinte mindig kidobta (a gól-megerősítés emiatt maradt el). A hálón kívül marad a régi 2 m: a kapus
+    # kezében (~1 m magasan) tartott labda vetülete pl. az alapvonal mögé, a kapun kívülre esik, és az
+    # events.py ezt (a labda "eltűnését" a kapusnál) védésként értelmezi.
+    BALL_NET_TOL_X_M = 1.5     # a háló mélységén túl ennyi vetítési tűrés
+    BALL_NET_TOL_Y_M = 0.5     # a kapufák ±1 m-én túl ennyi
+
+    def ball_in_net_zone(self, x, y):
+        """A gólvonal mögött, a kapuhálóban (vetítési tűréssel) van-e a pont."""
+        lo, hi = 30.34 - 1.0 - self.BALL_NET_TOL_Y_M, 37.66 + 1.0 + self.BALL_NET_TOL_Y_M
+        depth = 2.5 + self.BALL_NET_TOL_X_M
+        return lo <= y <= hi and (-depth <= x <= 0.0 or self.pitch_length <= x <= self.pitch_length + depth)
+
+    def transform_ball_to_pitch(self, u, v, H):
+        """A labda képpontja -> pálya (m): mint transform_to_pitch, de a kapuhálóban lévő labdát is elfogadja."""
+        if H is None:
+            return None
+        pt = np.array([[[float(u), float(v)]]], dtype=np.float32)
+        q = cv2.perspectiveTransform(pt, H)[0][0]
+        x, y = float(q[0]), float(q[1])
+        if not (math.isfinite(x) and math.isfinite(y)):
+            return None
+        if self.ball_in_net_zone(x, y):
+            return x, y
+        if x < -2.0 or x > self.pitch_length + 2.0 or y < -2.0 or y > self.pitch_width + 2.0:
+            return None
+        return x, y
+
     def update_tracks(self, frame_idx, timestamp, detections, ball_pos, H):
         current_frame_players = []
 
@@ -119,7 +149,7 @@ class TacticalEngine:
 
         real_ball = None
         if ball_pos is not None and H is not None:
-            real_ball_coords = self.transform_to_pitch(ball_pos[0], ball_pos[1], H)
+            real_ball_coords = self.transform_ball_to_pitch(ball_pos[0], ball_pos[1], H)
             if real_ball_coords is not None:
                 real_ball = real_ball_coords
                 self.ball_trajectory.append((real_ball[0], real_ball[1], timestamp))
