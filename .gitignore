@@ -13,3 +13,7 @@ runs/
 *.mov
 *.avi
 *.mkv
+
+# Szintetikus teszt-meccs (tools/synth_match.py) kimenetei
+*_gt.json
+e2e_summary.json
