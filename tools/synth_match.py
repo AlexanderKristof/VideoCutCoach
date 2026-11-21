@@ -24,6 +24,7 @@ Kimenet:
 Példa:
     python3 tools/synth_match.py --out synth.mp4 --duration 60 --seed 7
     python3 tools/synth_match.py --out full.mp4 --segments "warmup:20,half1:90,break:30,half2:90"
+    python3 tools/synth_match.py --gt-only --gt meccs_gt.json --duration 120 --seed 6   # csak GT, ~2 mp
 
 Csak numpy + OpenCV + ffmpeg (subprocess) kell hozzá.
 """
@@ -1264,11 +1265,16 @@ def _r(v, n=2):
 
 
 def generate(out_path, gt_path=None, duration=60.0, width=1280, height=720, fps=25, seed=7,
-             segments=None, audio=True, crf=23, preset="veryfast", progress=True, save_frames=None):
+             segments=None, audio=True, crf=23, preset="veryfast", progress=True, save_frames=None,
+             gt_only=False):
     """
     A szintetikus meccs legenerálása. Visszatér: a ground-truth dict (és kiírja a JSON-t is).
     save_frames: {képkocka index: jpg útvonal} – mintaképek mentése.
+    gt_only: csak a szimuláció + ground-truth JSON (nincs renderelés / ffmpeg); a képkockákban
+             ilyenkor csak t, seg, ball (xyz, on) és xy szerepel (nincs H, cam, objs, uv).
     """
+    if gt_only:
+        return _generate_gt_only(out_path, gt_path, duration, fps, seed, segments, progress)
     ffmpeg = find_ffmpeg()
     if ffmpeg is None:
         raise RuntimeError("Nem található ffmpeg (PATH vagy FFMPEG_PATH)")
@@ -1388,6 +1394,48 @@ def generate(out_path, gt_path=None, duration=60.0, width=1280, height=720, fps=
     return gt
 
 
+def _generate_gt_only(out_path, gt_path, duration, fps, seed, segments, progress):
+    """Renderelés nélküli gyors ground truth (pl. az eseménydetektor offline kiértékeléséhez)."""
+    t_start = time.time()
+    rng = np.random.default_rng(seed)
+    segs = segments if isinstance(segments, list) else parse_segments(segments, duration)
+    sim = MatchSim(fps, segs, rng)
+    states = sim.run()
+    frames_gt = []
+    for st in states:
+        b = st["ball"]
+        frames_gt.append({
+            "t": _r(st["t"], 3), "seg": st["seg"],
+            "ball": {"xyz": [_r(b[0]), _r(b[1]), _r(b[2])], "on": bool(st["ball_vis"])},
+            "xy": [[_r(p[0]), _r(p[1])] for p in st["pos"][:sim.n_match]],
+        })
+    gt = {
+        "version": 1, "gt_only": True,
+        "video": None, "fps": fps, "n_frames": len(states),
+        "duration": round(len(states) / fps, 3), "seed": seed,
+        "pitch": {"length": L, "width": W},
+        "camera": {"position": CAM_POS.tolist(), "model": "tűlyuk, pan/tilt/zoom, torzítás nélkül"},
+        "segments": [{"name": n, "duration": d} for n, d in segs],
+        "periods": sim.periods,
+        "whistles": sim.whistles,
+        "passes": sim.passes,
+        "people": [{"id": p.id, "role": p.role, "team": p.team, "number": p.number} for p in sim.people],
+        "events": sorted(sim.events, key=lambda e: e["time"]),
+        "frame_fields": {
+            "xy": "minden játékos + bíró pálya-pozíciója (people sorrendjében, az első n_match elem)",
+            "ball": "xyz: pálya m + magasság; on: játékban / látható helyen van (nem viszik)",
+        },
+        "frames": frames_gt,
+    }
+    gt_path = gt_path or os.path.splitext(out_path)[0] + "_gt.json"
+    with open(gt_path, "w", encoding="utf-8") as f:
+        json.dump(gt, f, ensure_ascii=False, separators=(",", ":"))
+    if progress:
+        print(f"Kész (csak ground truth): {gt_path} ({len(states)} képkocka, {len(sim.events)} esemény, "
+              f"{time.time() - t_start:.1f} s)")
+    return gt
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Szintetikus focimeccs-videó és ground-truth JSON generálása tesztekhez.")
     ap.add_argument("--out", default="synth_match.mp4", help="kimeneti MP4 fájl (alap: synth_match.mp4)")
@@ -1401,6 +1449,8 @@ def main(argv=None):
                     help='szakaszok, pl. "warmup:20,half1:90,break:30,half2:90" (alap: egy félidő --duration hosszal)')
     ap.add_argument("--no-audio", action="store_true", help="hangsáv (sípszavak) nélkül")
     ap.add_argument("--crf", type=int, default=23, help="H.264 minőség (alap: 23)")
+    ap.add_argument("--gt-only", action="store_true",
+                    help="csak a ground-truth JSON (renderelés és ffmpeg nélkül, gyors)")
     ap.add_argument("--save-frames", default=None,
                     help="mintaképek mentése: 'index1,index2,...:könyvtár' (pl. '0,300,900:/tmp/kepek')")
     args = ap.parse_args(argv)
@@ -1410,7 +1460,7 @@ def main(argv=None):
         os.makedirs(d or ".", exist_ok=True)
         save = {int(i): os.path.join(d or ".", f"frame_{int(i):05d}.jpg") for i in idx.split(",") if i.strip()}
     generate(args.out, args.gt, args.duration, args.width, args.height, args.fps, args.seed,
-             args.segments, audio=not args.no_audio, crf=args.crf, save_frames=save)
+             args.segments, audio=not args.no_audio, crf=args.crf, save_frames=save, gt_only=args.gt_only)
     return 0
 
 
