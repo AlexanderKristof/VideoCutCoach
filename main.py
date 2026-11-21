@@ -36,6 +36,7 @@ from heatmap import TrackMetaCollector, compact_trajectories, generate_heatmaps_
 from clip_export import export_clips, DEFAULT_PRE_SEC, DEFAULT_POST_SEC
 from team_classifier import TeamClassifier, auto_teams_enabled
 from pitch_tracker import PitchTracker, parse_calib_points, draw_pitch_overlay as render_pitch_overlay
+from ball_tracker import BallTracker, draw_ball_state  # labdakövetés (Kálmán + jelölt-pontozás)
 
 Base.metadata.create_all(bind=engine)
 
@@ -248,6 +249,15 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
     last_referee_boxes = []
     last_ball_pixels = []
 
+    # --- LABDAKÖVETÉS (ball_tracker.py) ---
+    # config["ball_tracker"] = False esetén a régi működés (az utolsó küszöb feletti labda-detektálás)
+    ball_tracker = BallTracker(fps, frame_size=(width, height),
+                               min_conf=min(BALL_CONF, 0.15)) if config.get("ball_tracker", True) else None
+    ball_cand_conf = ball_tracker.min_conf if ball_tracker is not None else BALL_CONF
+    ball_cam_ref = None      # a CameraMotion összesített eltolása a legutóbbi követő-frissítéskor
+    last_ball_state = None
+    # --- /LABDAKÖVETÉS ---
+
     # A megosztott modellt / követőt az egész klip idejére lefoglaljuk (lásd model_lock),
     # és töröljük az előző elemzésből megmaradt ByteTrack állapotot
     with model_lock, open(debug_log_path, "w", encoding="utf-8") as debug_file:
@@ -296,12 +306,15 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
                 referee_boxes = []
                 ball_pixels = []
                 ball_pixel = None
+                ball_candidates = []  # LABDAKÖVETÉS: az összes jelölt a követőnek
 
                 for r in results:
-                    for box in [b for b in r.boxes if int(b.cls[0]) in role_classes["ball"] and float(b.conf[0]) > BALL_CONF]:
+                    for box in [b for b in r.boxes if int(b.cls[0]) in role_classes["ball"] and float(b.conf[0]) > ball_cand_conf]:
                         bx1, by1, bx2, by2 = map(int, box.xyxy[0])
-                        ball_pixel = (int((bx1 + bx2) / 2), int((by1 + by2) / 2))
-                        ball_pixels.append(ball_pixel)
+                        ball_candidates.append({"xyxy": (bx1, by1, bx2, by2), "conf": float(box.conf[0])})
+                        if float(box.conf[0]) > BALL_CONF:
+                            ball_pixel = (int((bx1 + bx2) / 2), int((by1 + by2) / 2))
+                            ball_pixels.append(ball_pixel)
 
                     # Bírók: nem kerülnek a játékosok közé, csak semleges színnel rajzoljuk ki őket
                     for box in [b for b in r.boxes if int(b.cls[0]) in role_classes["referee"]]:
@@ -391,6 +404,17 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
                                 'bbox': (x1, y1, x2, y2)
                             })
 
+                # --- LABDAKÖVETÉS: a képkocka labdája a követő kimenete (detektált vagy rövid ideig becsült) ---
+                if ball_tracker is not None:
+                    cam_now = camera_motion.offset.copy()
+                    cam_shift = None if ball_cam_ref is None else cam_now - ball_cam_ref
+                    ball_cam_ref = cam_now
+                    last_ball_state = ball_tracker.update(ball_candidates, camera_shift=cam_shift,
+                                                          grass_mask=grass_mask, grass_scale=grass_scale,
+                                                          frame_idx=frames_done)
+                    ball_pixel = last_ball_state.pixel
+                # --- /LABDAKÖVETÉS ---
+
                 if H_cur is not None:
                     valid_players, real_ball = engine_instance.update_tracks(frames_done, current_time_sec, raw_detections, ball_pixel, H_cur)
                 else:
@@ -408,8 +432,11 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
             if H_cur is not None and config.get("draw_pitch_overlay", True):
                 render_pitch_overlay(frame, H_cur)  # halvány pályavonalak: látszik, mennyire pontos a kalibráció
 
-            for bp in ball_pixels:
-                cv2.circle(frame, bp, 5, (0, 255, 255), -1)
+            if ball_tracker is not None:
+                draw_ball_state(frame, last_ball_state)  # LABDAKÖVETÉS: teli kör = detektált, üres = becsült
+            else:
+                for bp in ball_pixels:
+                    cv2.circle(frame, bp, 5, (0, 255, 255), -1)
 
             for x1, y1, x2, y2 in referee_boxes:
                 # Bíró: sárga keret fekete szegéllyel
@@ -452,6 +479,9 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
 
         if team_clf is not None:  # AUTO CSAPAT: a tanult klaszterek a naplóba
             debug_file.write("\n" + team_clf.describe() + "\n")
+
+        if ball_tracker is not None:  # LABDAKÖVETÉS: összesítés a naplóba
+            debug_file.write("\n" + ball_tracker.summary() + "\n")
 
     cap.release()
     process.stdin.close()
