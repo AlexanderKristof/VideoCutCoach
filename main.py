@@ -102,7 +102,7 @@ def is_point_in_pitch_trapezoid(foot_x, foot_y, width, height, roi_top_pct, roi_
         
     return True, "Pályán belül"
 
-def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, calib_points_str, config):
+def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, calib_points_str, config, progress=None):
     clip_id = str(uuid.uuid4())[:8]
     output_filename = f"raw_{clip_id}.mp4"
     output_path = os.path.abspath(os.path.join(CLIPS_DIR, output_filename))
@@ -349,6 +349,7 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
             frames_done += 1
             if frames_done % 25 == 0:
                 print(f"Feldolgozva: {frames_done}/{total_frames} képkocka ({(frames_done/total_frames)*100:.1f}%)")
+                if progress: progress(100.0 * frames_done / max(1, total_frames), f"{frames_done}/{total_frames} képkocka")  # háttérfeladat haladás (+ megszakítás)
 
     cap.release()
     process.stdin.close()
@@ -798,6 +799,162 @@ async def tactics_board_page():
         "<style>[hidden]{display:none!important}body{margin:0}</style></head><body>"
         + body + "</body></html>"
     )
+
+
+# ============================================================
+# HÁTTÉRFELADATOK (jobok) — a hosszú munkák nem blokkolják a kérést.
+# A kliens job azonosítót kap, és a GET /jobs/{id} végponton 1–2 mp-enként
+# lekérdezi a haladást. Lásd jobs.py, pipeline.py, docs/HATTERFELADATOK.md.
+# A fenti szinkron végpontok változatlanul működnek.
+# ============================================================
+import sys
+from fastapi import Request
+from fastapi.responses import JSONResponse
+import pipeline
+from jobs import JobManager
+
+job_manager = JobManager(os.path.join(CLIPS_DIR, "jobs"), max_workers=2)
+
+
+def _job_funcs():
+    # A már betöltött main modult adjuk át (python main.py esetén __main__), hogy ne töltődjön be újra
+    return pipeline.default_funcs(sys.modules[__name__])
+
+
+async def _form_dict(request: Request):
+    form = await request.form()
+    return {k: v for k, v in form.items() if isinstance(v, str)}
+
+
+def _form_error(message, code=400):
+    return JSONResponse(status_code=code, content={"status": "error", "message": message})
+
+
+def _run_match_job(progress, video_path, opts):
+    return pipeline.run_match_pipeline(video_path, opts, progress=progress, funcs=_job_funcs())
+
+
+@app.post("/jobs/analyze-match")
+async def analyze_match_job_endpoint(request: Request):
+    """A teljes meccs elemzése egy háttérfeladatként (félidők → vágás → elemzés → hőtérkép → klipek)."""
+    raw = await _form_dict(request)
+    video_path = raw.get("video_path", "")
+    if not video_path or not os.path.exists(video_path):
+        return _form_error("A videófájl nem található.")
+    try:
+        opts = pipeline.coerce_options(raw)
+        pipeline.parse_compilations(opts["compilations"])
+        pipeline.build_analysis_config(opts)  # a HSV mezők ellenőrzése még a job indítása előtt
+    except ValueError as ex:
+        return _form_error(str(ex))
+    params = {"video_path": video_path, **{k: opts[k] for k in pipeline.PIPELINE_DEFAULTS},
+              "calib_points": opts["calib_points"], "team1_attacks_right": opts["team1_attacks_right"]}
+    job_id = job_manager.submit("analyze-match", _run_match_job, video_path, opts, params=params)
+    return {"status": "success", "job_id": job_id, "status_url": f"/jobs/{job_id}"}
+
+
+def _job_cut_raw(progress, raw):
+    url, local, events_path = cut_and_analyze_sync(
+        raw.get("video_path", ""), float(raw.get("start_sec", 0.0)), float(raw.get("end_sec", 30.0)),
+        pipeline._to_bool(raw.get("dev_mode", True)), raw.get("detect_mode", "team"),
+        raw.get("calib_points", ""), pipeline.build_analysis_config(raw), progress=progress)
+    return {"status": "success", "clip_url": url, "local_path": local, "events_path": events_path}
+
+
+def _job_detect_halves(progress, raw):
+    result = detect_match_halves(
+        raw["video_path"], expected_half_min=float(raw.get("expected_half_min", 45.0)),
+        person_counter=_segmenter_person_counter if pipeline._to_bool(raw.get("use_person_count", False)) else None,
+        progress_cb=pipeline._segmenter_cb(progress))
+    return {"status": "success", **result}
+
+
+def _job_cut_match(progress, raw):
+    opts = pipeline.coerce_options(raw)
+    notes = []
+    halves, detection = pipeline.resolve_halves({**opts, "video_path": raw["video_path"]}, _job_funcs(),
+                                                progress.sub(0, 90, "Félidők felismerése"), notes)
+    progress(90.0, "Vágás")
+    duration = (detection or {}).get("duration_sec")
+    paths = cut_match_halves(raw["video_path"], halves, CLIPS_DIR, padding_sec=opts["padding_sec"], duration_sec=duration)
+    to_url = lambda p: f"/clips/{os.path.basename(p)}" if p else None
+    return {"status": "success", "halves": halves, "confidence": (detection or {}).get("confidence"),
+            "notes": notes, "first_half_url": to_url(paths["first_half"]),
+            "second_half_url": to_url(paths["second_half"]), "full_match_url": to_url(paths["full_match"]),
+            "local_paths": paths}
+
+
+def _job_heatmap(progress, raw):
+    player_id = raw.get("player_id")
+    flip = raw.get("flip_second_half_at_sec")
+    return generate_heatmaps_from_file(
+        raw.get("events_path", ""), CLIPS_DIR, team=raw.get("team", "all"),
+        player_id=int(player_id) if player_id not in (None, "") else None,
+        flip_at_sec=float(flip) if flip not in (None, "") else None)
+
+
+def _job_export_clips(progress, raw):
+    try:
+        items = json.loads(raw.get("events_json") or "[]")
+    except ValueError:
+        return {"status": "error", "message": "Az events_json nem érvényes JSON."}
+    return export_clips(
+        raw.get("video_path", ""), items, CLIPS_DIR,
+        pre_sec=float(raw.get("pre_sec", DEFAULT_PRE_SEC)), post_sec=float(raw.get("post_sec", DEFAULT_POST_SEC)),
+        merge=pipeline._to_bool(raw.get("merge", True)), accurate=pipeline._to_bool(raw.get("accurate", True)),
+        title=raw.get("title") or None,
+        progress_cb=lambda done, total: progress(100.0 * done / max(1, total), f"{done}/{total} klip"))
+
+
+JOB_KINDS = {
+    "cut-raw": _job_cut_raw,
+    "detect-halves": _job_detect_halves,
+    "cut-match": _job_cut_match,
+    "heatmap": _job_heatmap,
+    "export-clips": _job_export_clips,
+}
+
+
+@app.post("/jobs/run")
+async def run_job_endpoint(request: Request):
+    """A régi végpontok háttérfeladatos változata: kind=cut-raw|detect-halves|cut-match|heatmap|export-clips + ugyanazok a form mezők."""
+    raw = await _form_dict(request)
+    kind = raw.get("kind", "")
+    if kind not in JOB_KINDS:
+        return _form_error(f"Ismeretlen feladattípus: {kind!r} (lehetséges: {', '.join(JOB_KINDS)})")
+    if kind in ("cut-raw", "detect-halves", "cut-match", "export-clips") and not os.path.exists(raw.get("video_path", "")):
+        return _form_error("A videófájl nem található.")
+    try:
+        if kind == "cut-raw":
+            pipeline.build_analysis_config(raw)
+        elif kind == "cut-match":
+            pipeline.coerce_options(raw)
+    except ValueError as ex:
+        return _form_error(str(ex))
+    params = {k: v for k, v in raw.items() if k != "events_json"}
+    job_id = job_manager.submit(kind, JOB_KINDS[kind], raw, params=params)
+    return {"status": "success", "job_id": job_id, "status_url": f"/jobs/{job_id}"}
+
+
+@app.get("/jobs")
+async def list_jobs_endpoint(limit: int = 50):
+    return {"status": "success", "jobs": job_manager.list(limit=limit)}
+
+
+@app.get("/jobs/{job_id}")
+async def get_job_endpoint(job_id: str):
+    job = job_manager.get(job_id)
+    if job is None:
+        return _form_error("Nincs ilyen feladat.", 404)
+    return {"status": "success", "job": job}
+
+
+@app.post("/jobs/{job_id}/cancel")
+async def cancel_job_endpoint(job_id: str):
+    job = job_manager.cancel(job_id)
+    if job is None:
+        return _form_error("Nincs ilyen feladat.", 404)
+    return {"status": "success", "job": job}
 
 
 # ============================================================

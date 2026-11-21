@@ -137,10 +137,13 @@ def _slug(text, max_len=40):
 
 
 def export_clips(video_path, items, out_dir, pre_sec=DEFAULT_PRE_SEC, post_sec=DEFAULT_POST_SEC,
-                 merge=True, accurate=True, title=None, url_prefix="/clips", gap_sec=MERGE_GAP_SEC):
+                 merge=True, accurate=True, title=None, url_prefix="/clips", gap_sec=MERGE_GAP_SEC,
+                 progress_cb=None):
     """
     Teljes folyamat: ellenőrzés → ablakok → összevonás → vágás → (összefűzés).
     Soha nem dob kivételt: hiba esetén {"status": "error", "message": ...}.
+    progress_cb(kész, összes): minden kivágott klip után (háttérfeladatok haladásjelzéséhez);
+    a horog kivétele (pl. megszakítás) továbbmegy a hívóhoz.
     """
     if not video_path or not os.path.exists(video_path):
         return {"status": "error", "message": "A videófájl nem található."}
@@ -169,6 +172,8 @@ def export_clips(video_path, items, out_dir, pre_sec=DEFAULT_PRE_SEC, post_sec=D
             cut_clip(video_path, s, e, out_path, accurate)
             clips.append({"start_sec": round(s, 3), "end_sec": round(e, 3),
                           "url": f"{url_prefix}/{fname}", "local_path": out_path})
+            if progress_cb is not None:
+                progress_cb(i, len(windows))
 
         result = {"status": "success", "clips": clips, "merged_url": None, "merged_local_path": None}
         if merge and clips:

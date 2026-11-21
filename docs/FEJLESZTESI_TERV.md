@@ -13,6 +13,8 @@ A MAUI program helyi folyamatként vagy helyi szerverként (pl. FastAPI, `localh
 - Az elemzés hosszú (percek–órák), ezért a Python folyamatosan jelenti a haladást (pl. JSON sorok: `{"fazis": "kovetes", "szazalek": 42}`).
 - Az eredmény egy meccs-JSON: események időbélyeggel, játékospozíciók a 2D pályán, statisztikák.
 - A klipek vágását a Python végzi ffmpeg-gel, a MAUI csak listáz, előnézetet mutat és exportál.
+- **Megvalósítva:** háttérfeladatok haladásjelzéssel (`POST /jobs/analyze-match`, `GET /jobs/{id}`) és a teljes
+  meccs elemzése egy lépésben, parancssorból is (`python elemzes.py MECCS.mp4`) – lásd [HATTERFELADATOK.md](HATTERFELADATOK.md).
 
 ---
 
