@@ -13,3 +13,4 @@ numpy>=1.26
 opencv-python>=4.9
 ultralytics>=8.2
 scikit-learn>=1.4            # csak a régi analyzer.py használja
+pillow>=10                   # opcionális: ékezetes feliratok a rajzos videóexportban (video_annotate.py)
