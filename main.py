@@ -502,8 +502,9 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
         "match_stats": engine_instance.stats,
         "pitch_tracking": {"setup": pitch_setup_msg, "frames": pitch_stats},
         "source": {"video_path": video_path, "start_sec": start_sec, "end_sec": end_sec},
-        # Tömörített pályák (5 Hz, 0.1 m) a hőtérképhez / statisztikához – lásd heatmap.py
-        "trajectories": compact_trajectories(engine_instance.player_trajectories, track_meta.summary()),
+        # Tömörített pályák (5 Hz, 0.1 m) a hőtérképhez / statisztikához, a labda útja 10 Hz-en – lásd heatmap.py
+        "trajectories": compact_trajectories(engine_instance.player_trajectories, track_meta.summary(),
+                                             ball=engine_instance.ball_trajectory),
         # AUTO CSAPAT: tanult mezszínek (RGB) a kliensnek / taktikai táblának; kézi módban null
         "team_colors": team_clf.team_colors() if team_clf is not None else None,
         "team_mode": "auto" if team_clf is not None else "manual"
@@ -945,6 +946,51 @@ async def tactics_board_page():
         "<style>[hidden]{display:none!important}body{margin:0}</style></head><body>"
         + body + "</body></html>"
     )
+
+
+# Mentett táblák a szerveren (clips/boards/<id>.json) – bármelyik eszközről elérhetők. Lásd boards.py
+from fastapi import Request as _BoardRequest
+from fastapi.responses import JSONResponse as _BoardJSON
+from boards import BoardStore, BoardError, parse_request_body
+
+board_store = BoardStore(os.path.join(CLIPS_DIR, "boards"))
+
+
+def _board_error(ex):
+    return _BoardJSON(status_code=ex.status, content={"status": "error", "message": ex.message})
+
+
+@app.get("/boards")
+async def list_boards_endpoint(kind: Optional[str] = None):
+    """Mentett táblák listája: [{id, name, kind, updated_at, ...}], a legfrissebb elöl."""
+    return {"status": "success", "boards": board_store.list(kind=kind or None)}
+
+
+@app.get("/boards/{board_id}")
+async def get_board_endpoint(board_id: str):
+    try:
+        return {"status": "success", "board": board_store.get(board_id)}
+    except BoardError as ex:
+        return _board_error(ex)
+
+
+@app.post("/boards")
+async def save_board_endpoint(request: _BoardRequest):
+    """Törzs (JSON): {"name", "data", "id"?: felülíráshoz, "kind"?: "board" | "replay"}"""
+    try:
+        name, data, board_id, kind = parse_request_body(await request.body())
+        return {"status": "success", "board": board_store.save(name, data, board_id=board_id, kind=kind)}
+    except BoardError as ex:
+        return _board_error(ex)
+
+
+@app.delete("/boards/{board_id}")
+async def delete_board_endpoint(board_id: str):
+    try:
+        board_store.delete(board_id)
+        return {"status": "success"}
+    except BoardError as ex:
+        return _board_error(ex)
 
 
 # ============================================================

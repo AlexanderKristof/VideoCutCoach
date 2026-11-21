@@ -41,6 +41,8 @@ MIN_PLAYER_SEC = 20.0
 # A megtett táv számolásánál ennyi időnként veszünk mintát, hogy a 25 fps-es
 # homográfia-remegés ne adódjon össze
 DISTANCE_MIN_STEP_SEC = 0.2
+# A labda útját sűrűbben mentjük (a visszajátszáshoz), mint a játékosokét
+DEFAULT_BALL_HZ = 10.0
 
 
 # ---------------------------------------------------------------------------
@@ -76,12 +78,52 @@ class TrackMetaCollector:
         return out
 
 
-def compact_trajectories(trajectories, track_meta=None, hz=5.0, decimals=1):
+def compact_ball(ball_trajectory, hz=DEFAULT_BALL_HZ, decimals=1):
+    """
+    A labda útja tömören: [[x, y, t], ...] hz-re ritkítva (alap 10 Hz), kerekítve,
+    idő szerint rendezve. A hibás (nem szám) mintákat kihagyja.
+    Bemenet: a TacticalEngine.ball_trajectory listája [(x, y, t), ...].
+    """
+    min_dt = 1.0 / hz if hz and hz > 0 else 0.0
+    out, last_t = [], None
+    pts = []
+    for p in ball_trajectory or []:
+        try:
+            x, y, t = float(p[0]), float(p[1]), float(p[2])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if all(np.isfinite(v) for v in (x, y, t)):
+            pts.append((x, y, t))
+    for x, y, t in sorted(pts, key=lambda q: q[2]):
+        if last_t is not None and (t - last_t) < min_dt - 1e-6:
+            continue
+        out.append([round(x, decimals), round(y, decimals), round(t, 2)])
+        last_t = t
+    return out
+
+
+def load_ball(data):
+    """Az események JSON-jából a labda útja: [(x, y, t), ...] (üres lista, ha nincs)."""
+    block = (data or {}).get("trajectories") or {}
+    raw = block.get("ball") if isinstance(block, dict) else None
+    out = []
+    for p in raw or []:
+        try:
+            if len(p) >= 3:
+                out.append((float(p[0]), float(p[1]), float(p[2])))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def compact_trajectories(trajectories, track_meta=None, hz=5.0, decimals=1, ball=None, ball_hz=DEFAULT_BALL_HZ):
     """
     Tömör, JSON-ba írható pályák: hz-re ritkítva, a koordináták `decimals`
     tizedesre kerekítve.
     Kimenet: {"hz": 5.0, "tracks": {"12": {"team": 1, "keeper": false,
               "points": [[x, y, t], ...]}, ...}}
+    Ha `ball` (a labda útja, [(x, y, t), ...]) meg van adva, a kimenetbe
+    "ball_hz" és "ball": [[x, y, t], ...] is kerül (alap 10 Hz – a labda gyorsabb).
     """
     track_meta = track_meta or {}
     min_dt = 1.0 / hz if hz and hz > 0 else 0.0
@@ -102,7 +144,11 @@ def compact_trajectories(trajectories, track_meta=None, hz=5.0, decimals=1):
             "keeper": bool(meta.get("keeper", False)),
             "points": kept,
         }
-    return {"hz": hz, "tracks": tracks}
+    out = {"hz": hz, "tracks": tracks}
+    if ball is not None:
+        out["ball_hz"] = ball_hz
+        out["ball"] = compact_ball(ball, ball_hz, decimals)
+    return out
 
 
 def load_trajectories(data):
@@ -110,6 +156,7 @@ def load_trajectories(data):
     Az események JSON-jából (dict) visszaadja: (pályák, meta)
         pályák: {track_id(int): [(x, y, t), ...]}
         meta:   {track_id(int): {"team": ..., "keeper": ...}}
+    A labda útja (trajectories["ball"]) nem játékos – azt a load_ball() adja vissza.
     """
     block = (data or {}).get("trajectories") or {}
     tracks = block.get("tracks", {}) if isinstance(block, dict) else {}

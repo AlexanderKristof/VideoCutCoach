@@ -348,18 +348,44 @@ def merge_half_events(half_data, halves, expected_half_min, cut_offsets=None):
 
 
 def merge_trajectories(half_data):
-    """A félidők pályáinak egyesítése; a 2. félidő azonosítói SECOND_HALF_TRACK_OFFSET-tel eltolva."""
-    tracks, hz = {}, None
+    """
+    A félidők pályáinak egyesítése; a 2. félidő azonosítói SECOND_HALF_TRACK_OFFSET-tel eltolva.
+    A labda útja ("ball": [[x, y, t], ...]) a két félidőből összefűzve, idő szerint rendezve
+    (az idők az eredeti videó másodpercei, így a félidők nem fedik egymást).
+    """
+    tracks, hz, ball, ball_hz = {}, None, [], None
     for idx, key in enumerate(("first_half", "second_half")):
         block = ((half_data.get(key) or {}).get("trajectories") or {})
         hz = hz or block.get("hz")
+        ball_hz = ball_hz or block.get("ball_hz")
+        for p in block.get("ball") or []:
+            if isinstance(p, (list, tuple)) and len(p) >= 3:
+                ball.append(list(p[:3]))
         for tid, tr in (block.get("tracks") or {}).items():
             try:
                 new_id = int(tid) + (SECOND_HALF_TRACK_OFFSET if idx == 1 else 0)
             except (TypeError, ValueError):
                 continue
             tracks[str(new_id)] = dict(tr, half=idx + 1, original_track_id=int(tid))
-    return {"hz": hz or 5.0, "tracks": tracks}
+    out = {"hz": hz or 5.0, "tracks": tracks}
+    if ball:
+        ball.sort(key=lambda p: float(p[2]))
+        out["ball_hz"] = ball_hz or 10.0
+        out["ball"] = ball
+    return out
+
+
+def merge_team_colors(half_data):
+    """
+    A tanult mezszínek ([r, g, b]) a meccs-összesítőbe: az 1. félidőé, ha van, különben a 2.-é.
+    A pipeline a 2. félidőben megfordítja a csapatsorrendet (swap_teams), így a "team1" mindkét
+    félidőben ugyanaz a csapat – a színek is egyeznek.
+    """
+    for key in ("first_half", "second_half"):
+        colors = (half_data.get(key) or {}).get("team_colors")
+        if isinstance(colors, dict) and colors.get("team1") and colors.get("team2"):
+            return colors
+    return None
 
 
 def _cut_offsets(halves, padding_sec, duration_sec=None):
@@ -524,6 +550,9 @@ def run_match_pipeline(video_path, options=None, progress=None, funcs=None, out_
                    "end_sec": max(h["end_sec"] for h in halves.values())},
         "full_match": (result["cut"] or {}).get("local_paths", {}).get("full_match") if result["cut"] else None,
         "trajectories": merge_trajectories(half_data),
+        # a taktikai tábla visszajátszásához: mezszínek és a félidő hossza (a meccsórához)
+        "team_colors": merge_team_colors(half_data),
+        "expected_half_min": opts["expected_half_min"],
     }
     match_events_path = os.path.join(out_dir, f"match_events_{run_id}.json")
     with open(match_events_path, "w", encoding="utf-8") as f:

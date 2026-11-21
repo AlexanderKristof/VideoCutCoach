@@ -82,6 +82,25 @@ def test_compact_and_meta():
     assert pts[0][:2] == [1.2, 2.3]
     t2, m2 = hm.load_trajectories({"trajectories": comp})
     assert list(t2) == [7] and m2[7]["team"] == 2 and m2[7]["keeper"] is True
+    assert "ball" not in comp  # labda nélkül a régi forma marad
+
+
+def test_compact_ball_10hz_and_load():
+    # 25 fps-es labdaút + egy hibás minta; 10 Hz-re ritkítva, [x, y, t] sorrendben
+    ball = [(10.0 + i * 0.04, 20.0, i / 25.0) for i in range(50)] + [(None, 1.0, 9.0)]
+    comp = hm.compact_trajectories({7: _line_track(1.0, 2.0, 1.0, 0.0, 0.0, 2.0)}, {}, ball=ball)
+    json.dumps(comp)
+    assert comp["ball_hz"] == 10.0
+    pts = comp["ball"]
+    assert 16 <= len(pts) <= 21, len(pts)  # 25 fps-ből >= 0,1 mp-es lépések (0,12 mp)
+    assert pts[0] == [10.0, 20.0, 0.0] and all(len(p) == 3 for p in pts)
+    assert all(pts[i][2] < pts[i + 1][2] for i in range(len(pts) - 1))
+    data = {"trajectories": comp}
+    traj, _ = hm.load_trajectories(data)
+    assert list(traj) == [7]  # a labda nem játékos-követés
+    loaded = hm.load_ball(data)
+    assert len(loaded) == len(pts) and loaded[0] == (10.0, 20.0, 0.0)
+    assert hm.load_ball({}) == [] and hm.compact_ball([]) == []
 
 
 def _synthetic_events():

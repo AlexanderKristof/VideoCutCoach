@@ -77,6 +77,16 @@ canvas#pitch { display: block; width: 100%; touch-action: none; cursor: crosshai
 .legend b { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; vertical-align: -1px; }
 .badge { font-size: 11px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; padding: 2px 7px; border-radius: 99px; background: var(--chip); color: var(--muted); }
 .status { font-size: 12.5px; color: var(--muted); min-height: 1.2em; }
+h3.sub { font: 600 12px var(--font-body); letter-spacing: .05em; text-transform: uppercase; color: var(--muted); margin: 12px 0 6px; }
+.list .item .meta { display: block; font-size: 11px; color: var(--muted); }
+.half-tabs { align-self: flex-start; }
+.half-tabs button { padding: 6px 12px; font-size: 13px; }
+.clock-box { text-align: right; }
+.clock-sub { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.overlay { position: fixed; inset: 0; z-index: 20; background: rgba(0,0,0,.6); display: flex; align-items: center; justify-content: center; padding: 16px; }
+.overlay-box { background: var(--panel); color: var(--fg); border: 1px solid var(--line); border-radius: 12px; padding: 14px; width: min(960px, 100%); max-height: calc(100vh - 32px); overflow: auto; display: flex; flex-direction: column; gap: 10px; }
+.overlay-box h2 { margin: 0; }
+.overlay-box img { display: block; width: 100%; height: auto; border-radius: 8px; -webkit-touch-callout: default; user-select: auto; }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 </style>
 
@@ -106,6 +116,7 @@ canvas#pitch { display: block; width: 100%; touch-action: none; cursor: crosshai
       <span class="sep"></span>
       <button class="btn" id="undo">↶ Vissza</button>
       <button class="btn" id="clear">Rajzok törlése</button>
+      <button class="btn" id="export-png" title="A pálya mostani képe PNG-ként">⤓ Kép mentése</button>
     </div>
     <div class="canvas-wrap"><canvas id="pitch" aria-label="Felülnézeti pálya"></canvas></div>
 
@@ -120,17 +131,18 @@ canvas#pitch { display: block; width: 100%; touch-action: none; cursor: crosshai
           </select>
           <label class="row" style="font-size:13px;"><input type="checkbox" id="trails" checked> nyomvonal</label>
         </div>
-        <div class="clock" id="clock">00:00</div>
+        <div class="clock-box"><div class="clock" id="clock">00:00</div><div class="clock-sub" id="clock-sub"></div></div>
+      </div>
+      <div class="tabs half-tabs" id="half-tabs" role="tablist" aria-label="Félidő" hidden>
+        <button role="tab" data-half="1" aria-selected="false">1. félidő</button>
+        <button role="tab" data-half="2" aria-selected="false">2. félidő</button>
+        <button role="tab" data-half="all" aria-selected="true">Teljes</button>
       </div>
       <div class="timebar">
         <div class="marks" id="marks"></div>
         <input type="range" id="seek" min="0" max="100" step="0.1" value="0" aria-label="Idő">
       </div>
-      <div class="legend">
-        <span><b style="background:#d93636"></b>Hazai</span><span><b style="background:#2f6fd6"></b>Vendég</span>
-        <span><b style="background:#f2c230"></b>Hazai kapus</span><span><b style="background:#9b5de5"></b>Vendég kapus</span>
-        <span><b style="background:#ffffff;border:1px solid #333"></b>Labda</span>
-      </div>
+      <div class="legend" id="legend"></div>
     </div>
   </section>
 
@@ -162,8 +174,15 @@ canvas#pitch { display: block; width: 100%; touch-action: none; cursor: crosshai
         <input type="text" id="save-name" placeholder="pl. Szöglet – védekezés" style="flex:1; min-width:0">
         <button class="btn primary" id="save">Mentés</button>
       </div>
+      <h3 class="sub" id="local-sub" hidden>Ebben a böngészőben</h3>
       <div class="list" id="saved" style="margin-top:8px;"></div>
-      <p class="hint" style="margin-top:6px;">A mentés ebben a böngészőben marad. Másik eszközre a JSON-másolással vihető át.</p>
+      <p class="hint" id="local-hint" style="margin-top:6px;">A mentés ebben a böngészőben marad. Másik eszközre a JSON-másolással vihető át.</p>
+      <div id="srv-board" hidden>
+        <h3 class="sub">Szerveren</h3>
+        <button class="btn" id="srv-save">Mentés a szerverre</button>
+        <div class="list" id="srv-saved" style="margin-top:8px;"></div>
+        <p class="hint" style="margin-top:6px;">A szerverre mentett táblák minden eszközről elérhetők, amelyik ezt a programot használja. Betöltés után a „Mentés a szerverre” ugyanazt a táblát frissíti (új névvel újat ment).</p>
+      </div>
       <div class="row" style="margin-top:8px;">
         <button class="btn" id="copy-json">JSON másolása</button>
         <button class="btn" id="paste-toggle">JSON beillesztése</button>
@@ -197,8 +216,33 @@ canvas#pitch { display: block; width: 100%; touch-action: none; cursor: crosshai
       <h2>Rajz-megállók</h2>
       <p class="hint">Állítsd meg a lejátszást, és rajzolj. A rajz ahhoz a pillanathoz tapad: lejátszáskor ott megáll és megmutatja. Így építhetsz fel egy elemzést az edzői megbeszélésre.</p>
       <div class="list" id="stops" style="margin-top:8px;"></div>
+      <h3 class="sub">Rajzsor mentése</h3>
+      <div class="row">
+        <input type="text" id="stops-name" placeholder="pl. 2. félidő – presszing" style="flex:1; min-width:0" aria-label="A rajzsor neve">
+        <button class="btn primary" id="stops-save">Mentés</button>
+        <button class="btn" id="stops-srv-save" hidden>Szerverre</button>
+      </div>
+      <p class="hint" style="margin-top:6px;">A rajz-megállók a meccsfájllal együtt mentődnek: betöltéskor, ha még nincs betöltve, a program megpróbálja azt is megnyitni.</p>
+      <h3 class="sub" id="stops-local-sub" hidden>Ebben a böngészőben</h3>
+      <div class="list" id="stops-saved" style="margin-top:6px;"></div>
+      <div id="stops-srv" hidden>
+        <h3 class="sub">Szerveren</h3>
+        <div class="list" id="stops-srv-saved"></div>
+      </div>
+      <div class="status" id="stops-status"></div>
     </div>
   </aside>
+</div>
+
+<div class="overlay" id="img-overlay" hidden role="dialog" aria-modal="true" aria-labelledby="img-title">
+  <div class="overlay-box">
+    <div class="row" style="justify-content: space-between;">
+      <h2 id="img-title">A pálya képe</h2>
+      <button class="btn" id="img-close">Bezárás</button>
+    </div>
+    <p class="hint">Itt a letöltés nem mindig engedélyezett, ezért a kép itt jelenik meg. <b>Telefonon</b> tartsd lenyomva a képet, és válaszd a „Kép mentése” lehetőséget. <b>Számítógépen</b> kattints rá jobb gombbal → „Kép mentése másként…”.</p>
+    <img id="img-out" alt="A taktikai tábla képe">
+  </div>
 </div>
 
 <script>
@@ -242,7 +286,7 @@ canvas#pitch { display: block; width: 100%; touch-action: none; cursor: crosshai
     tool: "move",
     color: COLORS[1],
     board: { form1: "4-3-3", form2: "4-4-2", show2: true, players: [], ball: { x: 52.5, y: 34 }, drawings: [] },
-    replay: { data: null, t: 0, playing: false, speed: 1, stops: [], trails: true },
+    replay: { data: null, t: 0, playing: false, speed: 1, stops: [], trails: true, half: "all", range: { t0: 0, t1: 0 }, source: null },
     selected: null,
     undo: [],
   };
@@ -320,11 +364,13 @@ canvas#pitch { display: block; width: 100%; touch-action: none; cursor: crosshai
   function drawPlayer(p, alpha = 1) {
     const [sx, sy] = toScreen(p.x, p.y), r = playerRadius();
     ctx.globalAlpha = alpha;
-    ctx.fillStyle = p.gk ? GK[p.team] : TEAM[p.team];
+    const kit = p.kit; // visszajátszásban a tanult mezszín (lásd teamKits)
+    ctx.fillStyle = kit ? kit.fill : p.gk ? GK[p.team] : TEAM[p.team];
     ctx.beginPath(); ctx.arc(sx, sy, r, 0, 7); ctx.fill();
-    ctx.lineWidth = 2; ctx.strokeStyle = state.selected === p.id ? "#ffffff" : "rgba(0,0,0,.55)"; ctx.stroke();
+    ctx.lineWidth = kit && kit.light ? 2.5 : 2;
+    ctx.strokeStyle = state.selected === p.id ? "#ffffff" : kit ? kit.outline : "rgba(0,0,0,.55)"; ctx.stroke();
     if (p.num != null) {
-      ctx.fillStyle = p.gk && p.team === 1 ? "#1a1a1a" : "#ffffff";
+      ctx.fillStyle = kit ? kit.text : p.gk && p.team === 1 ? "#1a1a1a" : "#ffffff";
       ctx.font = `700 ${Math.round(r * 1.05)}px "Barlow Condensed", "Arial Narrow", sans-serif`;
       ctx.textAlign = "center"; ctx.textBaseline = "middle";
       ctx.fillText(String(p.num), sx, sy + 1);
@@ -420,6 +466,7 @@ canvas#pitch { display: block; width: 100%; touch-action: none; cursor: crosshai
     const k = (t - a[0]) / (b[0] - a[0]);
     return { x: a[1] + (b[1] - a[1]) * k, y: a[2] + (b[2] - a[2]) * k };
   }
+  function trackKit(d, tr) { return d.kits && !tr.keeper ? d.kits[tr.team] || null : null; }
   function drawReplayFrame() {
     const d = state.replay.data; if (!d) return;
     const t = state.replay.t;
@@ -428,21 +475,63 @@ canvas#pitch { display: block; width: 100%; touch-action: none; cursor: crosshai
         const pts = [];
         for (let dt = -3; dt <= 0.001; dt += 0.25) { const p = sampleAt(tr.samples, t + dt); if (p) pts.push(toScreen(p.x, p.y)); }
         if (pts.length > 1) {
-          ctx.strokeStyle = (tr.keeper ? GK : TEAM)[tr.team] || "#ccc"; ctx.globalAlpha = 0.35; ctx.lineWidth = 2;
+          const kit = trackKit(d, tr);
+          ctx.strokeStyle = kit ? kit.fill : (tr.keeper ? GK : TEAM)[tr.team] || "#ccc"; ctx.globalAlpha = 0.35; ctx.lineWidth = 2;
           ctx.beginPath(); pts.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)); ctx.stroke(); ctx.globalAlpha = 1;
         }
       }
     }
     for (const tr of d.tracks) {
       const p = sampleAt(tr.samples, t);
-      if (p) drawPlayer({ id: "r" + tr.id, team: tr.team, gk: tr.keeper, num: tr.label, x: p.x, y: p.y });
+      if (p) drawPlayer({ id: "r" + tr.id, team: tr.team, gk: tr.keeper, num: tr.label, kit: trackKit(d, tr), x: p.x, y: p.y });
     }
-    if (d.ball.length) { const b = sampleAt(d.ball, t, 0.8); if (b) drawBall(b); }
+    if (d.ball.length) {
+      if (state.replay.trails) {
+        // a labda rövid (1,5 mp-es) nyomvonala
+        const pts = [];
+        for (let dt = -1.5; dt <= 0.001; dt += 0.1) { const q = sampleAt(d.ball, t + dt, 0.8); if (q) pts.push(toScreen(q.x, q.y)); }
+        if (pts.length > 1) {
+          ctx.strokeStyle = "#ffffff"; ctx.globalAlpha = 0.5; ctx.lineWidth = 1.5; ctx.setLineDash([3, 3]);
+          ctx.beginPath(); pts.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)); ctx.stroke();
+          ctx.setLineDash([]); ctx.globalAlpha = 1;
+        }
+      }
+      const b = sampleAt(d.ball, t, 0.8); if (b) drawBall(b);
+    }
   }
 
+  // ---------- Csapatszínek (tanult mezszín az events JSON 'team_colors' mezőjéből) ----------
+  function kitFromRgb(rgb) {
+    if (!Array.isArray(rgb) || rgb.length < 3) return null;
+    const c = rgb.slice(0, 3).map(Number);
+    if (!c.every(Number.isFinite)) return null;
+    const [r, g, b] = c.map((v) => Math.max(0, Math.min(255, Math.round(v))));
+    const lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+    return {
+      rgb: [r, g, b], lum, light: lum > 0.62,
+      fill: "#" + [r, g, b].map((v) => v.toString(16).padStart(2, "0")).join(""),
+      text: lum > 0.62 ? "#111111" : "#ffffff",
+      // világos mez: sötét körvonal; nagyon sötét mez: világos körvonal, hogy a füvön is látsszon
+      outline: lum > 0.62 ? "rgba(0,0,0,.85)" : lum < 0.2 ? "rgba(255,255,255,.8)" : "rgba(0,0,0,.55)",
+    };
+  }
+  function teamKits(raw) {
+    const tc = raw && raw.team_colors;
+    if (!tc || typeof tc !== "object") return null;
+    const k1 = kitFromRgb(tc.team1), k2 = kitFromRgb(tc.team2);
+    if (!k1 || !k2) return null;
+    // ha a két tanult szín szinte azonos, a megszokott piros/kék jobban olvasható
+    const dist = Math.hypot(k1.rgb[0] - k2.rgb[0], k1.rgb[1] - k2.rgb[1], k1.rgb[2] - k2.rgb[2]);
+    return dist < 45 ? null : { 1: k1, 2: k2 };
+  }
+
+  const toTxy = (q, xyt) => Array.isArray(q) ? (xyt ? [+q[2], +q[0], +q[1]] : [+q[0], +q[1], +q[2]]) : [+q.t, +q.x, +q.y];
   function normalizeMatch(raw) {
     // Elfogadott formák: events JSON 'trajectories' mezővel (objektum vagy lista), opcionális 'ball' / 'ball_trajectory'.
-    // Az elemző program formája: trajectories = {hz, tracks: {id: {team, keeper, points: [[x, y, t], ...]}}}
+    // Az elemző program formája: trajectories = {hz, tracks: {id: {team, keeper, half?, points: [[x, y, t], ...]}},
+    //   ball: [[x, y, t], ...]}; a meccs-összesítőben (match_events_*.json) 'halves', 'team_colors', 'expected_half_min' is.
+    // Az idő mindenhol az EREDETI videó másodperce (a 2. félidő is).
+    if (!raw || typeof raw !== "object") return null;
     const tracks = [];
     let tr = raw.trajectories || raw.tracks || {};
     const xyt = !!(tr && tr.tracks);
@@ -450,22 +539,49 @@ canvas#pitch { display: block; width: 100%; touch-action: none; cursor: crosshai
     const list = Array.isArray(tr) ? tr : Object.entries(tr).map(([id, v]) => ({ id, ...(Array.isArray(v) ? { points: v } : v) }));
     for (const v of list) {
       const pts = v.points || v.samples || v.p || v.positions || [];
-      const samples = pts.map((q) => Array.isArray(q) ? (xyt ? [+q[2], +q[0], +q[1]] : [+q[0], +q[1], +q[2]]) : [+q.t, +q.x, +q.y])
-        .filter((q) => q.every(Number.isFinite)).sort((a, b) => a[0] - b[0]);
+      const samples = pts.map((q) => toTxy(q, xyt)).filter((q) => q.every(Number.isFinite)).sort((a, b) => a[0] - b[0]);
       if (samples.length < 2) continue;
       let team = v.team ?? v.team_id ?? 1; if (typeof team === "string") team = team.endsWith("2") ? 2 : 1;
-      tracks.push({ id: v.id ?? v.track_id, team, keeper: !!(v.keeper ?? v.is_keeper), label: v.num ?? v.track_id ?? v.id, samples });
+      if (team !== 1 && team !== 2) team = 1;
+      // a 2. félidő azonosítói 100000-rel eltolva – a mezen az eredeti szám látszik
+      const label = v.num ?? v.original_track_id ?? v.track_id ?? v.id;
+      tracks.push({ id: v.id ?? v.track_id, team, keeper: !!(v.keeper ?? v.is_keeper), half: +v.half || null, label, samples });
     }
-    const ballRaw = raw.ball || raw.ball_trajectory || (raw.trajectories && raw.trajectories.ball) || [];
-    const ball = (Array.isArray(ballRaw) ? ballRaw : ballRaw.points || []).map((q) => Array.isArray(q) ? [+q[0], +q[1], +q[2]] : [+q.t, +q.x, +q.y])
+    // labda: trajectories.ball és ball_trajectory [x, y, t] sorrendű (mint a pályák), a régi 'ball' mező [t, x, y]
+    const tb = raw.trajectories && !Array.isArray(raw.trajectories) ? raw.trajectories.ball : null;
+    const ballXyt = !!(tb || raw.ball_trajectory);
+    const ballRaw = tb || raw.ball_trajectory || raw.ball || [];
+    const ball = (Array.isArray(ballRaw) ? ballRaw : ballRaw.points || []).map((q) => toTxy(q, ballXyt))
       .filter((q) => q.every(Number.isFinite)).sort((a, b) => a[0] - b[0]);
-    const events = (raw.events || []).filter((e) => Number.isFinite(+e.time)).map((e) => ({ ...e, time: +e.time }));
+    const events = (raw.events || []).filter((e) => e && Number.isFinite(+e.time)).map((e) => ({ ...e, time: +e.time }));
+    if (!tracks.length) return null;
     let t0 = Infinity, t1 = -Infinity;
     for (const t of tracks) { t0 = Math.min(t0, t.samples[0][0]); t1 = Math.max(t1, t.samples[t.samples.length - 1][0]); }
-    if (!tracks.length) return null;
-    return { tracks, ball, events, t0, t1 };
+    if (ball.length) { t0 = Math.min(t0, ball[0][0]); t1 = Math.max(t1, ball[ball.length - 1][0]); }
+    return { tracks, ball, events, t0, t1, halves: matchHalves(raw, tracks), kits: teamKits(raw) };
+  }
+  function matchHalves(raw, tracks) {
+    // [{idx, label, start, end, clock0}] – clock0: a meccsóra a félidő elején (2. félidő: félidőhossz × 60)
+    const halfMin = +raw.expected_half_min > 0 ? +raw.expected_half_min : 45;
+    const H = raw.halves && typeof raw.halves === "object" ? raw.halves : {};
+    const out = [];
+    for (const [key, idx] of [["first_half", 1], ["second_half", 2]]) {
+      const h = H[key];
+      let a = h ? +h.start_sec : NaN, b = h ? +h.end_sec : NaN;
+      if (!(Number.isFinite(a) && Number.isFinite(b) && b > a)) {
+        const ts = tracks.filter((t) => t.half === idx);  // félidőhatár nélkül: a pályák 'half' mezőjéből
+        if (!ts.length || (!h && idx === 1 && !tracks.some((t) => t.half === 2))) continue;
+        a = Math.min(...ts.map((t) => t.samples[0][0])); b = Math.max(...ts.map((t) => t.samples[t.samples.length - 1][0]));
+      }
+      out.push({ idx, label: `${idx}. félidő`, start: a, end: b, clock0: idx === 1 ? 0 : halfMin * 60 });
+    }
+    return out;
   }
 
+  function matchSummary(name, d) {
+    return `Betöltve: ${name} – ${d.tracks.length} játékos-útvonal, ${d.ball.length ? "labdaúttal, " : "labdaút nélkül, "}` +
+      `${d.events.length} esemény${d.halves.length >= 2 ? ", két félidő" : ""}.`;
+  }
   function demoMatch() {
     // Bemutató: 90 mp kitalált játék két 4-3-3 / 4-4-2 csapattal, 5 Hz-es mintavétellel.
     const rnd = mulberry(7);
@@ -495,41 +611,104 @@ canvas#pitch { display: block; width: 100%; touch-action: none; cursor: crosshai
       { time: 66, type: "goal", team: "team2", desc: "Valószínű gól – vendég" },
       { time: 70, type: "gk_conceded", team: "team1", desc: "Kapott gól – hazai kapus" },
     ];
-    return { tracks, ball, events, t0: 0, t1: T };
+    return { tracks, ball, events, t0: 0, t1: T, halves: [], kits: null, demo: true };
   }
   function mulberry(a) { return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
 
   function fmt(t) { t = Math.max(0, t); const mm = Math.floor(t / 60), ss = Math.floor(t % 60); return `${String(mm).padStart(2, "0")}:${String(ss).padStart(2, "0")}`; }
-
-  function loadMatch(d, label) {
-    state.replay.data = d; state.replay.t = d.t0; state.replay.playing = false; state.replay.stops = [];
-    $("seek").min = d.t0; $("seek").max = d.t1; $("seek").value = d.t0;
-    $("data-badge").textContent = label;
-    renderMarks(); renderEvents(); renderStops(); updatePlay(); draw(); updateClock();
+  function fmtLong(t) {
+    // videóidő: 1 óra fölött ó:pp:mm
+    t = Math.max(0, t); if (t < 3600) return fmt(t);
+    const h = Math.floor(t / 3600), mm = Math.floor((t % 3600) / 60), ss = Math.floor(t % 60);
+    return `${h}:${String(mm).padStart(2, "0")}:${String(ss).padStart(2, "0")}`;
   }
+  function halfAt(d, t) { return d.halves.find((h) => t >= h.start - 0.05 && t <= h.end + 0.05) || null; }
+  function inBreak(d, t) { return d.halves.length >= 2 && t > d.halves[0].end && t < d.halves[1].start; }
+  function clockAt(t) {
+    // Meccsóra: ha az adatban vannak félidők (meccs-összesítő), a hivatalos óra (2. félidő 45:00-tól), különben videóidő
+    const d = state.replay.data;
+    if (!d || !d.halves.length) return { main: fmt(t), sub: d && !d.demo ? "videóidő" : "" };
+    if (inBreak(d, t)) return { main: "Szünet", sub: `videó ${fmtLong(t)}` };
+    const h = halfAt(d, t) || (t < d.halves[0].start ? d.halves[0] : d.halves[d.halves.length - 1]);
+    return { main: fmt(h.clock0 + Math.max(0, t - h.start)), sub: `${h.label} · videó ${fmtLong(t)}` };
+  }
+  function eventClock(e) {
+    if (typeof e.match_clock === "string" && e.match_clock) return e.match_clock;
+    return clockAt(e.time).main;
+  }
+  const inRange = (t, pad = 0) => t >= state.replay.range.t0 - pad && t <= state.replay.range.t1 + pad;
+
+  function rangeFor(sel) {
+    const d = state.replay.data;
+    const h = sel !== "all" && d.halves.length >= 2 ? d.halves.find((x) => String(x.idx) === sel) : null;
+    if (h) {
+      const t0 = Math.max(d.t0, h.start), t1 = Math.min(d.t1, h.end);
+      return t1 > t0 ? { t0, t1 } : { t0: h.start, t1: h.end };
+    }
+    return { t0: d.t0, t1: d.t1 };
+  }
+  function setHalf(sel) {
+    const d = state.replay.data; if (!d) return;
+    if (d.halves.length < 2) sel = "all";
+    state.replay.half = sel; state.replay.range = rangeFor(sel);
+    document.querySelectorAll("#half-tabs [data-half]").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.half === sel)));
+    $("seek").min = state.replay.range.t0; $("seek").max = state.replay.range.t1;
+    if (!inRange(state.replay.t)) { state.replay.playing = false; updatePlay(); }
+    renderEvents(); renderStops();
+    seek(state.replay.t);
+  }
+
+  function loadMatch(d, label, source) {
+    state.replay.data = d; state.replay.t = d.t0; state.replay.playing = false; state.replay.stops = [];
+    state.replay.source = source || null;
+    $("data-badge").textContent = label;
+    $("half-tabs").hidden = d.halves.length < 2;
+    renderLegend();
+    setHalf("all");
+    seek(d.t0); updatePlay();
+  }
+  function renderLegend() {
+    const k = state.replay.data && state.replay.data.kits;
+    const item = (bg, label, ring) => `<span><b style="background:${bg}${ring ? ";border:1px solid #333" : ""}"></b>${label}</span>`;
+    $("legend").innerHTML =
+      item(k ? k[1].fill : TEAM[1], "Hazai", k && k[1].light) + item(k ? k[2].fill : TEAM[2], "Vendég", k && k[2].light) +
+      item(GK[1], "Hazai kapus") + item(GK[2], "Vendég kapus") + item("#ffffff", "Labda", true) +
+      (k ? '<span class="badge" title="Az elemzés során tanult mezszínek">mezszín</span>' : "");
+  }
+  function markPos(t) { const r = state.replay.range; return `${((t - r.t0) / Math.max(1e-6, r.t1 - r.t0)) * 100}%`; }
   function renderMarks() {
     const d = state.replay.data, box = $("marks"); box.innerHTML = "";
     if (!d) return;
-    for (const e of d.events) {
+    if (state.replay.half === "all" && d.halves.length >= 2 && d.halves[1].start > d.halves[0].end) {
+      // a félidei szünet halvány sávként (lejátszáskor átugorjuk)
       const i = document.createElement("i");
-      i.style.left = `${((e.time - d.t0) / Math.max(1e-6, d.t1 - d.t0)) * 100}%`;
+      i.style.left = markPos(d.halves[0].end); i.style.width = `calc(${markPos(d.halves[1].start)} - ${markPos(d.halves[0].end)})`;
+      i.style.background = "var(--line)"; i.style.transform = "none"; i.title = "Szünet";
+      box.appendChild(i);
+    }
+    for (const e of d.events) {
+      if (!inRange(e.time)) continue;
+      const i = document.createElement("i");
+      i.style.left = markPos(e.time);
       i.style.background = EVENT_COLORS[e.type] || "#cbd5d0";
       box.appendChild(i);
     }
     for (const s of state.replay.stops) {
+      if (!inRange(s.t)) continue;
       const i = document.createElement("i");
-      i.style.left = `${((s.t - d.t0) / Math.max(1e-6, d.t1 - d.t0)) * 100}%`;
+      i.style.left = markPos(s.t);
       i.style.background = "var(--accent)"; i.style.height = "12px"; i.style.top = "-2px";
       box.appendChild(i);
     }
   }
   function renderEvents() {
     const d = state.replay.data, box = $("events"); box.innerHTML = "";
-    if (!d || !d.events.length) { box.innerHTML = '<p class="hint">Ebben az adatban nincs esemény.</p>'; return; }
-    for (const e of d.events) {
+    const evs = d ? d.events.filter((e) => inRange(e.time, 5)) : [];
+    if (!evs.length) { box.innerHTML = `<p class="hint">${d && d.events.length ? "Ebben a félidőben nincs esemény." : "Ebben az adatban nincs esemény."}</p>`; return; }
+    for (const e of evs) {
       const row = document.createElement("div"); row.className = "item";
       const name = EVENT_NAMES[e.type] || e.type;
-      row.innerHTML = `<span class="ev-time">${fmt(e.time)}</span><span style="flex:1;min-width:0">${escapeHtml(name)}${e.team ? ` · ${e.team === "team1" ? "hazai" : "vendég"}` : ""}</span>`;
+      row.innerHTML = `<span class="ev-time">${escapeHtml(eventClock(e))}</span><span style="flex:1;min-width:0">${escapeHtml(name)}${e.team ? ` · ${e.team === "team1" ? "hazai" : "vendég"}` : ""}</span>`;
       const b = document.createElement("button"); b.textContent = "Ugrás";
       b.onclick = () => { seek(e.time - 3); };
       row.appendChild(b); box.appendChild(row);
@@ -540,9 +719,10 @@ canvas#pitch { display: block; width: 100%; touch-action: none; cursor: crosshai
     if (!state.replay.stops.length) { box.innerHTML = '<p class="hint">Még nincs rajz-megálló.</p>'; renderMarks(); return; }
     state.replay.stops.sort((a, b) => a.t - b.t).forEach((s) => {
       const row = document.createElement("div"); row.className = "item";
-      row.innerHTML = `<span class="ev-time">${fmt(s.t)}</span><span style="flex:1">${s.items.length} rajzelem</span>`;
-      const go = document.createElement("button"); go.textContent = "Ugrás"; go.onclick = () => { state.replay.playing = false; updatePlay(); seek(s.t, true); };
-      const del = document.createElement("button"); del.textContent = "Törlés"; del.onclick = () => { state.replay.stops = state.replay.stops.filter((x) => x !== s); renderStops(); draw(); };
+      row.innerHTML = `<span class="ev-time">${escapeHtml(clockAt(s.t).main)}</span><span style="flex:1">${s.items.length} rajzelem</span>`;
+      const go = document.createElement("button"); go.textContent = "Ugrás";
+      go.onclick = () => { state.replay.playing = false; updatePlay(); if (!inRange(s.t)) setHalf("all"); seek(s.t, true); };
+      const del = document.createElement("button"); del.textContent = "Törlés"; del.onclick = () => { pushUndo(); state.replay.stops = state.replay.stops.filter((x) => x !== s); renderStops(); draw(); };
       row.append(go, del); box.appendChild(row);
     });
     renderMarks();
@@ -553,11 +733,12 @@ canvas#pitch { display: block; width: 100%; touch-action: none; cursor: crosshai
   }
   function seek(t, exact = false) {
     const d = state.replay.data; if (!d) return;
-    state.replay.t = Math.max(d.t0, Math.min(d.t1, t));
+    const r = state.replay.range;
+    state.replay.t = Math.max(r.t0, Math.min(r.t1, t));
     if (!exact) lastPassed = state.replay.t;
     $("seek").value = state.replay.t; updateClock(); draw();
   }
-  function updateClock() { $("clock").textContent = fmt(state.replay.t); }
+  function updateClock() { const c = clockAt(state.replay.t); $("clock").textContent = c.main; $("clock-sub").textContent = c.sub; }
   function updatePlay() { $("play").textContent = state.replay.playing ? "❚❚ Szünet" : "▶ Lejátszás"; }
 
   let lastTs = null, lastPassed = 0;
@@ -569,7 +750,9 @@ canvas#pitch { display: block; width: 100%; touch-action: none; cursor: crosshai
         // rajz-megállónál automatikus szünet
         const stop = state.replay.stops.find((s) => s.t > prev + 1e-3 && s.t <= next && s.t > lastPassed + 1e-3);
         if (stop) { next = stop.t; state.replay.playing = false; lastPassed = stop.t; updatePlay(); }
-        if (next >= d.t1) { next = d.t1; state.replay.playing = false; updatePlay(); }
+        if (inBreak(d, next)) next = d.halves[1].start; // a félidei szünetet átugorjuk
+        const end = state.replay.range.t1;
+        if (next >= end) { next = end; state.replay.playing = false; updatePlay(); }
         state.replay.t = next; $("seek").value = next; updateClock(); draw();
       }
       lastTs = ts;
@@ -744,7 +927,7 @@ canvas#pitch { display: block; width: 100%; touch-action: none; cursor: crosshai
       const row = document.createElement("div"); row.className = "item";
       const name = document.createElement("span"); name.style.flex = "1"; name.style.minWidth = "0"; name.textContent = s.name;
       const load = document.createElement("button"); load.textContent = "Betöltés";
-      load.onclick = () => { pushUndo(); state.board = JSON.parse(JSON.stringify(s.board)); syncBoardInputs(); draw(); persistDraft(); status("board-status", `Betöltve: ${s.name}`); };
+      load.onclick = () => { pushUndo(); state.board = JSON.parse(JSON.stringify(s.board)); srvBoard = { id: null, name: null }; syncBoardInputs(); draw(); persistDraft(); status("board-status", `Betöltve: ${s.name}`); };
       const del = document.createElement("button"); del.textContent = "Törlés";
       del.onclick = () => { const l = store.get("tt-saved", []); l.splice(i, 1); store.set("tt-saved", l); renderSaved(); };
       row.append(name, load, del); box.appendChild(row);
@@ -766,10 +949,213 @@ canvas#pitch { display: block; width: 100%; touch-action: none; cursor: crosshai
     try {
       const o = JSON.parse($("paste-area").value);
       if (!o.board || !Array.isArray(o.board.players)) throw new Error();
-      pushUndo(); state.board = o.board; syncBoardInputs(); draw(); persistDraft(); status("board-status", "Tábla betöltve.");
+      pushUndo(); state.board = o.board; srvBoard = { id: null, name: null }; syncBoardInputs(); draw(); persistDraft(); status("board-status", "Tábla betöltve.");
     } catch { status("board-status", "Ez nem taktikai tábla JSON. Másold be újra a teljes szöveget."); }
   };
   function status(id, msg) { $(id).textContent = msg; }
+  const modeStatus = () => (state.mode === "board" ? "board-status" : "replay-status");
+
+  // ---------- Szerveres mentések (csak ha a program szervere szolgálja ki az oldalt) ----------
+  // Felderítés: GET /boards rövid időkorláttal, csak saját origin. Önálló oldalon (fájl, megosztott oldal)
+  // ez nem sikerül, és a szerveres részek csendben rejtve maradnak.
+  const server = { ok: false, boards: [] };
+  let srvBoard = { id: null, name: null };      // a szerverről betöltött tábla (a következő mentés ezt frissíti)
+  async function probeServer() {
+    if (!/^https?:$/.test(location.protocol)) return false;
+    const ctl = typeof AbortController === "function" ? new AbortController() : null;
+    const timer = setTimeout(() => ctl && ctl.abort(), 1500);
+    try {
+      const r = await fetch("/boards", { signal: ctl ? ctl.signal : undefined, cache: "no-store", credentials: "same-origin", headers: { Accept: "application/json" } });
+      if (!r.ok || !(r.headers.get("content-type") || "").includes("json")) return false;
+      const j = await r.json();
+      if (!j || !Array.isArray(j.boards)) return false;
+      server.boards = j.boards; return true;
+    } catch { return false; } finally { clearTimeout(timer); }
+  }
+  async function api(method, path, body) {
+    const r = await fetch(path, {
+      method, cache: "no-store", credentials: "same-origin",
+      headers: body ? { "Content-Type": "application/json", Accept: "application/json" } : { Accept: "application/json" },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    let j = null; try { j = await r.json(); } catch {}
+    if (!r.ok || !j || j.status === "error") throw new Error((j && (j.message || j.detail)) || `A szerver hibát jelzett (${r.status}).`);
+    return j;
+  }
+  async function refreshServer() {
+    if (!server.ok) return;
+    try { server.boards = (await api("GET", "/boards")).boards || []; }
+    catch (e) { status("board-status", `A szerveres lista nem tölthető be: ${e.message}`); }
+    renderServerList("board"); renderServerList("replay");
+  }
+  function fmtStamp(iso) {
+    if (!iso) return "";
+    const d = new Date(iso); return isNaN(d) ? String(iso) : d.toLocaleString("hu-HU", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+  }
+  function confirmButton(label, action) {
+    // kétlépéses törlés: első koppintás „Biztosan?”, a második töröl
+    const b = document.createElement("button"); b.textContent = label;
+    b.onclick = () => {
+      if (b.dataset.armed) { action(); return; }
+      b.dataset.armed = "1"; b.textContent = "Biztosan?";
+      setTimeout(() => { if (b.isConnected) { delete b.dataset.armed; b.textContent = label; } }, 3000);
+    };
+    return b;
+  }
+  function listRow(title, meta, buttons) {
+    const row = document.createElement("div"); row.className = "item";
+    const name = document.createElement("span"); name.style.flex = "1"; name.style.minWidth = "0"; name.textContent = title;
+    if (meta) { const m2 = document.createElement("span"); m2.className = "meta"; m2.textContent = meta; name.appendChild(m2); }
+    row.append(name, ...buttons); return row;
+  }
+  function renderServerList(kind) {
+    const box = $(kind === "board" ? "srv-saved" : "stops-srv-saved"); box.innerHTML = "";
+    const list = server.boards.filter((b) => (b.kind || "board") === kind);
+    if (!list.length) { box.innerHTML = `<p class="hint">Még nincs ${kind === "board" ? "tábla" : "rajzsor"} a szerveren.</p>`; return; }
+    for (const b of list) {
+      const load = document.createElement("button"); load.textContent = "Betöltés";
+      load.onclick = () => loadServerItem(b);
+      const del = confirmButton("Törlés", async () => {
+        try { await api("DELETE", `/boards/${encodeURIComponent(b.id)}`); if (srvBoard.id === b.id) srvBoard = { id: null, name: null }; status(kind === "board" ? "board-status" : "stops-status", `Törölve a szerverről: ${b.name}`); }
+        catch (e) { status(kind === "board" ? "board-status" : "stops-status", e.message); }
+        refreshServer();
+      });
+      const meta = [fmtStamp(b.updated_at), kind === "replay" && b.events_url ? b.events_url.split("/").pop() : ""].filter(Boolean).join(" · ");
+      box.appendChild(listRow(b.name, meta, [load, del]));
+    }
+  }
+  async function loadServerItem(b) {
+    const sid = b.kind === "replay" ? "stops-status" : "board-status";
+    try {
+      const doc = (await api("GET", `/boards/${encodeURIComponent(b.id)}`)).board;
+      if (b.kind === "replay") { await applyStopSet(doc.data, doc.name); return; }
+      const board = doc.data && (doc.data.board || doc.data);
+      if (!board || !Array.isArray(board.players)) throw new Error("A mentett tábla adata hibás.");
+      pushUndo(); state.board = board; srvBoard = { id: doc.id, name: doc.name };
+      $("save-name").value = doc.name;
+      syncBoardInputs(); state.selected = null; renderSelected(); draw(); persistDraft(); status(sid, `Betöltve a szerverről: ${doc.name}`);
+    } catch (e) { status(sid, e.message); }
+  }
+  $("srv-save").onclick = async () => {
+    const typed = $("save-name").value.trim();
+    const overwrite = !!srvBoard.id && (!typed || typed === srvBoard.name);
+    const name = typed || srvBoard.name || `Tábla ${new Date().toLocaleString("hu-HU")}`;
+    try {
+      const j = await api("POST", "/boards", { id: overwrite ? srvBoard.id : undefined, name, kind: "board", data: { taktikai_tabla: 1, board: state.board } });
+      srvBoard = { id: j.board.id, name: j.board.name };
+      status("board-status", overwrite ? `Frissítve a szerveren: ${j.board.name}` : `Elmentve a szerverre: ${j.board.name}`);
+      $("save-name").value = j.board.name;
+    } catch (e) { status("board-status", `Nem sikerült a szerverre menteni: ${e.message}`); }
+    refreshServer();
+  };
+  async function initServer() {
+    server.ok = await probeServer();
+    for (const id of ["srv-board", "stops-srv", "stops-srv-save", "local-sub", "stops-local-sub"]) $(id).hidden = !server.ok;
+    if (!server.ok) return;
+    $("local-hint").textContent = "A „Mentés” ebben a böngészőben marad; a szerverre mentett tábla bármelyik eszközről elérhető.";
+    renderServerList("board"); renderServerList("replay");
+  }
+
+  // ---------- Rajzsorok (visszajátszás rajz-megállói) mentése a meccsfájllal együtt ----------
+  function stopSetData() {
+    const src = state.replay.source || {};
+    return {
+      taktikai_tabla: 1, kind: "replay",
+      stops: JSON.parse(JSON.stringify(state.replay.stops)),
+      events_url: src.url || null, events_name: src.name || null, demo: !!src.demo, half: state.replay.half,
+    };
+  }
+  const safeUrl = (u) => typeof u === "string" && u.startsWith("/") && !u.startsWith("//") && !u.includes("\\");
+  async function fetchMatch(url) {
+    const r = await fetch(url, { cache: "no-store" });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return normalizeMatch(await r.json());
+  }
+  async function applyStopSet(set, name) {
+    if (!set || !Array.isArray(set.stops)) { status("stops-status", "Ez nem rajzsor-mentés."); return; }
+    const src = state.replay.source || {};
+    const same = set.demo ? !!src.demo : (set.events_url && set.events_url === src.url) || (set.events_name && set.events_name === src.name);
+    let note = "";
+    if (!same) {
+      // a hozzá tartozó meccs betöltése: a mentett URL, vagy szerveren a /clips/<fájlnév>
+      const urls = [];
+      if (safeUrl(set.events_url)) urls.push(set.events_url);
+      if (server.ok && set.events_name && /^[\w.-]+\.json$/.test(set.events_name)) urls.push(`/clips/${set.events_name}`);
+      let ok = false;
+      if (set.demo) { loadMatch(demoMatch(), "bemutató", { demo: true }); ok = true; }
+      for (const u of urls) {
+        if (ok) break;
+        try { const d = await fetchMatch(u); if (d) { loadMatch(d, "saját meccs", { url: u, name: set.events_name || u.split("/").pop() }); ok = true; } } catch {}
+      }
+      if (!ok && (set.events_url || set.events_name)) note = ` Figyelem: ez a rajzsor a(z) „${set.events_name || set.events_url}” meccshez készült – töltsd be azt a fájlt is.`;
+    }
+    pushUndo();
+    state.replay.stops = JSON.parse(JSON.stringify(set.stops)).filter((st) => st && Number.isFinite(+st.t) && Array.isArray(st.items)).map((st) => ({ t: +st.t, items: st.items }));
+    const first = state.replay.stops.slice().sort((a, b) => a.t - b.t)[0];
+    if (first && !inRange(first.t)) setHalf("all");
+    renderStops();
+    if (first) { state.replay.playing = false; updatePlay(); seek(first.t, true); } else draw();
+    status("stops-status", `Betöltve: ${name} (${state.replay.stops.length} megálló).${note}`);
+  }
+  function renderStopSets() {
+    const list = store.get("tt-stops-saved", []), box = $("stops-saved"); box.innerHTML = "";
+    if (!list.length) { box.innerHTML = '<p class="hint">Még nincs mentett rajzsor ebben a böngészőben.</p>'; return; }
+    list.forEach((s, i) => {
+      const load = document.createElement("button"); load.textContent = "Betöltés"; load.onclick = () => applyStopSet(s.data, s.name);
+      const del = confirmButton("Törlés", () => { const l = store.get("tt-stops-saved", []); l.splice(i, 1); store.set("tt-stops-saved", l); renderStopSets(); });
+      const meta = [fmtStamp(s.saved_at), s.data && (s.data.events_name || (s.data.demo ? "bemutató" : ""))].filter(Boolean).join(" · ");
+      box.appendChild(listRow(s.name, meta, [load, del]));
+    });
+  }
+  function stopSetName() { return $("stops-name").value.trim() || `Rajzsor ${new Date().toLocaleString("hu-HU")}`; }
+  $("stops-save").onclick = () => {
+    if (!state.replay.stops.length) { status("stops-status", "Nincs mit menteni: előbb rajzolj a visszajátszásra."); return; }
+    const name = stopSetName(), list = store.get("tt-stops-saved", []);
+    list.unshift({ name, saved_at: new Date().toISOString(), data: stopSetData() });
+    status("stops-status", store.set("tt-stops-saved", list) ? `Elmentve: ${name}` : "A böngésző nem engedi a mentést.");
+    $("stops-name").value = ""; renderStopSets();
+  };
+  $("stops-srv-save").onclick = async () => {
+    if (!state.replay.stops.length) { status("stops-status", "Nincs mit menteni: előbb rajzolj a visszajátszásra."); return; }
+    const name = stopSetName();
+    try { await api("POST", "/boards", { name, kind: "replay", data: stopSetData() }); status("stops-status", `Elmentve a szerverre: ${name}`); $("stops-name").value = ""; }
+    catch (e) { status("stops-status", `Nem sikerült a szerverre menteni: ${e.message}`); }
+    refreshServer();
+  };
+
+  // ---------- Kép mentése (PNG) ----------
+  function exportStamp() { const d = new Date(), p2 = (v) => String(v).padStart(2, "0"); return `${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}-${p2(d.getHours())}${p2(d.getMinutes())}`; }
+  function drawExportLabel() {
+    // visszajátszásban a meccsóra a kép sarkába
+    if (state.mode !== "replay" || !state.replay.data) return;
+    const c = clockAt(state.replay.t), text = c.sub ? `${c.main} · ${c.sub}` : c.main;
+    ctx.save(); ctx.font = `600 ${Math.max(11, Math.round(m(1.6)))}px Inter, system-ui, sans-serif`;
+    ctx.textAlign = "left"; ctx.textBaseline = "top";
+    const pad = 4, w = ctx.measureText(text).width, h = Math.max(11, Math.round(m(1.6))) + pad * 2;
+    ctx.fillStyle = "rgba(0,0,0,.55)"; ctx.fillRect(6, 6, w + pad * 2, h);
+    ctx.fillStyle = "#fff"; ctx.fillText(text, 6 + pad, 6 + pad); ctx.restore();
+  }
+  function showImageOverlay() {
+    $("img-out").src = canvas.toDataURL("image/png");
+    $("img-overlay").hidden = false; $("img-close").focus();
+  }
+  function closeOverlay() { $("img-overlay").hidden = true; $("img-out").removeAttribute("src"); $("export-png").focus(); }
+  $("img-close").onclick = closeOverlay;
+  $("img-overlay").addEventListener("click", (e) => { if (e.target === $("img-overlay")) closeOverlay(); });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("img-overlay").hidden) closeOverlay(); });
+  $("export-png").onclick = () => {
+    drawing = null; draw(); drawExportLabel();
+    const name = `taktikai-tabla-${state.mode === "replay" ? "visszajatszas-" : ""}${exportStamp()}.png`;
+    if (!server.ok) { showImageOverlay(); draw(); return; } // önálló oldalon a letöltés tiltott lehet
+    canvas.toBlob((blob) => {
+      draw();
+      if (!blob) { showImageOverlay(); return; }
+      const url = URL.createObjectURL(blob), a = document.createElement("a");
+      a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+      status(modeStatus(), `A kép letöltése elindult: ${name}`);
+    }, "image/png");
+  };
 
   // Mód váltás
   function setMode(mode) {
@@ -777,20 +1163,21 @@ canvas#pitch { display: block; width: 100%; touch-action: none; cursor: crosshai
     $("tab-board").setAttribute("aria-selected", String(mode === "board"));
     $("tab-replay").setAttribute("aria-selected", String(mode === "replay"));
     $("panel-board").hidden = mode !== "board"; $("panel-replay").hidden = mode !== "replay"; $("timeline").hidden = mode !== "replay";
-    if (mode === "replay" && !state.replay.data) loadMatch(demoMatch(), "bemutató");
+    if (mode === "replay" && !state.replay.data) loadMatch(demoMatch(), "bemutató", { demo: true });
     try { history.replaceState(null, "", mode === "replay" ? "#visszajatszas" : "#tabla"); } catch {}
     draw();
   }
   $("tab-board").onclick = () => setMode("board");
   $("tab-replay").onclick = () => setMode("replay");
 
-  $("play").onclick = () => { if (!state.replay.data) return; if (state.replay.t >= state.replay.data.t1) seek(state.replay.data.t0); state.replay.playing = !state.replay.playing; updatePlay(); };
+  $("play").onclick = () => { if (!state.replay.data) return; if (state.replay.t >= state.replay.range.t1) seek(state.replay.range.t0); state.replay.playing = !state.replay.playing; updatePlay(); };
+  document.querySelectorAll("#half-tabs [data-half]").forEach((b) => b.addEventListener("click", () => setHalf(b.dataset.half)));
   $("back5").onclick = () => seek(state.replay.t - 5);
   $("fwd5").onclick = () => seek(state.replay.t + 5);
   $("speed").onchange = (e) => { state.replay.speed = +e.target.value; };
   $("trails").onchange = (e) => { state.replay.trails = e.target.checked; draw(); };
   $("seek").oninput = (e) => seek(+e.target.value);
-  $("demo").onclick = () => { loadMatch(demoMatch(), "bemutató"); status("replay-status", ""); };
+  $("demo").onclick = () => { loadMatch(demoMatch(), "bemutató", { demo: true }); status("replay-status", ""); };
   $("file").onchange = (e) => {
     const f = e.target.files[0]; if (!f) return;
     const r = new FileReader();
@@ -798,7 +1185,7 @@ canvas#pitch { display: block; width: 100%; touch-action: none; cursor: crosshai
       try {
         const d = normalizeMatch(JSON.parse(r.result));
         if (!d) { status("replay-status", "A fájlban nincs játékos-útvonal (trajectories). Az elemzést az új programverzióval futtasd újra."); return; }
-        loadMatch(d, "saját meccs"); status("replay-status", `Betöltve: ${f.name} – ${d.tracks.length} játékos-útvonal, ${d.events.length} esemény.`);
+        loadMatch(d, "saját meccs", { name: f.name }); status("replay-status", matchSummary(f.name, d));
       } catch { status("replay-status", "Ez a fájl nem olvasható JSON. Az elemző program events_*.json fájlját válaszd."); }
     };
     r.readAsText(f);
@@ -810,8 +1197,8 @@ canvas#pitch { display: block; width: 100%; touch-action: none; cursor: crosshai
     let url = null; try { url = new URLSearchParams(location.search).get("events"); } catch {}
     if (!url) return false;
     try {
-      const d = normalizeMatch(await (await fetch(url)).json());
-      if (d) { setMode("replay"); loadMatch(d, "saját meccs"); return true; }
+      const d = await fetchMatch(url);
+      if (d) { setMode("replay"); loadMatch(d, "saját meccs", { url, name: url.split("/").pop() }); status("replay-status", matchSummary(url.split("/").pop(), d)); return true; }
     } catch {}
     return false;
   }
@@ -826,11 +1213,12 @@ canvas#pitch { display: block; width: 100%; touch-action: none; cursor: crosshai
     { type: "circle", pts: [[62, 34], [66, 34]], color: COLORS[2] },
     { type: "text", pts: [[62, 25], [62, 25]], color: COLORS[0], text: "Presszing" },
   ];
-  syncBoardInputs(); renderSaved(); renderSelected(); setTool("move");
+  syncBoardInputs(); renderSaved(); renderStopSets(); renderSelected(); setTool("move"); renderLegend();
   window.addEventListener("resize", layout);
   layout();
   setMode(location.hash === "#visszajatszas" ? "replay" : "board");
   loadFromQuery();
+  initServer();
   requestAnimationFrame(tick);
 })();
 </script>

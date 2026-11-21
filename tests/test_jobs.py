@@ -257,7 +257,9 @@ class Fakes:
         pts = [[30.0, 20.0, start + i * 0.2] for i in range(200)]
         payload = {"events": events, "match_stats": {"half": n}, "review_url": f"/clips/review_{n}/index.html",
                    "source": {"video_path": video_path, "start_sec": start, "end_sec": end},
-                   "trajectories": {"hz": 5.0, "tracks": {"3": {"team": 1, "keeper": False, "points": pts}}}}
+                   "trajectories": {"hz": 5.0, "tracks": {"3": {"team": 1, "keeper": False, "points": pts}},
+                                    "ball_hz": 10.0, "ball": [[50.0, 30.0, start + i * 0.1] for i in range(20)]},
+                   "team_colors": {"team1": [200, 30, 30], "team2": [240, 240, 240], "other": None}}
         path = os.path.join(self.out_dir, f"events_fake{n}.json")
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f)
@@ -355,6 +357,12 @@ def test_pipeline_full_orchestration():
         tracks = merged["trajectories"]["tracks"]
         assert set(tracks) == {"3", str(3 + pipeline.SECOND_HALF_TRACK_OFFSET)}
         assert tracks[str(3 + pipeline.SECOND_HALF_TRACK_OFFSET)]["original_track_id"] == 3
+        # labda: a két félidő összefűzve, idő szerint; mezszínek és félidőhossz a táblának
+        ball = merged["trajectories"]["ball"]
+        assert len(ball) == 40 and ball[0][2] == 100.0 and ball[20][2] == 3700.0
+        assert all(ball[i][2] <= ball[i + 1][2] for i in range(len(ball) - 1))
+        assert merged["team_colors"]["team1"] == [200, 30, 30]
+        assert merged["expected_half_min"] == 40.0
         summary = pipeline.summarize(res)
         assert "A meccs elemzése elkészült" in summary and "Összesített események (8 db)" in summary
     finally:
