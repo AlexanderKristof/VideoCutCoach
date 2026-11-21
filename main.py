@@ -1199,6 +1199,64 @@ async def delete_board_endpoint(board_id: str):
         return _board_error(ex)
 
 
+# Videó elemzés (a tábla 3. módja): a szerveren lévő videók listája és a rajzos export. Lásd video_annotate.py
+import video_annotate
+from boards import slugify as _board_slugify
+
+
+@app.get("/videos")
+async def list_videos_endpoint():
+    """{videos: [{name, url, size, mtime, kind, fps?, duration_sec?, events_url?}], events: [{name, url, ...}]}"""
+    loop = asyncio.get_running_loop()
+    listing = await loop.run_in_executor(None, video_annotate.list_videos, CLIPS_DIR)
+    return {"status": "success", **listing}
+
+
+def _job_burn_stops(progress, video_path, stops, opts):
+    name = _board_slugify(opts.get("title") or os.path.splitext(os.path.basename(video_path))[0])
+    out_name = f"rajzos_{name}_{uuid.uuid4().hex[:6]}.mp4"
+    out_path = os.path.abspath(os.path.join(CLIPS_DIR, out_name))
+    try:
+        res = video_annotate.burn_stops(
+            video_path, stops, out_path, default_hold=opts["default_hold_sec"],
+            start_sec=opts.get("start_sec"), end_sec=opts.get("end_sec"),
+            progress_cb=lambda done, total, label: progress(100.0 * done / max(1, total), label))
+    except (ValueError, RuntimeError) as ex:
+        return {"status": "error", "message": str(ex)}
+    return {**res, "url": f"/clips/{out_name}", "name": out_name}
+
+
+@app.post("/burn-stops")
+async def burn_stops_endpoint(request: _BoardRequest):
+    """
+    Rajzos videóexport háttérfeladatként. Törzs (JSON):
+      {"video_url": "/clips/x.mp4", "stops": [{t, items, hold_sec?, note?}], "title"?,
+       "default_hold_sec"?: 3, "start_sec"?, "end_sec"?: csak a részlet}
+    Válasz: {"status": "success", "job_id", "status_url"}; a kész job eredménye: {url, duration_sec, ...}.
+    """
+    try:
+        body = json.loads((await request.body()).decode("utf-8") or "null")
+    except (UnicodeDecodeError, ValueError):
+        return _form_error("A kérés törzse nem érvényes JSON.")
+    if not isinstance(body, dict):
+        return _form_error("A kérés törzse JSON objektum legyen.")
+    try:
+        video_path = video_annotate.resolve_clip_url(body.get("video_url"), CLIPS_DIR)
+        num = lambda k: (None if body.get(k) in (None, "") else float(body.get(k)))
+        opts = {"title": str(body.get("title") or "")[:80], "default_hold_sec": num("default_hold_sec") or 3.0,
+                "start_sec": num("start_sec"), "end_sec": num("end_sec")}
+        stops = body.get("stops") or []
+        info = video_annotate.probe_video(video_path) or {}
+        ranged = opts["start_sec"] is not None or opts["end_sec"] is not None
+        video_annotate.normalize_stops(stops, info.get("fps") or 25.0, info.get("frames"),
+                                       allow_empty=ranged)  # gyors ellenőrzés a job indítása előtt
+    except (ValueError, TypeError) as ex:
+        return _form_error(str(ex))
+    params = {"video_url": body.get("video_url"), "stops": len(stops), **opts}
+    job_id = job_manager.submit("burn-stops", _job_burn_stops, video_path, stops, opts, params=params)
+    return {"status": "success", "job_id": job_id, "status_url": f"/jobs/{job_id}"}
+
+
 # ============================================================
 # HÁTTÉRFELADATOK (jobok) — a hosszú munkák nem blokkolják a kérést.
 # A kliens job azonosítót kap, és a GET /jobs/{id} végponton 1–2 mp-enként

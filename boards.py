@@ -5,6 +5,8 @@ bármelyik eszközről elérhetők legyenek, amelyik a program szerverét haszn�
 Két fajta mentés van (kind):
   - "board":  felállás + rajzok (a tábla "Felállás és rajz" módja)
   - "replay": a visszajátszás rajz-megállói, a meccsfájl elérési útjával/URL-jével együtt
+  - "video":  a videóra rajzolt rajz-megállók ({t, items, hold_sec, note}), a videó
+              URL-jével / fájlnevével (video_url, video_name) – a "Videó elemzés" mód
 
 Fájlforma: {"id", "name", "kind", "created_at", "updated_at", "data": {...}}
 
@@ -21,7 +23,7 @@ import uuid
 MAX_BOARD_BYTES = 2 * 1024 * 1024   # egy mentés legfeljebb 2 MB (JSON-ként)
 MAX_NAME_LEN = 120
 MAX_BOARDS = 2000                   # ennyi mentés fölött nem fogadunk újat
-KINDS = ("board", "replay")
+KINDS = ("board", "replay", "video")
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
@@ -61,9 +63,9 @@ def check_id(board_id):
 
 
 def guess_kind(data):
-    """'replay', ha rajz-megállókat tartalmaz, különben 'board'."""
+    """'video', ha videós rajzsor; 'replay', ha rajz-megállókat tartalmaz; különben 'board'."""
     if isinstance(data, dict) and isinstance(data.get("stops"), list):
-        return "replay"
+        return "video" if data.get("kind") == "video" else "replay"
     return "board"
 
 
@@ -120,10 +122,13 @@ class BoardStore:
                 continue
             if kind and doc.get("kind") != kind:
                 continue
+            data = doc.get("data") if isinstance(doc.get("data"), dict) else {}
             out.append({"id": fn[:-5], "name": doc.get("name") or fn[:-5], "kind": doc.get("kind", "board"),
                         "updated_at": doc.get("updated_at"), "created_at": doc.get("created_at"),
                         "size": os.path.getsize(path),
-                        "events_url": (doc.get("data") or {}).get("events_url") if isinstance(doc.get("data"), dict) else None})
+                        "events_url": data.get("events_url"),
+                        "video_url": data.get("video_url") if doc.get("kind") == "video" else None,
+                        "video_name": data.get("video_name") if doc.get("kind") == "video" else None})
         out.sort(key=lambda d: (d.get("updated_at") or "", d["id"]), reverse=True)
         return out
 
@@ -144,7 +149,7 @@ class BoardStore:
         if kind is None or kind == "":
             kind = guess_kind(data)
         if kind not in KINDS:
-            raise BoardError("Ismeretlen mentésfajta (board vagy replay lehet).", 400)
+            raise BoardError("Ismeretlen mentésfajta (board, replay vagy video lehet).", 400)
         validate_data(data, kind)
         name = clean_name(name)
         if board_id:
