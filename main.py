@@ -28,6 +28,8 @@ from pitch_filters import (build_grass_mask, foot_on_grass, CameraMotion,
 from model_config import (load_model_config, resolve_weights, build_role_class_map,
                           describe_role_map, should_detect, reset_tracker)
 from auth import hash_password, verify_password, create_access_token, get_current_user
+from heatmap import TrackMetaCollector, compact_trajectories, generate_heatmaps_from_file
+from clip_export import export_clips, DEFAULT_PRE_SEC, DEFAULT_POST_SEC
 
 Base.metadata.create_all(bind=engine)
 
@@ -153,6 +155,7 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
 
     frames_done = 0
     timeline_events = []
+    track_meta = TrackMetaCollector()  # követésenkénti csapat / kapus (a mentett pályákhoz)
     # Gyors mód: a kihagyott képkockákon az utolsó felismerés eredményét rajzoljuk ki újra,
     # így a kimeneti videóban minden képkocka megmarad
     last_valid_players = []
@@ -278,6 +281,7 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
                     real_ball = None
 
                 last_valid_players, last_referee_boxes, last_ball_pixels = valid_players, referee_boxes, ball_pixels
+                track_meta.add(valid_players)
             else:
                 # Kihagyott képkocka (gyors mód): az előző felismerés újrarajzolása,
                 # statisztika és esemény nem keletkezik belőle (különben duplán számolnánk)
@@ -325,7 +329,9 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
 
     analysis_payload = {
         "events": timeline_events,
-        "match_stats": engine_instance.stats
+        "match_stats": engine_instance.stats,
+        # Tömörített pályák (5 Hz, 0.1 m) a hőtérképhez / statisztikához – lásd heatmap.py
+        "trajectories": compact_trajectories(engine_instance.player_trajectories, track_meta.summary())
     }
     with open(events_path, 'w', encoding='utf-8') as f:
         json.dump(analysis_payload, f, ensure_ascii=False, indent=4)
@@ -512,6 +518,49 @@ async def burn_drawings_endpoint(
     await loop.run_in_executor(executor, process_burn)
 
     return {"status": "success", "clip_url": f"/clips/{output_filename}", "local_path": output_path}
+
+# ============================================================
+# HŐTÉRKÉP ÉS KLIPEXPORT
+# ============================================================
+
+@app.post("/heatmap")
+async def heatmap_endpoint(
+    events_path: str = Form(...),
+    team: str = Form("all"),
+    player_id: Optional[int] = Form(None),
+    flip_second_half_at_sec: Optional[float] = Form(None)
+):
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(
+            executor, lambda: generate_heatmaps_from_file(
+                events_path, CLIPS_DIR, team=team, player_id=player_id, flip_at_sec=flip_second_half_at_sec))
+    except Exception as ex:
+        traceback.print_exc()
+        return {"status": "error", "message": f"Hőtérkép hiba: {ex}"}
+
+@app.post("/export-clips")
+async def export_clips_endpoint(
+    video_path: str = Form(...),
+    events_json: str = Form(...),
+    pre_sec: float = Form(DEFAULT_PRE_SEC),
+    post_sec: float = Form(DEFAULT_POST_SEC),
+    merge: bool = Form(True),
+    accurate: bool = Form(True),
+    title: Optional[str] = Form(None)
+):
+    try:
+        items = json.loads(events_json) if events_json else []
+    except ValueError:
+        return {"status": "error", "message": "Az events_json nem érvényes JSON."}
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(
+            executor, lambda: export_clips(video_path, items, CLIPS_DIR, pre_sec=pre_sec, post_sec=post_sec,
+                                           merge=merge, accurate=accurate, title=title))
+    except Exception as ex:
+        traceback.print_exc()
+        return {"status": "error", "message": f"Klipexport hiba: {ex}"}
 
 # ============================================================
 # AUTH VÉGPONTOK — eddig hiányoztak, pedig az AuthService.cs

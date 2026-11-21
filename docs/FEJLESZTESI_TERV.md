@@ -101,3 +101,65 @@ Kiegészítésként a színek egyszerűsítése (pl. a mezszínek klaszterezése
 ## Következő lépés
 
 Amikor a kód felkerül a repóba: az 1. fázissal kezdünk (nézők, edzők, melegítők kiszűrése).
+
+---
+
+## Hőtérkép és klipexport (API a MAUI klienshez)
+
+### Mentett pályák az események JSON-jában
+A `/cut-raw` (dev_mode, kalibrációval) által írt `events_<id>.json` új mezője a `trajectories`:
+
+```json
+"trajectories": {
+  "hz": 5.0,
+  "tracks": {
+    "12": {"team": 1, "keeper": false, "points": [[x_m, y_m, t_sec], ...]}
+  }
+}
+```
+- 5 Hz-re ritkítva, a koordináták 0.1 m-re kerekítve (105 x 68 m-es pálya, `t_sec` a teljes videóhoz mért idő).
+- `team`: a követés leggyakoribb csapata (1/2), `keeper`: volt-e valaha kapusnak jelölve.
+- Kalibráció nélkül a `tracks` üres (nincs pályakoordináta).
+
+### `POST /heatmap` (form)
+| Mező | Kötelező | Leírás |
+|---|---|---|
+| `events_path` | igen | a `/cut-raw` által visszaadott `events_path` |
+| `team` | nem | `1`, `2` vagy `all` (alapértelmezett) |
+| `player_id` | nem | csak ennek a követésnek (track_id) a hőtérképe |
+| `flip_second_half_at_sec` | nem | ettől az időponttól az x tengelyt tükrözzük, így a két félidő egy irányba támadva összeadódik |
+
+Válasz:
+```json
+{"status": "success",
+ "team_heatmaps": {"team1": "/clips/heatmap_..._team1.png", "team2": "/clips/heatmap_..._team2.png"},
+ "player_heatmaps": [{"track_id": 12, "team": 1, "url": "/clips/heatmap_..._p12.png", "distance_m": 812.4, "time_sec": 305.2}],
+ "player_stats": [{"track_id": 12, "team": 1, "keeper": false, "distance_m": 812.4,
+                   "avg_x": 31.2, "avg_y": 22.8, "time_sec": 305.2, "samples": 1526}]}
+```
+- Idővel súlyozott, 1 m-es rács, Gauss-simítás (2 m), 0..1-re normálva; a > 1 mp-es kimaradások nem számítanak teljes hosszal.
+- Játékos-hőtérkép csak a legalább 20 mp-ig követett azonosítókhoz készül (a `player_stats` mindenkit tartalmaz).
+- Megtett táv: 0.2 mp-es lépésekkel, a > 10 m/s-os ugrásokat (téves vetítés, azonosító-csere) kihagyva.
+- A kép: tiszta zöld pálya fehér vonalakkal, rajta átlátszó színskála (kék → piros); ahol nincs adat, a pálya látszik.
+- Hiba esetén: `{"status": "error", "message": "..."}`.
+
+### `POST /export-clips` (form)
+| Mező | Alapértelmezett | Leírás |
+|---|---|---|
+| `video_path` | – | az EREDETI videó útvonala |
+| `events_json` | – | JSON lista: `[{"start_sec": 10, "end_sec": 18}, {"time": 42.5}, ...]` |
+| `pre_sec` / `post_sec` | 5 / 4 | a csak `time`-mal megadott elemeknél az esemény előtti / utáni rész |
+| `merge` | true | a klipek összefűzése egy videóvá |
+| `accurate` | true | true: újrakódolás (képkocka-pontos, lassabb); false: stream copy (gyors, de csak kulcskockánál vág) |
+| `title` | – | a fájlnevekbe kerül (ékezet nélkül) |
+
+- Az átfedő vagy 1 mp-nél közelebbi ablakokat előbb összevonjuk, így ugyanaz a jelenet nem ismétlődik.
+- Válasz:
+```json
+{"status": "success",
+ "clips": [{"start_sec": 5.0, "end_sec": 17.0, "url": "/clips/Kapus_vedesek_ab12cd_01.mp4", "local_path": "C:\\...\\clips\\..."}],
+ "merged_url": "/clips/Kapus_vedesek_ab12cd_osszefuzott.mp4", "merged_local_path": "C:\\..."}
+```
+- Egyetlen klipnél a `merged_url` maga a klip; `merge=false` esetén `null`.
+- Az ffmpeg útvonala az `FFMPEG_PATH` környezeti változóval állítható (alapértelmezett: `ffmpeg.exe`).
+- Hiba esetén (üres lista, hibás időablak, hiányzó videó / ffmpeg): `{"status": "error", "message": "..."}`.
