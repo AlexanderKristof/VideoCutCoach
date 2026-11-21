@@ -60,7 +60,9 @@ Hasznos kapcsolók (`python elemzes.py --help`):
 
 - `docs/FEJLESZTESI_TERV.md` – a teljes felépítés, minden végpont mezőkkel
 - `docs/HATTERFELADATOK.md` – háttérfeladatok (haladásjelzés a MAUI-ban), parancssor
-- `docs/MODELL_BEALLITAS.md` – modell, gyors mód, osztálynevek
+- `docs/MODELL_BEALLITAS.md` – modell, gyors mód, osztálynevek, detektor-háttér (ONNX / ultralytics)
+- `docs/MODELL_TANITAS.md` – saját focis detektor tanítása (képkocka-export, címkézés, ONNX export)
+- `docs/LICENC_ES_ARUSITAS.md` – licencek és a kereskedelmi kiadás ellenőrzőlistája (`THIRD_PARTY_NOTICES.md`)
 
 ## Tesztek
 

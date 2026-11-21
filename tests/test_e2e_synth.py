@@ -19,6 +19,13 @@ Módok (E2E_MODES, alap "dyn_manual,dyn_auto,oracle"):
   oracle     – a motor a valós képkockánkénti H-t kapja (referencia)
   oracle_full – mint az oracle, de a main.py szűrői (pályahatár, követés-épség, labda-priorok) is a
                valós H-t kapják a pályakövető helyett (szűrő-hangolás a H-sodródástól függetlenül)
+  oracle_owntracker – mint az oracle, de az ultralytics-szerű model.track() helyett a SAJÁT háttér fut:
+               Detector-interfészű ál-detektor (FakeDetector, ugyanazok a zajos detektálások) + a
+               detection/tracker.py ByteTrack-szerű követő; a labda nyers jelöltjei közvetlenül
+  dyn_owntracker – mint a dyn_manual, a saját háttérrel (a kamera-kompenzáció a pályakövető becsült
+               képtér-mozgását kapja)
+  onnx_owntracker – mint az oracle_owntracker, de VALÓDI ONNX detektorral (E2E_ONNX_PATH, pl. a YOLOX
+               COCO modell; E2E_ONNX_CFG: további OnnxDetector beállítások JSON-ban) – mérés, nincs épség-kapu
   régi módok: static_off / static_on (statikus H a négy – akár képen kívüli – pályasarokból),
               oracle_off / oracle_on (labdakövető nélkül / vele)
 
@@ -67,7 +74,7 @@ if not FFMPEG:
     _skip("nincs ffmpeg a PATH-on")
 
 import synth_match  # noqa: E402
-from fake_detector import FakeYOLO  # noqa: E402
+from fake_detector import FakeYOLO, FakeDetector  # noqa: E402
 
 EVENT_TYPES = ("shot", "goal", "gk_save", "gk_conceded", "gk_goal_kick", "gk_long_ball", "gk_short_pass")
 EVENT_LABELS = {"shot": "lövés", "goal": "gól", "gk_save": "védés", "gk_conceded": "kapott gól",
@@ -86,6 +93,13 @@ MODES = {
     "oracle_on": ("valós H (orákulum) + labdakövető", "landmarks", True, True, True),
 }
 MODES["oracle_full"] = ("valós H a motornak ÉS a main.py szűrőinek", "landmarks", True, True, True)
+MODES["oracle_owntracker"] = ("valós H + saját detektor-háttér és követő", "landmarks", True, True, True)
+MODES["dyn_owntracker"] = ("dinamikus H, kézi kalibr. + saját követő", "landmarks", False, True, True)
+MODES["onnx_owntracker"] = ("valós H + VALÓDI ONNX detektor + saját követő", "landmarks", True, True, True)
+# a valódi detektoros mód mérőeszköz: az épség-ellenőrzés kihagyja (pl. a COCO modell a kis labdát alig látja)
+MEASURE_ONLY_MODES = {"onnx_owntracker"}
+# ezekben a módokban a main.py az OwnTrackerBackend-et (FakeDetector + saját ByteTracker) használja
+OWN_TRACKER_MODES = {"oracle_owntracker", "dyn_owntracker"}
 # ezekben a módokban a pályakövető helyett is a valós H fut (a szűrők hangolása a H-sodródástól függetlenül)
 ORACLE_TRACKER_MODES = {"oracle_full"}
 MODE_LABELS = {k: v[0] for k, v in MODES.items()}
@@ -356,6 +370,48 @@ def score_players(records, gt, min_h_px=50.0):
             "non_player_outputs": specs_out}
 
 
+def score_identity(records, gt, iou_thr=0.5):
+    """
+    Azonosító-stabilitás (MOT-szerű): képkockánként a kiadott játékos-dobozok párosítása a valós
+    játékos / kapus dobozokkal (IoU >= iou_thr, mohó), és valós objektumonként az azonosító-sorozat.
+      id_switches – hányszor változik egy valós játékos kiadott azonosítója (a kihagyásokat átugorva)
+      ids_per_player – átlagosan hány különböző azonosítót kap egy valós játékos (1.0 = tökéletes)
+      purity – a kiadott azonosítók hány %-a tartozik végig egyetlen valós játékoshoz
+    """
+    frames = gt["frames"]
+    roles = {p["id"]: p["role"] for p in gt["people"]}
+    seq, owner = {}, {}
+    for r in records:
+        objs = [o for o in frames[r["frame"]]["objs"] if roles.get(o[0]) in ("player", "goalkeeper")]
+        pairs = []
+        for pi, p in enumerate(r["players"]):
+            if p["tid"] is None:
+                continue
+            for o in objs:
+                v = _iou(p["bbox"], o[5:9])
+                if v >= iou_thr:
+                    pairs.append((v, pi, o[0]))
+        pairs.sort(reverse=True)
+        used_p, used_o = set(), set()
+        for v, pi, oid in pairs:
+            if pi in used_p or oid in used_o:
+                continue
+            used_p.add(pi)
+            used_o.add(oid)
+            tid = int(r["players"][pi]["tid"])
+            seq.setdefault(oid, []).append(tid)
+            owner.setdefault(tid, set()).add(oid)
+    switches = 0
+    for ids in seq.values():
+        switches += sum(1 for a, b in zip(ids, ids[1:]) if a != b)
+    n_ids = [len(set(ids)) for ids in seq.values()]
+    pure = sum(1 for o in owner.values() if len(o) == 1)
+    return {"id_switches": switches, "gt_players_seen": len(seq),
+            "ids_per_player": float(np.mean(n_ids)) if n_ids else None,
+            "purity": pure / max(1, len(owner)), "output_ids": len(owner),
+            "matched_boxes": int(sum(len(v) for v in seq.values()))}
+
+
 def ideal_events(gt):
     """Felső korlát: az events.py detektor a VALÓS pálya-pozíciókkal (labda + 22 játékos) etetve."""
     from events import EventDetector, EventConfig
@@ -480,6 +536,23 @@ def run_mode(main_mod, fake, gt, video, mode):
             config["calib_pitch_points"] = pitch_pts
             print(f"Kézi kalibráció {len(calib_names)} látható ponttal: {', '.join(calib_names)}")
     original_cpt = main_mod.create_pitch_tracker
+    original_backend = getattr(main_mod, "OWN_BACKEND", None)
+    original_roles = main_mod.role_classes
+    if mode == "onnx_owntracker":
+        from detection.backend import create_backend
+        import model_config
+        onnx_path = os.environ.get("E2E_ONNX_PATH")
+        if not onnx_path or not os.path.exists(onnx_path):
+            raise SystemExit("onnx_owntracker: az E2E_ONNX_PATH környezeti változóban add meg az .onnx fájlt")
+        mcfg = dict(model_config.DEFAULTS)
+        mcfg.update({"backend": "onnx", "onnx_path": onnx_path,
+                     "onnx": json.loads(os.environ.get("E2E_ONNX_CFG", "{}"))})
+        main_mod.OWN_BACKEND, main_mod.role_classes = create_backend(mcfg, "cpu")
+        print(f"Valódi detektor: {main_mod.OWN_BACKEND.describe()}, osztályok: "
+              f"{model_config.describe_role_map(main_mod.role_classes, main_mod.OWN_BACKEND.names)}")
+    elif mode in OWN_TRACKER_MODES:
+        from detection.backend import OwnTrackerBackend
+        main_mod.OWN_BACKEND = OwnTrackerBackend(FakeDetector(fake), role_classes=main_mod.role_classes)
     if mode in ORACLE_TRACKER_MODES:
         # a main.py szűrői (pályahatár, követés-épség, labda-priorok) is a valós H-t kapják
         main_mod.create_pitch_tracker = lambda *a, **k: (OraclePitchTracker(gt), "orákulum (valós H)")
@@ -490,13 +563,16 @@ def run_mode(main_mod, fake, gt, video, mode):
     finally:
         main_mod.TacticalEngine = original
         main_mod.create_pitch_tracker = original_cpt
+        own_stats = dict(main_mod.OWN_BACKEND.stats) if main_mod.OWN_BACKEND is not None else None
+        main_mod.OWN_BACKEND = original_backend
+        main_mod.role_classes = original_roles
     elapsed = time.time() - t0
     with open(events_path, encoding="utf-8") as f:
         payload = json.load(f)
     return {"records": Engine.records, "static_H": Engine.static_H, "events": payload["events"],
             "elapsed": elapsed, "fake_stats": dict(fake.stats), "out_video": out_path,
             "pitch_tracking": payload.get("pitch_tracking"), "calib_names": calib_names,
-            "min_h_pct": config["min_player_height_pct"]}
+            "min_h_pct": config["min_player_height_pct"], "own_backend_stats": own_stats}
 
 
 def save_annotated_frames(video_path, out_dir, mode, frame_ids):
@@ -579,6 +655,16 @@ def print_report(results, gt, tol, h_err, ideal=None):
     print(f"  (a látható valós játékos-dobozok {100 * p0['gt_below_min_h_ratio']:.0f}%-a alacsonyabb a main.py "
           f"magasságszűrőjénél ({p0['min_h_px']:.1f} px) – ezeket eldobja)")
 
+    print("\nAZONOSÍTÓK (a kiadott játékos-azonosítók stabilitása, IoU >= 0.5 a valós dobozzal)")
+    print(f"{'mód':44s} {'ID-váltás':>10s} {'azon./játékos':>14s} {'tisztaság%':>11s} {'kiadott azon.':>14s} {'párosított doboz':>17s}")
+    for mode, r in results.items():
+        i = r["identity"]
+        print(f"{MODE_LABELS[mode]:44s} {i['id_switches']:10d} {_f(i['ids_per_player']):>14s} {100 * i['purity']:11.1f} "
+              f"{i['output_ids']:14d} {i['matched_boxes']:17d}")
+    for mode, r in results.items():
+        if r.get("own_backend_stats"):
+            print(f"  Saját háttér [{mode}]: {r['own_backend_stats']}")
+
     print(f"\nESEMÉNYEK (±{tol:.1f} s tűrés)")
     header = f"{'esemény':18s} {'valós':>6s} " + " ".join(f"{m:>16s}" for m in results)
     print(header)
@@ -616,7 +702,8 @@ def print_report(results, gt, tol, h_err, ideal=None):
 
 SUMMARY_COLS = [("játékos hiba med (m)", "player_err_med", "{:.2f}"), ("lefedés %", "coverage", "{:.1f}"),
                 ("labda találat %", "ball_hit", "{:.1f}"), ("labda pálya hiba med (m)", "ball_pitch_err_med", "{:.2f}"),
-                ("csapat ok %", "team_acc", "{:.1f}"), ("esemény pontosság", "ev_precision", "{:.2f}"),
+                ("csapat ok %", "team_acc", "{:.1f}"), ("ID-váltás", "id_switches", "{:d}"),
+                ("esemény pontosság", "ev_precision", "{:.2f}"),
                 ("esemény felidézés", "ev_recall", "{:.2f}")]
 
 
@@ -624,7 +711,7 @@ def summary_row(r):
     """Módonként egy sor a fő mutatókkal (a labda pálya hibája: a motor labdapontja vs. valós, földön)."""
     return {"player_err_med": r["players"]["pitch_err"]["median"], "coverage": 100 * r["players"]["coverage"],
             "ball_hit": 100 * r["ball"]["detection_rate"], "ball_pitch_err_med": r["ball"]["engine_ball_err"]["median"],
-            "team_acc": 100 * r["players"]["team_accuracy"],
+            "team_acc": 100 * r["players"]["team_accuracy"], "id_switches": r["identity"]["id_switches"],
             "ev_precision": r["events"]["_total"]["precision"], "ev_recall": r["events"]["_total"]["recall"]}
 
 
@@ -653,6 +740,8 @@ def sanity_check(results):
     a játékosok egy része átjut, a labda néha megvan, a csapat nem véletlen.
     """
     for m, r in results.items():
+        if m in MEASURE_ONLY_MODES:
+            continue
         p, b = r["players"], r["ball"]
         assert p["coverage"] > 0.2, f"{m}: túl kicsi játékos-lefedés ({p['coverage']:.2f})"
         assert b["detection_rate"] > 0.15, f"{m}: túl kicsi labda-találati arány ({b['detection_rate']:.2f})"
@@ -702,6 +791,7 @@ def main():
                 "ball": score_ball(r["records"], gt),
                 "players": score_players(r["records"], gt, r["min_h_pct"] * gt["height"]),
                 "events": score_events(r["events"], gt["events"], tol),
+                "identity": score_identity(r["records"], gt), "own_backend_stats": r["own_backend_stats"],
                 "elapsed": r["elapsed"], "fake_stats": r["fake_stats"],
                 "detected_events": [{k: e.get(k) for k in ("type", "time", "team")} for e in r["events"]],
                 "pitch_tracking": r["pitch_tracking"], "calib_names": r["calib_names"],

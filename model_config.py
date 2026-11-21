@@ -6,6 +6,8 @@ Forrás (erősorrendben):
        TACTICAL_MODEL_WEIGHTS   – a .pt súlyfájl útvonala (mindkét eszközre)
        TACTICAL_DETECT_EVERY_N  – csak minden N. képkockán fut felismerés (gyors mód)
        TACTICAL_MODEL_CONFIG    – a JSON beállítófájl útvonala
+       TACTICAL_DETECTOR_BACKEND – "ultralytics" (alap) | "onnx" | "ultralytics_predict"
+       TACTICAL_ONNX_PATH       – az ONNX modellfájl útvonala (backend = "onnx")
   2. model_config.json (opcionális, a main.py mellett)
   3. alapértelmezés: yolov8x.pt (CUDA) / yolov8n.pt (CPU), COCO osztályok, minden képkocka
 
@@ -18,11 +20,12 @@ ROLES = ("player", "goalkeeper", "referee", "ball")
 
 # Szerepkör -> ismert osztálynevek (kisbetűs, normalizált alak).
 # COCO: "person", "sports ball"; Roboflow focis modellek: "player", "goalkeeper", "referee", "ball".
+# Magyar nevek is (saját tanítású modell: docs/MODELL_TANITAS.md – "jatekos", "kapus", "biro", "labda").
 DEFAULT_ROLE_ALIASES = {
-    "player": {"player", "person", "players"},
-    "goalkeeper": {"goalkeeper", "goalie", "keeper", "goalkeepers"},
-    "referee": {"referee", "referees", "ref"},
-    "ball": {"ball", "sports ball", "football", "soccer ball", "soccerball"},
+    "player": {"player", "person", "players", "játékos", "jatekos"},
+    "goalkeeper": {"goalkeeper", "goalie", "keeper", "goalkeepers", "kapus"},
+    "referee": {"referee", "referees", "ref", "bíró", "biro", "játékvezető", "jatekvezeto"},
+    "ball": {"ball", "sports ball", "football", "soccer ball", "soccerball", "labda"},
 }
 
 DEFAULTS = {
@@ -35,7 +38,21 @@ DEFAULTS = {
     # Külön labda-felismerő menet (második modellpéldány), ha a nyers labda-callback nem érhető el
     # (lásd main.py NYERS LABDA-DETEKTÁLÁSOK, docs/MODELL_BEALLITAS.md) – drága, alapból KI
     "ball_extra_pass": False,
+    # --- DETEKTOR-HÁTTÉR (lásd detection/, docs/MODELL_BEALLITAS.md 7. pont) ---
+    # "ultralytics": model.track() + beépített ByteTrack (AGPL-3.0 – csak fejlesztéshez!)
+    # "onnx": ONNX Runtime detektor + saját követő (detection/tracker.py) – a kereskedelmi út
+    # "ultralytics_predict": ultralytics predict + saját követő (fejlesztői összevetéshez)
+    "backend": "ultralytics",
+    "onnx_path": None,        # pl. "models/focis_detektor.onnx" (relatív útvonal: a main.py mappájához)
+    "input_size": None,       # [szélesség, magasság] vagy egy szám; alap: a modellből
+    "onnx_class_names": None, # a modell osztálynevei (lista / {id: név} / "coco80"), ha a modell nem tárolja
+    "onnx": None,             # további OnnxDetector beállítások (preset, iou, normalize, ...)
+    "providers": "auto",      # "auto" = CUDA > DirectML > CPU, vagy lista
+    "role_conf": None,        # szerepkörönkénti min. pontszám, pl. {"ball": 0.05, "player": 0.1}
+    "tracker": None,          # a saját követő paraméterei (detection/tracker.py ByteTracker)
 }
+
+BACKENDS = ("ultralytics", "onnx", "ultralytics_predict")
 
 DEFAULT_CONFIG_FILENAME = "model_config.json"
 
@@ -89,6 +106,16 @@ def load_model_config(config_path=None, env=None):
         cfg["weights"] = env["TACTICAL_MODEL_WEIGHTS"]
     if env.get("TACTICAL_DETECT_EVERY_N"):
         cfg["detect_every_n"] = env["TACTICAL_DETECT_EVERY_N"]
+
+    if env.get("TACTICAL_DETECTOR_BACKEND"):
+        cfg["backend"] = env["TACTICAL_DETECTOR_BACKEND"]
+    if env.get("TACTICAL_ONNX_PATH"):
+        cfg["onnx_path"] = env["TACTICAL_ONNX_PATH"]
+    backend = str(cfg.get("backend") or "ultralytics").strip().lower()
+    if backend not in BACKENDS:
+        print(f"⚠️ Ismeretlen detektor-háttér: {cfg['backend']!r} (lehet: {', '.join(BACKENDS)}) – ultralytics")
+        backend = "ultralytics"
+    cfg["backend"] = backend
 
     cfg["detect_every_n"] = _parse_every_n(cfg["detect_every_n"])
     try:

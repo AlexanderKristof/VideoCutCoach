@@ -18,8 +18,18 @@ from fastapi.responses import HTMLResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
-import torch
-from ultralytics import YOLO
+# --- DETEKTOR-HÁTTÉR: a torch / ultralytics csak az ultralytics háttérhez kell (lásd detection/) ---
+try:
+    import torch
+except ImportError:  # ONNX háttérnél a torch nem szükséges
+    torch = None
+
+
+def YOLO(*args, **kwargs):
+    """Lusta ultralytics import (AGPL-3.0): csak akkor töltődik be, ha az ultralytics hátteret választják."""
+    from ultralytics import YOLO as _UltralyticsYOLO
+    return _UltralyticsYOLO(*args, **kwargs)
+# --- /DETEKTOR-HÁTTÉR ---
 
 from database import get_db, engine
 from models import Base, User, Match
@@ -47,15 +57,31 @@ os.makedirs(CLIPS_DIR, exist_ok=True)
 app.mount("/clips", StaticFiles(directory=CLIPS_DIR), name="clips")
 executor = ThreadPoolExecutor(max_workers=4)
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+device = 'cuda' if (torch is not None and torch.cuda.is_available()) else 'cpu'
 model_cfg = load_model_config()
-model_weights = resolve_weights(model_cfg, device)
-if model_cfg.get("weights") and not os.path.exists(model_weights):
-    print(f"⚠️ A beállított súlyfájl nem található: {model_weights} (lásd docs/MODELL_BEALLITAS.md)")
-model = YOLO(model_weights)
-# Szerepkör -> osztály id-k a modell osztálynevei alapján (COCO: person / sports ball,
-# focis modell: player / goalkeeper / referee / ball)
-role_classes = build_role_class_map(model.names, model_cfg.get("class_names"))
+# --- DETEKTOR-HÁTTÉR: "ultralytics" (model.track + beépített ByteTrack, fejlesztéshez) vagy
+# saját háttér ("onnx" / "ultralytics_predict": detector.detect() + detection/tracker.py követő).
+# A saját háttérnél nincs ultralytics import, és a labda nyers jelöltjei közvetlenül jönnek
+# (nem kell a lenti callback-trükk). Lásd docs/MODELL_BEALLITAS.md 7. pont.
+DETECTOR_BACKEND = model_cfg.get("backend", "ultralytics")
+OWN_BACKEND = None   # OwnTrackerBackend, ha nem az ultralytics model.track() fut
+if DETECTOR_BACKEND == "ultralytics":
+    model_weights = resolve_weights(model_cfg, device)
+    if model_cfg.get("weights") and not os.path.exists(model_weights):
+        print(f"⚠️ A beállított súlyfájl nem található: {model_weights} (lásd docs/MODELL_BEALLITAS.md)")
+    model = YOLO(model_weights)
+    model_names = model.names
+    # Szerepkör -> osztály id-k a modell osztálynevei alapján (COCO: person / sports ball,
+    # focis modell: player / goalkeeper / referee / ball)
+    role_classes = build_role_class_map(model.names, model_cfg.get("class_names"))
+else:
+    from detection.backend import create_backend
+    model = None
+    OWN_BACKEND, role_classes = create_backend(model_cfg, device, build_role_class_map,
+                                               base_dir=os.path.dirname(os.path.abspath(__file__)))
+    model_names = OWN_BACKEND.names
+    model_weights = OWN_BACKEND.describe()
+# --- /DETEKTOR-HÁTTÉR ---
 if not role_classes["player"] and not role_classes["goalkeeper"]:
     print("⚠️ A modellben nincs játékos osztály (player / person) – állítsd be a class_names kulcsot!")
 DETECT_EVERY_N = model_cfg["detect_every_n"]
@@ -66,7 +92,7 @@ BALL_CONF = model_cfg["ball_conf"]
 # és a követő azonosítói nem keverednek két klip között.
 model_lock = threading.Lock()
 print(f"🔥 Tactical AI Motor aktív: {device.upper()}, modell: {model_weights}")
-print(f"   Osztályok: {describe_role_map(role_classes, model.names)}")
+print(f"   Osztályok: {describe_role_map(role_classes, model_names)}")
 if DETECT_EVERY_N > 1:
     print(f"   Gyors mód: felismerés minden {DETECT_EVERY_N}. képkockán")
 
@@ -366,17 +392,19 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
     # A megosztott modellt / követőt az egész klip idejére lefoglaljuk (lásd model_lock),
     # és töröljük az előző elemzésből megmaradt ByteTrack állapotot
     with model_lock, open(debug_log_path, "w", encoding="utf-8") as debug_file:
-        trackers_reset = reset_tracker(model)
+        # DETEKTOR-HÁTTÉR: a saját követő nullázása (az FPS a követés-puffer méretéhez kell)
+        trackers_reset = OWN_BACKEND.reset(frame_rate=fps) if OWN_BACKEND is not None else reset_tracker(model)
         debug_file.write(f"=== TACTICAL ANALYZER RUN LOG: {clip_id} ===\n")
         debug_file.write(f"Videó felbontás: {width}x{height} @ {fps} FPS, Összes képkocka: {total_frames}\n")
         debug_file.write(f"Dinamikus Felső ROI Százalék: {roi_top_pct:.2f}, Min Magasság: {min_h:.1f}px\n")
         debug_file.write(f"Fix trapéz szűrő: {'BE' if config['use_static_roi'] else 'KI'}, "
                          f"Fű arány min.: {config['grass_min_ratio']:.2f}, "
                          f"Álló alak ablak: {config['stationary_window_sec']:.1f}s\n")
-        debug_file.write(f"Modell: {model_weights}, osztályok: {describe_role_map(role_classes, model.names)}\n")
+        debug_file.write(f"Modell: {OWN_BACKEND.describe() if OWN_BACKEND is not None else model_weights}, "
+                         f"osztályok: {describe_role_map(role_classes, model_names)}\n")
         debug_file.write(f"Felismerés minden {DETECT_EVERY_N}. képkockán, törölt követők: {trackers_reset}\n")
         debug_file.write(f"Pályakövetés: {pitch_setup_msg}\n")
-        debug_file.write(f"Nyers labda-callback: {'BE' if RAW_BALL_HOOK else 'nincs (a követett dobozok)'}, "
+        debug_file.write(f"Nyers labda-callback: {'saját háttér (közvetlen)' if OWN_BACKEND is not None else ('BE' if RAW_BALL_HOOK else 'nincs (a követett dobozok)')}, "
                          f"külön labda-menet: {'BE' if ball_extra_pass else 'KI'}\n\n")
 
         while cap.isOpened():
@@ -405,6 +433,8 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
                 F_img = pitch_tracker.frame_motion() if hasattr(pitch_tracker, "frame_motion") else None
                 if ball_motion_H is not None:
                     ball_motion_H = None if F_img is None else F_img @ ball_motion_H
+                if OWN_BACKEND is not None:   # DETEKTOR-HÁTTÉR: kamera-kompenzáció a saját követőnek
+                    OWN_BACKEND.note_motion(F_img)
             # --- /Pályakövetés ---
 
             detected = should_detect(frames_done, DETECT_EVERY_N)
@@ -413,8 +443,14 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
             if detected:
                 hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
                 grass_mask, grass_scale = build_grass_mask(hsv_frame, grass_lower, grass_upper)
-                _raw_ball_buf["boxes"] = None   # NYERS LABDA: a callback tölti ki a track() alatt
-                results = model.track(frame, persist=True, tracker="bytetrack.yaml", device=device, verbose=False)
+                # --- DETEKTOR-HÁTTÉR: saját detektor + követő, vagy az ultralytics model.track() ---
+                own_raw_ball = None
+                if OWN_BACKEND is not None:
+                    results, own_raw_ball = OWN_BACKEND.track(frame)   # a labda nyers jelöltjei külön
+                else:
+                    _raw_ball_buf["boxes"] = None   # NYERS LABDA: a callback tölti ki a track() alatt
+                    results = model.track(frame, persist=True, tracker="bytetrack.yaml", device=device, verbose=False)
+                # --- /DETEKTOR-HÁTTÉR ---
                 pitch_boxes = [tuple(map(int, b.xyxy[0])) for r in results for b in r.boxes]  # pályakövetéshez
                 # PÁLYAHATÁR: a képkocka H-ja csak akkor szűr, ha megbízható (a pályakövető None-t is adhat)
                 h_trusted = pitch_h_trusted(H_cur, pitch_q if pitch_tracker is not None else None)
@@ -429,7 +465,8 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
                 ball_candidates = []  # LABDAKÖVETÉS: az összes jelölt a követőnek
 
                 # --- NYERS LABDA: a követő előtti labda-dobozok; tartalék: külön menet / a követett dobozok ---
-                ball_src = _raw_ball_buf["boxes"] if RAW_BALL_HOOK else None
+                ball_src = own_raw_ball if own_raw_ball is not None else (
+                    _raw_ball_buf["boxes"] if RAW_BALL_HOOK else None)   # DETEKTOR-HÁTTÉR: saját háttér = nyers
                 if ball_src is not None:
                     ball_stats["nyers"] += 1
                 elif ball_extra_pass:
@@ -996,6 +1033,8 @@ def _segmenter_person_counter(frame):
     hogy ne zavarja a /cut-raw követését (a model.track állapota nem szálbiztos).
     """
     global _segmenter_person_model
+    if OWN_BACKEND is not None:   # DETEKTOR-HÁTTÉR: a saját detektor (állapotmentes, követés nélkül)
+        return OWN_BACKEND.count_role(frame, ("player", "goalkeeper"), conf=0.3)
     with _segmenter_person_lock:
         if _segmenter_person_model is None:
             _segmenter_person_model = YOLO('yolov8n.pt')

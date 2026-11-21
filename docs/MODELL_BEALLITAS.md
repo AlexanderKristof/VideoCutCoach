@@ -131,3 +131,77 @@ Ultralytics-frissítés után érdemes megnézni a naplóban a „Labda-jelölte
 a mechanizmust utánozza (a követő az első `track()`-nél regisztrált callback), így a
 `tests/test_e2e_synth.py` a valódi kódutat méri.
 
+## 7. Detektor-háttér: ONNX Runtime + saját követő (a kereskedelmi út)
+
+Az ultralytics AGPL-3.0 licencű, ezért zárt forrású, eladott termékbe nem kerülhet
+(lásd `docs/LICENC_ES_ARUSITAS.md`). A `backend` kulcs választja ki a felismerő láncot:
+
+| `backend` | Felismerés | Követés | Mire |
+|---|---|---|---|
+| `"ultralytics"` (alap) | `model.track()` | az ultralytics ByteTrack-je | fejlesztés, összevetés |
+| `"onnx"` | ONNX Runtime (`detection/onnx_detector.py`, MIT) | saját követő (`detection/tracker.py`) | **termék** |
+| `"ultralytics_predict"` | ultralytics `predict()` | saját követő | fejlesztés: a saját követő valódi YOLO-dobozokon |
+
+Az `"onnx"` háttérnél a `main.py` nem importálja sem az ultralytics-et, sem a torch-ot. A labda
+minden nyers jelöltje közvetlenül a labdakövetőbe megy (a 6. pont callback-trükkje itt nem kell).
+Kész minta: `model_config.onnx.example.json`.
+
+### Beállítás
+
+```json
+{
+    "backend": "onnx",
+    "onnx_path": "models/focis_detektor.onnx",
+    "onnx_class_names": ["ball", "goalkeeper", "player", "referee"],
+    "role_conf": {"ball": 0.05, "player": 0.1, "goalkeeper": 0.1, "referee": 0.1},
+    "onnx": {"preset": "auto", "iou": 0.5, "threads": 0},
+    "providers": "auto",
+    "tracker": {"track_buffer": 30, "high_thresh": 0.25}
+}
+```
+
+| Kulcs | Jelentés | Alapérték |
+|---|---|---|
+| `backend` | lásd fent; környezeti változó: `TACTICAL_DETECTOR_BACKEND` | `ultralytics` |
+| `onnx_path` | az `.onnx` fájl (relatív útvonal: a `main.py` mappájához); környezeti változó: `TACTICAL_ONNX_PATH` | – |
+| `input_size` | a modell bemenete `[szélesség, magasság]` (csak dinamikus bemenetű modellnél kell) | a modellből |
+| `onnx_class_names` | a modell osztálynevei, ha a modell metaadata nem tartalmazza (lista, `{id: név}` vagy `"coco80"`) | metaadat / COCO |
+| `class_names` | szerepkör → osztálynevek (mint eddig, 3. pont) | automatikus |
+| `role_conf` | szerepkörönkénti minimális pontszám a detektorban (a labda alacsonyabb; a személyeknél a követő 0.1-től a gyenge dobozokat is használja) | lásd fent |
+| `onnx` | további detektor-beállítások: `preset` (`auto` / `yolo` / `yolox` / `detr`), `iou`, `max_det`, `normalize` (`"imagenet"` RF-DETR-hez), `box_format`, `threads` (CPU-szálak, 0 = automatikus) | – |
+| `providers` | `"auto"` = CUDA > DirectML > CPU, vagy lista | `auto` |
+| `tracker` | a saját követő paraméterei (`detection/tracker.py`, `ByteTracker`) | ultralytics-szerű |
+
+GPU-gyorsítás: NVIDIA kártyán `pip install onnxruntime-gpu` (CUDA), bármely Windows GPU-n (Intel / AMD
+integrált is) `pip install onnxruntime-directml`. Egyszerre csak az egyik onnxruntime csomag legyen
+telepítve. A naplóban (`Modell: ONNX (..., végrehajtó: ...)`) látszik, melyik végrehajtó fut.
+
+### Támogatott modell-kimenetek
+
+- **YOLO-szerű** (egy kimenet, NMS-t mi végzünk, osztály-tudatosan): `[1, 4+C, N]` és a **YOLOX**
+  `[1, N, 5+C]` (a hivatalos YOLOX ONNX fájlok dekódolatlan rács-kimenetét is kezeli).
+- **DETR-szerű** (NMS nélkül): RT-DETR / D-FINE export (`labels`, `boxes`, `scores` + `orig_target_sizes`
+  bemenet), RF-DETR export (`dets` + `labels` logitok; ehhez `"onnx": {"normalize": "imagenet"}`).
+
+Ellenőrzés egy képen (kimenetek, felismert konvenció, osztályok, detektálások, idő):
+```bat
+python -m detection.onnx_detector models\focis_detektor.onnx kep.jpg
+```
+
+### Kipróbált, kereskedelmileg használható modell
+
+A YOLOX (Megvii, **Apache-2.0**, kód és súlyok) hivatalos COCO ONNX fájljai működnek a háttérrel
+(`person` → játékos, `sports ball` → labda; kapust / bírót nem különböztet meg). Letöltés: a YOLOX
+projekt GitHub-oldalának „Releases” részéről (0.1.1rc0: `yolox_nano.onnx`, `yolox_tiny.onnx`,
+`yolox_s.onnx`, `yolox_m.onnx`). Ez csak átmeneti megoldás: a kis, gyors labdát a COCO modell alig
+látja – a termékhez focira finomhangolt modell kell (`docs/MODELL_TANITAS.md`).
+
+### A saját követő
+
+ByteTrack-szerű, saját kód: Kálmán-szűrő (középpont, oldalarány, magasság + sebességek), kétlépcsős
+párosítás (erős, majd gyenge detektálások; Magyar-módszer), megerősítés a második találatnál,
+elveszett követés visszatérése `track_buffer` képkockán belül. A kamera mozgását a pályakövető
+képkockák közti homográfiájával (`PitchTracker.frame_motion()`) kompenzálja – a forgó Veo képnél
+ez csökkenti az azonosító-váltásokat. A szintetikus mérés (`tests/test_e2e_synth.py`,
+`oracle_owntracker` mód) azonos detektálásokon hasonlítja össze az ultralytics-szerű követővel.
+

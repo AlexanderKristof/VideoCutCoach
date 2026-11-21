@@ -1,0 +1,11 @@
+{
+    "_megjegyzes": "ONNX háttér (kereskedelmi út). Másold model_config.json néven a main.py mellé. Leírás: docs/MODELL_BEALLITAS.md 7. pont",
+    "backend": "onnx",
+    "onnx_path": "models/focis_detektor.onnx",
+    "onnx_class_names": ["ball", "goalkeeper", "player", "referee"],
+    "role_conf": {"ball": 0.05, "player": 0.1, "goalkeeper": 0.1, "referee": 0.1},
+    "onnx": {"preset": "auto", "iou": 0.5},
+    "providers": "auto",
+    "ball_conf": 0.35,
+    "detect_every_n": 1
+}

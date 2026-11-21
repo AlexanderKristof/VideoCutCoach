@@ -11,5 +11,6 @@ passlib>=1.7.4
 bcrypt>=4.0,<5               # a passlib 1.7.4 a bcrypt 5-tel nem működik
 numpy>=1.26
 opencv-python>=4.9
-ultralytics>=8.2
+ultralytics>=8.2             # AGPL-3.0: CSAK fejlesztéshez (backend "ultralytics"), a termékbe NEM – docs/LICENC_ES_ARUSITAS.md
+onnxruntime>=1.17            # MIT: a termék detektor-háttere (backend "onnx"); GPU: onnxruntime-gpu / onnxruntime-directml
 scikit-learn>=1.4            # csak a régi analyzer.py használja

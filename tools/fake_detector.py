@@ -456,3 +456,30 @@ class FakeYOLO:
         return [FakeResult(boxes, False, self.names)]
 
     __call__ = predict
+
+
+class FakeDetector:
+    """
+    A detection/detector_base.py Detector-interfésze a FakeYOLO zajos ground-truth detektálásaival
+    (követés és callbackek nélkül) – a saját követő (detection/tracker.py) végponttól végpontig
+    tartó teszteléséhez. Ugyanazt a hívásszámlálót és véletlen-sorozatot használja, mint a FakeYOLO,
+    így egy újratöltött (load_ground_truth) FakeYOLO-val képkockára azonos detektálásokat ad.
+    """
+
+    def __init__(self, fake_yolo):
+        self.src = fake_yolo
+        self.names = fake_yolo.names
+
+    def detect(self, frame):
+        from detection.detector_base import Detections
+        idx = self.src._next_idx()
+        dets = self.src.detect_frame(idx, getattr(frame, "shape", None))
+        if not dets:
+            return Detections(names=self.names)
+        return Detections([d[0] for d in dets], [d[1] for d in dets], [d[2] for d in dets], self.names)
+
+    def detect_batch(self, frames):
+        return [self.detect(f) for f in frames]
+
+    def describe(self):
+        return "ál-detektor (FakeDetector, ground truth + zaj)"
