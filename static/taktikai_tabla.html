@@ -127,7 +127,7 @@ h3.sub { font: 600 12px var(--font-body); letter-spacing: .05em; text-transform:
           <button class="btn" id="back5">−5 mp</button>
           <button class="btn" id="fwd5">+5 mp</button>
           <select id="speed" aria-label="Sebesség">
-            <option value="0.5">0,5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option><option value="8">8×</option>
+            <option value="0.25">0,25×</option><option value="0.5">0,5×</option><option value="0.75">0,75×</option><option value="1" selected>1×</option><option value="1.5">1,5×</option><option value="2">2×</option><option value="4">4×</option>
           </select>
           <label class="row" style="font-size:13px;"><input type="checkbox" id="trails" checked> nyomvonal</label>
         </div>
@@ -582,35 +582,136 @@ h3.sub { font: 600 12px var(--font-body); letter-spacing: .05em; text-transform:
     return `Betöltve: ${name} – ${d.tracks.length} játékos-útvonal, ${d.ball.length ? "labdaúttal, " : "labdaút nélkül, "}` +
       `${d.events.length} esemény${d.halves.length >= 2 ? ", két félidő" : ""}.`;
   }
+  const DRAFT_KEY = "tt-draft-v2"; // v2: a régi, bemutató rajzos piszkozat nem töltődik vissza
   function demoMatch() {
-    // Bemutató: 90 mp kitalált játék két 4-3-3 / 4-4-2 csapattal, 5 Hz-es mintavétellel.
-    const rnd = mulberry(7);
+    // Bemutató: kb. 70 mp valós tempójú, kitalált játék (4-3-3 hazai, 4-4-2 vendég), 10 Hz.
+    // Labdasebesség: passz 12–16 m/s, lövés 26 m/s; játékos legfeljebb 7 m/s, gyorsulás 4 m/s².
     const base = [...teamPlayers(1, "4-3-3"), ...teamPlayers(2, "4-4-2")];
-    const T = 90, hz = 5, tracks = [], ball = [];
-    // labda útvonala kulcspontokon át
-    const keys = [[0, 52.5, 34], [6, 40, 20], [12, 55, 12], [18, 70, 22], [24, 62, 40], [30, 78, 50], [34, 88, 38], [36, 101, 35.5], [38, 92, 30],
-      [44, 70, 30], [50, 50, 48], [56, 35, 55], [60, 22, 40], [64, 14, 30], [66, 3, 33], [70, 20, 20], [76, 45, 14], [82, 60, 30], [90, 52, 34]];
-    const ballAt = (t) => { for (let i = 1; i < keys.length; i++) if (t <= keys[i][0]) { const a = keys[i - 1], b = keys[i], k = (t - a[0]) / (b[0] - a[0]); return [a[1] + (b[1] - a[1]) * k, a[2] + (b[2] - a[2]) * k]; } return [52.5, 34]; };
-    for (const p of base) {
-      const samples = [], ph = rnd() * 6, amp = 2 + rnd() * 3;
-      for (let i = 0; i <= T * hz; i++) {
-        const t = i / hz, [bx, by] = ballAt(t);
-        const pull = p.gk ? 0.08 : 0.28;
-        const x = p.x + (bx - 52.5) * pull + Math.sin(t / 3 + ph) * amp;
-        const y = p.y + (by - p.y) * (p.gk ? 0.15 : 0.18) + Math.cos(t / 4 + ph) * amp * 0.6;
-        samples.push([t, Math.max(0.5, Math.min(L - 0.5, x)), Math.max(0.5, Math.min(W - 0.5, y))]);
-      }
-      tracks.push({ id: p.id, team: p.team, keeper: p.gk, label: p.num, samples });
-    }
-    for (let i = 0; i <= T * hz; i++) { const t = i / hz, [x, y] = ballAt(t); ball.push([t, x, y]); }
-    const events = [
-      { time: 34, type: "shot", team: "team1", desc: "Lövés kapura – hazai", on_target: true },
-      { time: 36.2, type: "gk_save", team: "team2", desc: "Kapus védés – vendég" },
-      { time: 39, type: "gk_long_ball", team: "team2", desc: "Ívelés (45 m)" },
-      { time: 64, type: "shot", team: "team2", desc: "Lövés kapura – vendég", on_target: true },
-      { time: 66, type: "goal", team: "team2", desc: "Valószínű gól – vendég" },
-      { time: 70, type: "gk_conceded", team: "team1", desc: "Kapott gól – hazai kapus" },
+    const P = base.map((p) => ({ ...p, ax: p.x, ay: p.y, vx: 0, vy: 0 }));
+    const hz = 10, dt = 1 / hz;
+    // Hazai: 0 kapus, 1-4 védők, 5-7 közép, 8 jobbszél, 9 csatár, 10 balszél.
+    // Vendég: 11 kapus, 12-15 védők, 16-19 közép, 20-21 csatárok.
+    const script = [
+      { carrier: 9, hold: 0.8 },
+      { to: 6, v: 12, hold: 1.0, dribble: [4, 0] },
+      { to: 2, v: 14, hold: 0.8 },
+      { to: 1, v: 13, hold: 1.4, dribble: [8, -3] },
+      { to: 5, v: 13, hold: 0.9 },
+      { to: 8, v: 16, hold: 2.2, dribble: [14, 0] },
+      { to: 9, v: 17, hold: 0.4, point: [93, 36] },
+      { shot: [105, 35.5], v: 26, team: "team1", save: 11, desc: "Lövés kapura – hazai" },
+      { long: 20, v: 23, hold: 0.9, team: "team2" },
+      { to: 17, v: 12, hold: 1.0 },
+      { to: 21, v: 15, hold: 2.0, dribble: [-12, -3] },
+      { shot: [-1.2, 33], v: 27, team: "team2", goal: true, desc: "Lövés kapura – vendég" },
+      { restart: 9, wait: 4.0 },
+      { to: 6, v: 12, hold: 1.0 },
+      { to: 3, v: 13, hold: 1.0 },
+      { to: 4, v: 13, hold: 1.6, dribble: [8, 2] },
+      { to: 7, v: 12, hold: 1.0, dribble: [5, 0] },
+      { to: 10, v: 16, hold: 2.0, dribble: [12, 3] },
+      { to: 9, v: 15, hold: 1.0, dribble: [5, -2] },
+      { shot: [105, 41], v: 25, team: "team1", wide: true, desc: "Lövés mellé – hazai" },
+      { restart: 11, wait: 2.5, at: [99.5, 34] },
+      { long: 21, v: 22, hold: 0.8, team: "team2", kick: true },
+      { to: 18, v: 13, hold: 1.2 },
+      { to: 14, v: 14, hold: 1.5 },
     ];
+    const ball = [], samples = P.map(() => []), events = [];
+    let bx = 52.5, by = 34, carrier = 9, flight = null, hold = 0.8, step = 1, t = 0, kicker = null, hideBallUntil = -1, loose = null;
+    const T = 72;
+    while (t <= T) {
+      // labda
+      if (flight) {
+        const k = Math.min(1, (t - flight.t0) / (flight.t1 - flight.t0));
+        bx = flight.x0 + (flight.x1 - flight.x0) * k; by = flight.y0 + (flight.y1 - flight.y0) * k;
+        if (k >= 1) {
+          // a labda megérkezett: ha a fogadó még nincs ott, a labda ott marad, amíg oda nem ér
+          loose = flight.recv; carrier = null; hold = flight.hold || 0;
+          if (flight.onArrive) flight.onArrive();
+          flight = null;
+        }
+      } else if (loose != null) {
+        const r = P[loose];
+        if (Math.hypot(r.x - bx, r.y - by) < 1.2) { carrier = loose; loose = null; }
+      } else if (carrier != null) {
+        const c = P[carrier];
+        bx = c.x + (c.team === 1 ? 0.7 : -0.7); by = c.y;
+        hold -= dt;
+      } else hold -= dt;
+      if (!flight && loose == null && hold <= 0 && step < script.length) {
+        const sc = script[step++];
+        const from = carrier != null ? P[carrier] : null;
+        if (from) from.dribble = null;
+        const launch = (x1, y1, v, recv, h, onArrive) => {
+          const d = Math.hypot(x1 - bx, y1 - by);
+          flight = { x0: bx, y0: by, x1, y1, t0: t, t1: t + Math.max(0.3, d / v), recv, hold: h, onArrive };
+          carrier = null;
+        };
+        if (sc.restart != null) {
+          // Újraindítás: a labda a helyére kerül (rövid ideig nem látszik), a rúgó odafut, majd tőle indul a játék
+          const at = sc.at || [52.5, 34]; bx = at[0]; by = at[1];
+          carrier = null; kicker = sc.restart; hold = sc.wait; hideBallUntil = t + 1.0;
+          if (sc.restart === 11) events.push({ time: +t.toFixed(1), type: "gk_goal_kick", team: "team2", desc: "Kirúgás – vendég kapus" });
+        } else if (sc.shot) {
+          events.push({ time: +t.toFixed(1), type: "shot", team: sc.team, desc: sc.desc, on_target: !sc.wide });
+          if (sc.save != null) {
+            const k = P[sc.save];
+            launch(k.x + 0.6, sc.shot[1], sc.v, sc.save, 1.6, () => events.push({ time: +t.toFixed(1), type: "gk_save", team: "team2", desc: "Kapus védés – vendég" }));
+          } else if (sc.goal) {
+            launch(sc.shot[0], sc.shot[1], sc.v, null, 0, () => {
+              events.push({ time: +t.toFixed(1), type: "goal", team: "team2", desc: "Gól – vendég" });
+              events.push({ time: +(t + 0.2).toFixed(1), type: "gk_conceded", team: "team1", desc: "Kapott gól – hazai kapus" });
+            });
+          } else launch(sc.shot[0] + 3, sc.shot[1] + 3, sc.v, null, 0, null);
+        } else {
+          const tgt = sc.long != null ? sc.long : sc.to, r = P[tgt];
+          if (sc.long != null && !sc.kick) events.push({ time: +t.toFixed(1), type: "gk_long_ball", team: sc.team, desc: "Ívelés – vendég kapus" });
+          const lead = r.team === 1 ? 1.5 : -1.5;
+          kicker = null;
+          if (sc.point) launch(sc.point[0], sc.point[1], sc.v, tgt, sc.hold, null);
+          else launch(r.x + lead, r.y, sc.v, tgt, sc.hold, null);
+          if (sc.dribble) r.pendingDribble = sc.dribble;
+        }
+      }
+      if (carrier != null && P[carrier].pendingDribble) {
+        const c = P[carrier]; c.dribble = [c.x + c.pendingDribble[0], c.y + c.pendingDribble[1]]; c.pendingDribble = null;
+      }
+      // játékosok célpontjai
+      const owner = carrier != null ? carrier : (loose != null ? loose : (flight ? flight.recv : null));
+      const ballTeam = owner != null ? P[owner].team : 0;
+      const pressers = new Set();
+      for (const team of [1, 2]) {
+        if (team === ballTeam) continue;
+        const order = P.map((q, i) => [i, q]).filter(([, q]) => q.team === team && !q.gk)
+          .sort((a, b) => Math.hypot(a[1].x - bx, a[1].y - by) - Math.hypot(b[1].x - bx, b[1].y - by));
+        order.slice(0, 2).forEach(([i]) => pressers.add(i));
+      }
+      P.forEach((q, i) => {
+        let tx, ty;
+        // sorrend: labdás / fogadó / rúgó (a kapus is) előbb, utána a kapus és a mezőny alaphelyzete
+        if (i === carrier && q.dribble) { tx = q.dribble[0]; ty = q.dribble[1]; }
+        else if (i === carrier) { tx = q.x; ty = q.y; }
+        else if (i === kicker) { tx = bx - (q.team === 1 ? 0.8 : -0.8); ty = by; }
+        else if (flight && i === flight.recv) { tx = flight.x1; ty = flight.y1; }
+        else if (i === loose) { tx = bx; ty = by; }
+        else if (q.gk) { const gx = q.team === 1 ? 2.5 : L - 2.5; tx = gx + (q.team === 1 ? 1 : -1) * Math.max(0, 6 - Math.abs(bx - gx) / 8); ty = 34 + (by - 34) * 0.18; }
+        else if (pressers.has(i)) { const d = Math.hypot(bx - q.x, by - q.y) || 1; tx = bx - (bx - q.x) / d * 1.2; ty = by - (by - q.y) / d * 1.2; }
+        else { tx = q.ax + (bx - 52.5) * 0.45; ty = q.ay + (by - q.ay) * 0.22; }
+        tx = Math.max(0.5, Math.min(L - 0.5, tx)); ty = Math.max(0.5, Math.min(W - 0.5, ty));
+        const dx = tx - q.x, dy = ty - q.y, dist = Math.hypot(dx, dy);
+        const vmax = q.gk ? 5 : 7, vdes = Math.min(vmax, dist * 1.3);
+        const dvx = (dist ? dx / dist * vdes : 0) - q.vx, dvy = (dist ? dy / dist * vdes : 0) - q.vy;
+        const dv = Math.hypot(dvx, dvy), amax = 4 * dt, k = dv > amax ? amax / dv : 1;
+        q.vx += dvx * k; q.vy += dvy * k;
+        q.x = Math.max(0.3, Math.min(L - 0.3, q.x + q.vx * dt)); q.y = Math.max(0.3, Math.min(W - 0.3, q.y + q.vy * dt));
+        samples[i].push([+t.toFixed(2), +q.x.toFixed(2), +q.y.toFixed(2)]);
+      });
+      if (t >= hideBallUntil) ball.push([+t.toFixed(2), +bx.toFixed(2), +by.toFixed(2)]);
+      t += dt;
+    }
+    const tracks = P.map((p, i) => ({ id: p.id, team: p.team, keeper: p.gk, label: p.num, samples: samples[i] }));
+    events.sort((a, b) => a.time - b.time);
     return { tracks, ball, events, t0: 0, t1: T, halves: [], kits: null, demo: true };
   }
   function mulberry(a) { return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
@@ -919,7 +1020,7 @@ h3.sub { font: 600 12px var(--font-body); letter-spacing: .05em; text-transform:
   $("sel-name").oninput = (e) => { const p = state.board.players.find((q) => q.id === state.selected); if (p) { p.name = e.target.value.slice(0, 16); draw(); persistDraft(); } };
 
   // Mentések (böngészőben)
-  function persistDraft() { if (state.mode === "board") store.set("tt-draft", state.board); }
+  function persistDraft() { if (state.mode === "board") store.set(DRAFT_KEY, state.board); }
   function renderSaved() {
     const list = store.get("tt-saved", []), box = $("saved"); box.innerHTML = "";
     if (!list.length) { box.innerHTML = '<p class="hint">Még nincs mentett tábla.</p>'; return; }
@@ -1204,15 +1305,12 @@ h3.sub { font: 600 12px var(--font-body); letter-spacing: .05em; text-transform:
   }
 
   // ---------- Indítás ----------
-  const draft = store.get("tt-draft", null);
-  if (draft && Array.isArray(draft.players) && draft.players.length) state.board = draft; else resetPlayers();
-  // bemutató rajzok, hogy az első kép mutassa, mire való
-  if (!draft) state.board.drawings = [
-    { type: "arrow", pts: [[30, 34], [47, 14]], color: COLORS[1] },
-    { type: "run", pts: [[46, 56], [66, 60]], color: COLORS[0] },
-    { type: "circle", pts: [[62, 34], [66, 34]], color: COLORS[2] },
-    { type: "text", pts: [[62, 25], [62, 25]], color: COLORS[0], text: "Presszing" },
-  ];
+  // Induláskor mindig a labda és mind a 22 játékos a pályán van (az utolsó munka folytatható, rajzokkal együtt).
+  const draft = store.get(DRAFT_KEY, null);
+  if (draft && Array.isArray(draft.players) && draft.players.length === 22) state.board = draft; else resetPlayers();
+  if (!state.board.ball) state.board.ball = { x: 52.5, y: 34 };
+  if (!Array.isArray(state.board.drawings)) state.board.drawings = [];
+  state.board.show2 = true;
   syncBoardInputs(); renderSaved(); renderStopSets(); renderSelected(); setTool("move"); renderLegend();
   window.addEventListener("resize", layout);
   layout();
