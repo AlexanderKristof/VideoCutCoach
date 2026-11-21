@@ -8,7 +8,8 @@ Forrás (erősorrendben):
        TACTICAL_MODEL_CONFIG    – a JSON beállítófájl útvonala
        TACTICAL_DETECTOR_BACKEND – "ultralytics" (alap) | "onnx" | "ultralytics_predict"
        TACTICAL_ONNX_PATH       – az ONNX modellfájl útvonala (backend = "onnx")
-  2. model_config.json (opcionális, a main.py mellett)
+  2. model_config.json (opcionális, a main.py mellett; a telepített alkalmazásban az adatmappában,
+     lásd app_paths.py)
   3. alapértelmezés: yolov8x.pt (CUDA) / yolov8n.pt (CPU), COCO osztályok, minden képkocka
 
 Ez a modul szándékosan nem importál torch-ot / ultralytics-et, hogy önállóan tesztelhető legyen.
@@ -38,7 +39,7 @@ DEFAULTS = {
     # Külön labda-felismerő menet (második modellpéldány), ha a nyers labda-callback nem érhető el
     # (lásd main.py NYERS LABDA-DETEKTÁLÁSOK, docs/MODELL_BEALLITAS.md) – drága, alapból KI
     "ball_extra_pass": False,
-    # --- DETEKTOR-HÁTTÉR (lásd detection/, docs/MODELL_BEALLITAS.md 7. pont) ---
+    # --- DETEKTOR-HÁTTÉR (lásd detection/, docs/MODELL_BEALLITAS.md 8. pont) ---
     # "ultralytics": model.track() + beépített ByteTrack (AGPL-3.0 – csak fejlesztéshez!)
     # "onnx": ONNX Runtime detektor + saját követő (detection/tracker.py) – a kereskedelmi út
     # "ultralytics_predict": ultralytics predict + saját követő (fejlesztői összevetéshez)
@@ -84,8 +85,9 @@ def load_model_config(config_path=None, env=None):
     cfg = dict(DEFAULTS)
 
     if config_path is None:
-        config_path = env.get("TACTICAL_MODEL_CONFIG") or os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), DEFAULT_CONFIG_FILENAME)
+        # fejlesztői módban a main.py mellett, alkalmazás-módban az adatmappában (app_paths.py)
+        import app_paths
+        config_path = env.get("TACTICAL_MODEL_CONFIG") or app_paths.model_config_path(env)
 
     if config_path and os.path.isfile(config_path):
         try:

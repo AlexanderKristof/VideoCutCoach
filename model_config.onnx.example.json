@@ -1,5 +1,5 @@
 {
-    "_megjegyzes": "ONNX háttér (kereskedelmi út). Másold model_config.json néven a main.py mellé. Leírás: docs/MODELL_BEALLITAS.md 7. pont",
+    "_megjegyzes": "ONNX háttér (kereskedelmi út). Másold model_config.json néven a main.py mellé. Leírás: docs/MODELL_BEALLITAS.md 8. pont",
     "backend": "onnx",
     "onnx_path": "models/focis_detektor.onnx",
     "onnx_class_names": ["ball", "goalkeeper", "player", "referee"],

@@ -2,7 +2,7 @@
 
 Cél: egy **Apache-2.0** licencű keretrendszerrel, **saját (engedélyezett) felvételeken** finomhangolt
 detektor ONNX formátumban, amelyet a motor a `backend: "onnx"` háttérrel futtat
-(`docs/MODELL_BEALLITAS.md` 7. pont). Osztályok:
+(`docs/MODELL_BEALLITAS.md` 8. pont). Osztályok:
 
 | Sorszám | Név a modellben | Magyarul |
 |---|---|---|

@@ -131,7 +131,27 @@ Ultralytics-frissítés után érdemes megnézni a naplóban a „Labda-jelölte
 a mechanizmust utánozza (a követő az első `track()`-nél regisztrált callback), így a
 `tests/test_e2e_synth.py` a valódi kódutat méri.
 
-## 7. Detektor-háttér: ONNX Runtime + saját követő (a kereskedelmi út)
+
+## 7. Betöltés és a súlyfájl helye (lusta betöltés, models mappa)
+
+A modell **nem** a szerver indulásakor töltődik be, hanem az első elemzéskor (`main.ensure_model()`,
+szálbiztos, egyszer), vagy előre a `POST /models/load` háttérfeladattal. Így a `GET /health`
+azonnal válaszol, és a torch / ultralytics importja sem lassítja az indulást. A nyers
+labda-callback (6. pont) a betöltéskor, az első `track()` előtt regisztrálódik.
+
+A súlyfájlt a `model_manager.py` keresi, ebben a sorrendben: a megadott út (a munkakönyvtárhoz
+képest), a `models/` mappa (fájlnévvel is), az adatmappa, a csomagolt erőforrások, a program
+`models/` mappája. Ha nincs meg:
+- fejlesztői módban (`python main.py`) a régi viselkedés: a név változatlanul megy az ultralytics-nek,
+  amely a hivatalos súlyt a munkakönyvtárba tölti le;
+- alkalmazás-módban (telepített program / `TACTICAL_DATA_DIR`) a hivatalos súlyt (`yolov8*.pt`,
+  `yolo11*.pt`) a motor maga tölti le az adatmappa `models/` mappájába (`TACTICAL_AUTO_DOWNLOAD=0`
+  kikapcsolja; `TACTICAL_MODEL_BASE_URL` belső tükröt ad meg). A letöltés haladása:
+  `POST /models/download` → `GET /jobs/{id}`; állapot: `GET /models/status`.
+
+Alkalmazás-módban a `model_config.json` helye is az adatmappa (`%LOCALAPPDATA%\TacAnaly`).
+
+## 8. Detektor-háttér: ONNX Runtime + saját követő (a kereskedelmi út)
 
 Az ultralytics AGPL-3.0 licencű, ezért zárt forrású, eladott termékbe nem kerülhet
 (lásd `docs/LICENC_ES_ARUSITAS.md`). A `backend` kulcs választja ki a felismerő láncot:
@@ -142,7 +162,7 @@ Az ultralytics AGPL-3.0 licencű, ezért zárt forrású, eladott termékbe nem 
 | `"onnx"` | ONNX Runtime (`detection/onnx_detector.py`, MIT) | saját követő (`detection/tracker.py`) | **termék** |
 | `"ultralytics_predict"` | ultralytics `predict()` | saját követő | fejlesztés: a saját követő valódi YOLO-dobozokon |
 
-Az `"onnx"` háttérnél a `main.py` nem importálja sem az ultralytics-et, sem a torch-ot. A labda
+Az `"onnx"` háttért is az `ensure_model()` hozza létre (lusta betöltés, 7. pont). Ennél a háttérnél a `main.py` nem importálja sem az ultralytics-et, sem a torch-ot. A labda
 minden nyers jelöltje közvetlenül a labdakövetőbe megy (a 6. pont callback-trükkje itt nem kell).
 Kész minta: `model_config.onnx.example.json`.
 
@@ -163,7 +183,7 @@ Kész minta: `model_config.onnx.example.json`.
 | Kulcs | Jelentés | Alapérték |
 |---|---|---|
 | `backend` | lásd fent; környezeti változó: `TACTICAL_DETECTOR_BACKEND` | `ultralytics` |
-| `onnx_path` | az `.onnx` fájl (relatív útvonal: a `main.py` mappájához); környezeti változó: `TACTICAL_ONNX_PATH` | – |
+| `onnx_path` | az `.onnx` fájl; a 7. pont szerinti helyeken keresve (`models/` mappa, adatmappa, erőforrások), végül a `main.py` mappájához képest; környezeti változó: `TACTICAL_ONNX_PATH` | – |
 | `input_size` | a modell bemenete `[szélesség, magasság]` (csak dinamikus bemenetű modellnél kell) | a modellből |
 | `onnx_class_names` | a modell osztálynevei, ha a modell metaadata nem tartalmazza (lista, `{id: név}` vagy `"coco80"`) | metaadat / COCO |
 | `class_names` | szerepkör → osztálynevek (mint eddig, 3. pont) | automatikus |

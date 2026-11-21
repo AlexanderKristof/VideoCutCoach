@@ -304,9 +304,12 @@ sys.modules["torch"] = None          # ImportError: az ONNX háttérhez a torch 
 os.chdir({tmp!r})
 import main
 import numpy as np
-assert main.model is None and main.OWN_BACKEND is not None, "nem a saját háttér töltődött be"
+assert main.OWN_BACKEND is None, "a háttér csak az ensure_model()-ben jön létre (lusta betöltés)"
+main.ensure_model()
+assert main.OWN_BACKEND is not None and main.model is main.OWN_BACKEND, "nem a saját háttér töltődött be"
+assert main.device == "cpu", main.device
+assert main.ensure_model() is main.OWN_BACKEND
 assert main.role_classes["player"] == {{2}} and main.role_classes["ball"] == {{0}}, main.role_classes
-assert main.device == "cpu"
 n = main._segmenter_person_counter(np.full((64, 128, 3), 90, np.uint8))
 assert n == 1, n
 print("RENDBEN", main.OWN_BACKEND.describe())

@@ -508,6 +508,317 @@ def test_cli_help_without_torch():
     assert "--felido-perc" in res.stdout and "félidő" in res.stdout
 
 
+# ------------------------------------------------------------------
+# Szüneteltetés, háttér-mód, részeredmény
+# ------------------------------------------------------------------
+
+def _looping_job(stop, steps=None):
+    def work(progress):
+        i = 0
+        while not stop.is_set():
+            i += 1
+            if steps is not None:
+                steps.append(i)
+            progress(min(99.0, i * 0.5), f"{i}. lépés")
+            time.sleep(0.01)
+        return {"status": "success", "lepesek": i}
+    return work
+
+
+def test_pause_resume_running_job():
+    d = _tmpdir()
+    try:
+        mgr = JobManager(d)
+        stop, steps = threading.Event(), []
+        jid = mgr.submit("teszt", _looping_job(stop, steps))
+        _wait_status(mgr, jid, ("running",))
+        while len(steps) < 3:
+            time.sleep(0.01)
+        job = mgr.pause(jid)
+        assert job["paused"] is True, job
+        job = _wait_status(mgr, jid, ("paused",))
+        assert job["phase"] == "Szüneteltetve", job
+        n = len(steps)
+        time.sleep(0.3)
+        assert len(steps) <= n + 1, (n, len(steps))       # szünet alatt nem halad
+        with open(os.path.join(d, f"{jid}.json"), encoding="utf-8") as f:
+            saved = json.load(f)
+        assert saved["status"] == "paused" and not any(k.startswith("_") for k in saved)
+        job = mgr.resume(jid)
+        assert job["paused"] is False
+        _wait_status(mgr, jid, ("running",))
+        t0 = time.time()
+        while len(steps) < n + 5 and time.time() - t0 < 3:
+            time.sleep(0.01)
+        assert len(steps) >= n + 5, "folytatás után nem halad"
+        assert mgr.get(jid)["phase"] != "Szüneteltetve"
+        stop.set()
+        job = mgr.wait(jid, 5)
+        assert job["status"] == "done" and job["paused"] is False, job
+        # kész jobon a szüneteltetés nem csinál semmit
+        assert mgr.pause(jid)["status"] == "done"
+        assert mgr.pause("nincs-ilyen") is None and mgr.resume("nincs-ilyen") is None
+        mgr.shutdown()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_pause_then_cancel_and_queued_pause():
+    d = _tmpdir()
+    try:
+        mgr = JobManager(d, max_workers=1)
+        stop1 = threading.Event()
+        j1 = mgr.submit("teszt", _looping_job(stop1))
+        _wait_status(mgr, j1, ("running",))
+        mgr.pause(j1)
+        _wait_status(mgr, j1, ("paused",))
+        mgr.cancel(j1)                          # szüneteltetett job is megszakítható
+        job = _wait_status(mgr, j1, ("cancelled",))
+        assert job["paused"] is False
+
+        # várakozó job szüneteltetése: elindul, de azonnal vár
+        stop2, stop3 = threading.Event(), threading.Event()
+        steps3 = []
+        j2 = mgr.submit("teszt", _looping_job(stop2))
+        j3 = mgr.submit("teszt", _looping_job(stop3, steps3))
+        _wait_status(mgr, j2, ("running",))
+        assert mgr.get(j3)["status"] == "queued"
+        mgr.pause(j3)
+        stop2.set()
+        mgr.wait(j2, 5)
+        _wait_status(mgr, j3, ("paused",))
+        time.sleep(0.2)
+        assert steps3 == [], steps3
+        mgr.resume(j3)
+        _wait_status(mgr, j3, ("running",))
+        stop3.set()
+        assert mgr.wait(j3, 5)["status"] == "done"
+        mgr.shutdown()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_background_job_priority_and_threads():
+    import background
+    d = _tmpdir()
+    calls = []
+    try:
+        prio = {
+            "lower_thread": lambda: calls.append(("lower", threading.current_thread().name)) or True,
+            "limit_threads": lambda n: calls.append(("limit", n)) or {"elozo": 8},
+            "restore_threads": lambda prev: calls.append(("restore", prev)),
+            "default_threads": lambda: 3,
+        }
+        mgr = JobManager(d, priority=prio)
+        seen = {}
+
+        def work(progress):
+            cfg = background.current()
+            seen["cfg"] = (cfg.enabled, cfg.threads)
+            seen["thread"] = threading.current_thread().name
+            # az ebből a szálból indított ffmpeg alacsony prioritással és szálkorláttal indulna
+            seen["win"] = background.prepare(["ffmpeg"], _os_name="nt")
+            seen["args"] = background.ffmpeg_thread_args()
+            return {"status": "success"}
+
+        jid = mgr.submit("teszt", work, background=True)
+        job = mgr.wait(jid, 5)
+        assert job["status"] == "done" and job["background"] is True and job["threads"] == 3, job
+        assert seen["cfg"] == (True, 3), seen
+        assert seen["thread"].startswith("job-hatter"), seen
+        assert seen["win"] == (["ffmpeg"], {"creationflags": background.BELOW_NORMAL_PRIORITY_CLASS})
+        assert seen["args"] == ["-threads", "3"]
+        assert calls[0][0] == "lower" and calls[0][1].startswith("job-hatter"), calls
+        assert ("limit", 3) in calls and ("restore", {"elozo": 8}) in calls, calls
+        assert calls.index(("limit", 3)) < calls.index(("restore", {"elozo": 8}))
+
+        # normál job: nincs háttér-mód, nincs prioritás-csökkentés
+        calls.clear()
+        jid2 = mgr.submit("teszt", work, threads=2)
+        assert mgr.wait(jid2, 5)["status"] == "done"
+        assert seen["cfg"] == (False, 2) and seen["win"] == (["ffmpeg"], {}) and seen["args"] == ["-threads", "2"]
+        assert not seen["thread"].startswith("job-hatter") and calls == [], calls
+        mgr.shutdown()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_background_os_hooks():
+    import background
+
+    class FakeOS:
+        PRIO_PROCESS = 0
+
+        def __init__(self, nice=0):
+            self.n, self.calls = nice, []
+
+        def getpriority(self, which, who):
+            return self.n
+
+        def setpriority(self, which, who, value):
+            self.calls.append(("setpriority", who, value))
+            self.n = value
+
+        def nice(self, inc):
+            self.calls.append(("nice", inc))
+            self.n += inc
+            return self.n
+
+    fos = FakeOS()
+    assert background.lower_current_thread_priority(_os=fos, _os_name="posix")
+    assert fos.calls == [("setpriority", threading.get_native_id(), background.NICE_LEVEL)], fos.calls
+    fos2 = FakeOS(nice=15)
+    assert background.lower_current_thread_priority(_os=fos2, _os_name="posix") and fos2.calls == []
+
+    class FakeK32:
+        def __init__(self):
+            self.calls = []
+
+        def GetCurrentThread(self):
+            return "szal"
+
+        def GetCurrentProcess(self):
+            return "folyamat"
+
+        def SetThreadPriority(self, h, p):
+            self.calls.append(("thread", h, p))
+            return 1
+
+        def SetPriorityClass(self, h, c):
+            self.calls.append(("process", h, c))
+            return 1
+
+    k = FakeK32()
+    assert background.lower_current_thread_priority(_os_name="nt", _kernel32=k)
+    assert k.calls == [("thread", "szal", background.THREAD_PRIORITY_BELOW_NORMAL)]
+
+    class FakeProc:
+        def __init__(self, log):
+            self.log = log
+
+        def nice(self, value):
+            self.log.append(value)
+
+    class FakePsutil:
+        BELOW_NORMAL_PRIORITY_CLASS = 0x4000
+
+        def __init__(self, plugged=True):
+            self.log, self.plugged = [], plugged
+
+        def Process(self):
+            return FakeProc(self.log)
+
+        def sensors_battery(self):
+            return type("B", (), {"power_plugged": self.plugged})()
+
+    ps = FakePsutil()
+    assert background.lower_process_priority(_os_name="nt", _psutil=ps) and ps.log == [0x4000]
+    k2 = FakeK32()
+    assert background.lower_process_priority(_os_name="nt", _psutil=type("Ures", (), {})(), _kernel32=k2)
+    assert k2.calls == [("process", "folyamat", background.BELOW_NORMAL_PRIORITY_CLASS)]
+    fos3 = FakeOS()
+    assert background.lower_process_priority(_os=fos3, _os_name="posix") and fos3.calls == [("nice", 0), ("nice", 10)]
+
+    assert background.on_battery(_psutil=FakePsutil(plugged=False)) is True
+    assert background.on_battery(_psutil=FakePsutil(plugged=True)) is False
+    assert background.default_threads(cpu_count=8, battery=False) == 4
+    assert background.default_threads(cpu_count=8, battery=True) == 2
+    assert background.default_threads(cpu_count=1, battery=True) == 1
+
+    # könyvtárak szálszáma: csak a már betöltött modulok, és visszaállítható
+    class FakeTorch:
+        n = 8
+
+        def get_num_threads(self):
+            return self.n
+
+        def set_num_threads(self, n):
+            self.n = n
+
+    saved_env = {v: os.environ.get(v) for v in background.THREAD_ENV_VARS}
+    had_torch = "torch" in sys.modules
+    old_torch = sys.modules.get("torch")
+    sys.modules["torch"] = FakeTorch()
+    try:
+        prev = background.limit_library_threads(2)
+        assert sys.modules["torch"].n == 2 and os.environ["OMP_NUM_THREADS"] == "2"
+        background.restore_library_threads(prev)
+        assert sys.modules["torch"].n == 8
+        assert {v: os.environ.get(v) for v in background.THREAD_ENV_VARS} == saved_env
+    finally:
+        if had_torch:
+            sys.modules["torch"] = old_torch
+        else:
+            del sys.modules["torch"]
+
+
+def test_partial_result_published():
+    d = _tmpdir()
+    try:
+        mgr = JobManager(d)
+        gate = threading.Event()
+
+        def work(progress):
+            progress.sub(0, 50, "Vágás").publish({"status": "success", "reszleges": True, "kesz_reszek": ["vagas"]})
+            progress(50, "vágás kész")
+            gate.wait(5)
+            return {"status": "success", "kesz_reszek": ["vagas", "kesz"]}
+
+        jid = mgr.submit("teszt", work)
+        t0 = time.time()
+        while (mgr.get(jid).get("result") or {}).get("reszleges") is not True and time.time() - t0 < 5:
+            time.sleep(0.01)
+        job = mgr.get(jid)
+        assert job["status"] == "running" and job["result"]["kesz_reszek"] == ["vagas"], job
+        with open(os.path.join(d, f"{jid}.json"), encoding="utf-8") as f:
+            assert json.load(f)["result"]["reszleges"] is True
+        gate.set()
+        job = mgr.wait(jid, 5)
+        assert job["result"] == {"status": "success", "kesz_reszek": ["vagas", "kesz"]}, job
+        mgr.shutdown()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_pipeline_publishes_cut_before_analysis():
+    d = _tmpdir()
+    try:
+        fakes = Fakes(d)
+        events = []
+
+        def cut_match(video_path, halves, out_dir, padding_sec=5.0, duration_sec=None, on_part=None):
+            res = Fakes.cut_match(fakes, video_path, halves, out_dir, padding_sec, duration_sec)
+            for k in ("first_half", "second_half", "full_match"):
+                on_part(k, res[k])
+            return dict(res, cut_modes={"first_half": "smart", "second_half": "copy"})
+
+        funcs = fakes.funcs()
+        funcs["cut_match"] = cut_match
+        orig_analyze = funcs["analyze"]
+
+        def analyze(*a, **k):
+            events.append(("analyze",))
+            return orig_analyze(*a, **k)
+
+        funcs["analyze"] = analyze
+        reporter = ProgressReporter(on_publish=lambda r: events.append(("publish", list(r.get("kesz_reszek")),
+                                                                         r.get("reszleges"), r.get("cut"))))
+        res = pipeline.run_match_pipeline(_video(d), {}, progress=reporter, funcs=funcs)
+        first_analyze = events.index(("analyze",))
+        before = [e for e in events[:first_analyze] if e[0] == "publish"]
+        assert before and before[-1][1] == ["felidok", "vagas"], before
+        assert before[-1][3]["full_match_url"] == "/clips/match_x.mp4", before[-1]
+        assert before[-1][3]["cut_modes"] == {"first_half": "smart", "second_half": "copy"}
+        assert any(e[1] == ["felidok", "vagas_first_half"] for e in before), before
+        assert all(e[2] is True for e in events if e[0] == "publish")
+        assert "full_match" in res["cut"]["local_paths"] and "cut_modes" not in res["cut"]["local_paths"]
+        assert res["kesz_reszek"][-1] == "kesz" and "reszleges" not in res
+        assert "elemzes_first_half" in res["kesz_reszek"] and "esemenyek" in res["kesz_reszek"]
+        json.dumps(res)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failed = 0

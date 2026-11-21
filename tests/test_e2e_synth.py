@@ -536,6 +536,8 @@ def run_mode(main_mod, fake, gt, video, mode):
             config["calib_pitch_points"] = pitch_pts
             print(f"Kézi kalibráció {len(calib_names)} látható ponttal: {', '.join(calib_names)}")
     original_cpt = main_mod.create_pitch_tracker
+    if hasattr(main_mod, "ensure_model"):
+        main_mod.ensure_model()   # lusta betöltés: az ál-YOLO és a szerepkörök előbb töltődjenek be
     original_backend = getattr(main_mod, "OWN_BACKEND", None)
     original_roles = main_mod.role_classes
     if mode == "onnx_owntracker":
