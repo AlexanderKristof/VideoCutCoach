@@ -27,6 +27,8 @@ from tactical_engine import TacticalEngine
 from pitch_filters import (build_grass_mask, foot_on_grass, CameraMotion,
                            StationaryFilter, extract_dominant_color,
                            PitchBoundary, PitchTrackSanity, KeeperGate, pitch_h_trusted)  # PÁLYAHATÁR
+from pitch_filters import GrassModel, grass_mode_from_config  # ADAPTÍV FŰ
+from video_quality import VideoQualityMonitor, annotate_event_reliability  # VIDEÓMINŐSÉG
 from model_config import (load_model_config, resolve_weights, build_role_class_map,
                           describe_role_map, should_detect, reset_tracker)
 from review_export import ReviewExporter
@@ -274,9 +276,23 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
         except Exception as ex:
             print(f"Homográfia hiba: {ex}")
 
+    # --- ADAPTÍV FŰ: videónként tanult fűmodell (pitch_filters.GrassModel) a fix HSV tartomány helyett ---
+    # "auto" (alap): ha a kliens nem állított be saját fű-HSV tartományt; a kézi tartomány mindig nyer.
+    grass_mode = grass_mode_from_config(config)
+    grass_model = GrassModel.learn_from_video(temp_cut) if grass_mode == "auto" else None
+    pt_config = config
+    if grass_model is not None and grass_model.ready:
+        # a pályakövető (pitch_tracker.py) csak HSV tartományt fogad: az alap tartomány és a tanult fű
+        # HSV-burkának uniója (sosem szűkebb a réginél; sötét / árnyékos / fakó fűnél tágabb)
+        # TODO(pitch_tracker): fűmaszk-függvény / GrassModel átadása, ha a PitchTracker fogad ilyet
+        g_lo, g_hi = grass_model.hsv_bounds(union_default=True)
+        pt_config = dict(config, grass_lower=[int(v) for v in g_lo], grass_upper=[int(v) for v in g_hi])
+    grass_update_every = max(1, int(round(2.0 * fps)))   # a fűmodell lassú frissítése ~2 mp-enként
+    # --- /ADAPTÍV FŰ ---
+
     # --- Pályakövetés: képkockánkénti homográfia mozgó (Veo) kamerához (pitch_tracker.py) ---
     pitch_tracker, pitch_setup_msg = create_pitch_tracker(temp_cut, width, height, fps, start_sec,
-                                                          calib_points_str, H, config)
+                                                          calib_points_str, H, pt_config)
     pitch_stats = {"ok": 0, "elveszett": 0, "kalibráció szükséges": 0, "finomítás": 0}
     pitch_boxes = []   # az előző felismerés dobozai (a követés ezeket kitakarja)
     H_cur = H
@@ -311,7 +327,8 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
     team_clf = None
     if auto_teams_enabled(config):
         team_clf = TeamClassifier(grass_lower=grass_lower, grass_upper=grass_upper,
-                                  swap_teams=config.get("swap_teams", False))
+                                  swap_teams=config.get("swap_teams", False),
+                                  grass_model=grass_model)  # ADAPTÍV FŰ: fű-kiszűrés + megvilágítás-korrekció
     # --- AUTO CSAPAT VÉGE ---
 
     process = subprocess.Popen([
@@ -340,6 +357,8 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
         fed_timeline_events = len(timeline_events)
 
     track_meta = TrackMetaCollector()  # követésenkénti csapat / kapus (a mentett pályákhoz)
+    quality = VideoQualityMonitor(fps, grass_model=grass_model)  # VIDEÓMINŐSÉG: 0,5 mp-enkénti mérés
+    grass_mask, grass_scale = None, 0.5
     # Gyors mód: a kihagyott képkockákon az utolsó felismerés eredményét rajzoljuk ki újra,
     # így a kimeneti videóban minden képkocka megmarad
     last_valid_players = []
@@ -377,7 +396,9 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
         debug_file.write(f"Felismerés minden {DETECT_EVERY_N}. képkockán, törölt követők: {trackers_reset}\n")
         debug_file.write(f"Pályakövetés: {pitch_setup_msg}\n")
         debug_file.write(f"Nyers labda-callback: {'BE' if RAW_BALL_HOOK else 'nincs (a követett dobozok)'}, "
-                         f"külön labda-menet: {'BE' if ball_extra_pass else 'KI'}\n\n")
+                         f"külön labda-menet: {'BE' if ball_extra_pass else 'KI'}\n")
+        debug_file.write("Fűmaszk: " + (grass_model.describe() if grass_model is not None
+                                         else f"kézi HSV {list(grass_lower)}–{list(grass_upper)}") + "\n\n")  # ADAPTÍV FŰ
 
         while cap.isOpened():
             ret, frame = cap.read()
@@ -385,7 +406,16 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
                 break
 
             current_time_sec = start_sec + (frames_done / fps)
+            cam_prev = camera_motion.offset.copy()   # VIDEÓMINŐSÉG: a kamera elfordulása ezen a képkockán
             camera_motion.update(frame)
+            # --- ADAPTÍV FŰ + VIDEÓMINŐSÉG (a nyers képkockán, a rajzolás előtt) ---
+            if grass_model is not None and frames_done > 0 and frames_done % grass_update_every == 0:
+                grass_model.observe(frame)
+            if quality.due(frames_done):
+                pan_px = float(np.hypot(*(camera_motion.offset - cam_prev))) * 1280.0 / max(1, width)
+                q_sample = quality.update(frame, current_time_sec, grass_mask=grass_mask, pan_px=pan_px)
+                debug_file.write(f"F#{frames_done} {VideoQualityMonitor.describe_sample(q_sample)}\n")
+            # --- /ADAPTÍV FŰ + VIDEÓMINŐSÉG ---
             if frames_done % 250 == 0:
                 stationary_filter.prune(frames_done)
                 keeper_gate.prune(frames_done)  # PÁLYAHATÁR
@@ -412,7 +442,10 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
 
             if detected:
                 hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-                grass_mask, grass_scale = build_grass_mask(hsv_frame, grass_lower, grass_upper)
+                if grass_model is not None:  # ADAPTÍV FŰ (tanulás előtt a modell az alap HSV-re esik vissza)
+                    grass_mask, grass_scale = grass_model.mask(frame)
+                else:
+                    grass_mask, grass_scale = build_grass_mask(hsv_frame, grass_lower, grass_upper)
                 _raw_ball_buf["boxes"] = None   # NYERS LABDA: a callback tölti ki a track() alatt
                 results = model.track(frame, persist=True, tracker="bytetrack.yaml", device=device, verbose=False)
                 pitch_boxes = [tuple(map(int, b.xyxy[0])) for r in results for b in r.boxes]  # pályakövetéshez
@@ -541,13 +574,16 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
                                 continue
 
                             crop = frame[max(0, y1):min(height, y2), max(0, x1):min(width, x2)]
-                            dominant_color = extract_dominant_color(crop, grass_lower, grass_upper)
+                            dominant_color = extract_dominant_color(crop, grass_lower, grass_upper, grass_model=grass_model)
 
                             # --- AUTO CSAPAT: mezszín-klaszterezés + követésenkénti szavazás ---
                             if team_clf is not None:
                                 pitch_xy = engine_instance.transform_to_pitch(foot_x, foot_y, H_cur) if H_cur is not None else None
+                                # ADAPTÍV FŰ: árnyékban álló játékos mezszíne a napos fűhöz igazítva
+                                illum_gain = (grass_model.illumination_gain(frame, (x1, y1, x2, y2))[0]
+                                              if grass_model is not None else None)
                                 auto = team_clf.observe(tid, crop, current_time_sec, pitch_xy=pitch_xy,
-                                                        model_keeper=model_keeper)
+                                                        model_keeper=model_keeper, illum_gain=illum_gain)
                                 if (auto["is_referee"] or auto["role"] == "other") and not is_keeper:
                                     # bíró / egyéb mez (pl. kapus pályakoordináta nélkül): semleges keret
                                     referee_boxes.append((x1, y1, x2, y2))
@@ -673,6 +709,10 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
                 print(f"Feldolgozva: {frames_done}/{total_frames} képkocka ({(frames_done/total_frames)*100:.1f}%)")
                 if progress: progress(100.0 * frames_done / max(1, total_frames), f"{frames_done}/{total_frames} képkocka")  # háttérfeladat haladás (+ megszakítás)
 
+        quality_summary = quality.summary()  # VIDEÓMINŐSÉG: összesítés a naplóba
+        debug_file.write("\n" + quality_summary.get("summary_text", "") + "\n")
+        if grass_model is not None:
+            debug_file.write(grass_model.describe() + "\n")
         if team_clf is not None:  # AUTO CSAPAT: a tanult klaszterek a naplóba
             debug_file.write("\n" + team_clf.describe() + "\n")
         # PÁLYAHATÁR: összesítés a naplóba
@@ -697,8 +737,9 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
     engine_instance.finalize(start_sec + frames_done / fps)
     if review is not None:
         feed_review_events()
-        review.close()
+        review.close(video_quality=quality_summary)
     timeline_events = engine_instance.merge_timeline(timeline_events)
+    annotate_event_reliability(timeline_events, quality)  # VIDEÓMINŐSÉG: esemény-megbízhatóság
 
     analysis_payload = {
         "events": timeline_events,
@@ -711,7 +752,10 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
                                              ball=engine_instance.ball_trajectory),
         # AUTO CSAPAT: tanult mezszínek (RGB) a kliensnek / taktikai táblának; kézi módban null
         "team_colors": team_clf.team_colors() if team_clf is not None else None,
-        "team_mode": "auto" if team_clf is not None else "manual"
+        "team_mode": "auto" if team_clf is not None else "manual",
+        # VIDEÓMINŐSÉG: osztályzat, az egyes képhibák idő-aránya, a legrosszabb szakaszok; a fűmaszk módja
+        "video_quality": quality_summary,
+        "grass_model": grass_model.describe() if grass_model is not None else "kézi HSV tartomány"
     }
     with open(events_path, 'w', encoding='utf-8') as f:
         json.dump(analysis_payload, f, ensure_ascii=False, indent=4)
@@ -747,7 +791,8 @@ async def cut_raw_endpoint(
     draw_pitch_overlay: bool = Form(True),
     calib_time_sec: Optional[float] = Form(None),
     calib_pitch_points: str = Form(""),
-    pitch_margin_m: float = Form(2.5)
+    pitch_margin_m: float = Form(2.5),
+    grass_model: str = Form("auto")
 ):
     config = {
         "team1_attacks_right": team1_attacks_right,
@@ -757,6 +802,7 @@ async def cut_raw_endpoint(
         "dynamic_homography": dynamic_homography, "draw_pitch_overlay": draw_pitch_overlay,
         "calib_time_sec": calib_time_sec, "calib_pitch_points": calib_pitch_points,
         "pitch_margin_m": pitch_margin_m,  # PÁLYAHATÁR: a pályán kívüli tűrés (m), 0 = ki
+        "grass_model": grass_model,  # ADAPTÍV FŰ: "auto" (tanult fűmodell) / "hsv" (fix tartomány)
         "roi_top_pct": roi_top_pct, "roi_bottom_pct": roi_bottom_pct, "min_player_height_pct": min_player_height_pct,
         "use_static_roi": use_static_roi, "grass_min_ratio": grass_min_ratio,
         "stationary_window_sec": stationary_window_sec, "stationary_max_move": stationary_max_move,

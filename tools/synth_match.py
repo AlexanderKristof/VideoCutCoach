@@ -25,6 +25,12 @@ Példa:
     python3 tools/synth_match.py --out synth.mp4 --duration 60 --seed 7
     python3 tools/synth_match.py --out full.mp4 --segments "warmup:20,half1:90,break:30,half2:90"
     python3 tools/synth_match.py --gt-only --gt meccs_gt.json --duration 120 --seed 6   # csak GT, ~2 mp
+    python3 tools/synth_match.py --out rossz.mp4 --duration 40 --rossz          # rossz minőségű felvétel
+    python3 tools/synth_match.py --out arnyek.mp4 --arnyek 0.5 --nap 0.8 --tomorites 40 --zaj 6 --elmosodas
+
+Képromlások (--arnyek, --nap, --tomorites, --zaj, --elmosodas, --esti, --rossz): a valódi amatőr
+felvételek tipikus hibái (lelátó-árnyék, napfény-csillanás, kockás tömörítés, zaj, mozgási
+elmosódás, esti színezet). A ground truth (pozíciók, események, H) ettől nem változik.
 
 Csak numpy + OpenCV + ffmpeg (subprocess) kell hozzá.
 """
@@ -962,6 +968,38 @@ class Renderer:
             x += 6.0
             k += 1
 
+    # --- valós fűmaszk (tesztekhez: a fűmaszk IoU-ja)
+    def grass_gt_mask(self, exclude_people=True):
+        """
+        A legutóbb renderelt képkocka valós fűmaszkja (uint8, 255 = fű): a füves pályarész (a fehér
+        vonalakkal együtt) a képen, a fasor / égbolt nélkül. exclude_people: az alakok és a labda
+        dobozai 0 helyett 128-at kapnak (a kiértékelésnél figyelmen kívül hagyható).
+        A véletlenszám-generátort nem használja (a ground truth változatlan).
+        """
+        lab = getattr(self, "_grass_label", None)
+        if lab is None:
+            ppm = 5.0
+            tw, th = int((TEX_X1 - TEX_X0) * ppm), int((TEX_Y1 - TEX_Y0) * ppm)
+            xs = TEX_X0 + (np.arange(tw) + 0.5) / ppm
+            ys = TEX_Y0 + (np.arange(th) + 0.5) / ppm
+            X, Y = np.meshgrid(xs, ys)
+            g = (X >= GRASS_X0) & (X <= GRASS_X1) & (Y >= GRASS_Y0) & (Y <= GRASS_Y1)
+            M = np.array([[1.0 / ppm, 0, TEX_X0], [0, 1.0 / ppm, TEX_Y0], [0, 0, 1.0]])
+            self._grass_label = lab = (np.uint8(g) * 255, M)
+        img, M = lab
+        m = cv2.warpPerspective(img, self.last_Hp2i @ M, (self.w, self.h), flags=cv2.INTER_NEAREST,
+                                borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        bg = getattr(self, "last_bg_mask", None)
+        if bg is not None:
+            m[bg] = 0
+        if exclude_people and self.last_boxes:
+            for bb, _z, _f in self.last_boxes.values():
+                x1, y1 = max(0, int(bb[0]) - 1), max(0, int(bb[1]) - 1)
+                x2, y2 = min(self.w, int(bb[2]) + 2), min(self.h, int(bb[3]) + 2)
+                if x2 > x1 and y2 > y1:
+                    m[y1:y2, x1:x2] = np.where(m[y1:y2, x1:x2] > 0, 128, m[y1:y2, x1:x2])
+        return m
+
     # --- háttér
     def _background(self, frame):
         cam = self.cam
@@ -992,6 +1030,7 @@ class Renderer:
         vt = uvt[:, 1]
         rows = np.arange(h, dtype=np.float64)[:, None]
         tree_mask = rows < vb[None, :]
+        self.last_bg_mask = tree_mask     # a fasor / égbolt (nem talaj) képpontjai – a rontásokhoz / GT fűmaszkhoz
         if tree_mask.any():
             shift = int(cam.pan * cam.f) % self.tree_w
             cols = (np.arange(w) + shift) % self.tree_w
@@ -1095,6 +1134,8 @@ class Renderer:
         w, h = self.w, self.h
         Hp2i = cam.H_pitch2img()
         Mw = Hp2i @ self.M_tex
+        self.last_Hp2i = Hp2i
+        self.last_boxes = None
         frame = cv2.warpPerspective(self.tex, Mw, (w, h), flags=cv2.INTER_LINEAR,
                                     borderMode=cv2.BORDER_CONSTANT, borderValue=(50, 90, 60))
         self._background(frame)
@@ -1185,6 +1226,7 @@ class Renderer:
                 ball_box = self._draw_ball(frame, c, cp, r)
                 ball_info = {"uv": [float(c[0]), float(c[1])], "r": float(r), "depth": float(depth),
                              "blur_px": float(math.hypot(c[0] - cp[0], c[1] - cp[1])) * 2.0}
+        self.last_boxes = boxes
         frame = cv2.GaussianBlur(frame, (3, 3), 0.7)
         ox, oy = int(self.rng.integers(0, 32)), int(self.rng.integers(0, 32))
         cv2.add(frame, self.noise_p[oy:oy + h, ox:ox + w], dst=frame)
@@ -1239,6 +1281,160 @@ def camera_path(states, fps, width):
     return out
 
 
+# ============================================================ képromlások (valódi amatőr felvétel utánzása)
+# A rontások a renderelt képkockára hatnak, saját véletlenszám-generátorral: a ground truth
+# (pozíciók, események, H) változatlan marad.
+DEGRADE_PRESETS = {
+    # közepes szintű, együtt előforduló hibák: lelátó-árnyék + alacsony nap + tömörítés + zaj + elmosódás
+    "rossz": {"arnyek": 0.55, "nap": 0.6, "tomorites": 36, "zaj": 4.0, "elmosodas": 0.7},
+}
+
+
+def degrade_options(arnyek=None, nap=None, tomorites=None, zaj=None, elmosodas=None, esti=False, rossz=False):
+    """A parancssori rontás-kapcsolók összefésülése (a --rossz előre beállított szintjeit a kifejezetten
+    megadott értékek felülírják). Visszatér: dict vagy None (nincs rontás)."""
+    opts = dict(DEGRADE_PRESETS["rossz"]) if rossz else {}
+    for k, v in (("arnyek", arnyek), ("nap", nap), ("tomorites", tomorites), ("zaj", zaj), ("elmosodas", elmosodas)):
+        if v is not None:
+            opts[k] = v
+    if esti:
+        opts["esti"] = True
+    opts = {k: v for k, v in opts.items() if v not in (None, 0, 0.0, False)}
+    return opts or None
+
+
+def shadow_edge_y(x):
+    """A --arnyek lelátó-árnyékának határa a pályán: az y < shadow_edge_y(x) rész (a túlsó oldal) árnyékos."""
+    return 36.0 + 0.25 * (np.asarray(x, np.float64) - L / 2) + 1.5 * np.sin(np.asarray(x, np.float64) / 9.0)
+
+
+class Degrader:
+    """
+    Valószerű képromlások a szintetikus képkockákon:
+      arnyek    – éles szélű (lelátó-) árnyék a pálya túlsó részén (a pálya síkjában, a kamerával
+                  együtt mozog a képen), a megadott fényerő-szorzóval (0.45–0.6), enyhén kékes;
+      nap       – napfény-csillanás: fényes folt + szellemképek, fátyolfény (kisebb kontraszt,
+                  fakóbb színek) egy képrészen, beégett csúcsfények (fehér vonal, mez);
+      tomorites – (a kódolásnál) magas CRF, deblocking nélkül: kockás tömörítési hibák;
+      zaj       – Gauss-zaj (σ, 0–255 skála), enyhe színzajjal;
+      elmosodas – irányított mozgási elmosódás a kamera forgási sebességével arányosan
+                  (a szorzó az expozíciós idő a képkocka-időhöz képest);
+      esti      – sötétebb, meleg színezetű kép, reflektor-fényfoltok a pályán, zaj.
+    """
+
+    SUN_DIR = (0.62, -0.78, 0.10)   # a nap iránya (világ): a jobb oldali kapu / túlsó oldal fölött, alacsonyan
+
+    def __init__(self, renderer, opts, seed=0):
+        self.r = renderer
+        self.o = dict(opts or {})
+        self.rng = np.random.default_rng(seed + 9001)
+        self.w, self.h = renderer.w, renderer.h
+        self.prev_cam = None
+        ppm = 5.0
+        tw, th = int((TEX_X1 - TEX_X0) * ppm), int((TEX_Y1 - TEX_Y0) * ppm)
+        xs = TEX_X0 + (np.arange(tw) + 0.5) / ppm
+        ys = TEX_Y0 + (np.arange(th) + 0.5) / ppm
+        X, Y = np.meshgrid(xs, ys)
+        self.M_map = np.array([[1.0 / ppm, 0, TEX_X0], [0, 1.0 / ppm, TEX_Y0], [0, 0, 1.0]])
+        self.shadow_map = None
+        if self.o.get("arnyek"):
+            # a túlsó lelátó árnyéka: ferde, enyhén hullámos, éles határ (a pálya kb. 50%-a)
+            sh = (Y < shadow_edge_y(X)).astype(np.float32)
+            self.shadow_map = cv2.GaussianBlur(sh, (3, 3), 0.6)     # ~0,2 m-es félárnyék
+        self.flood_map = None
+        if self.o.get("esti"):
+            pools = np.zeros(X.shape, np.float32)
+            for lx, ly in ((14.0, 8.0), (L - 14.0, 8.0), (14.0, W - 8.0), (L - 14.0, W - 8.0), (L / 2, -2.0)):
+                pools += np.exp(-((X - lx) ** 2 + (Y - ly) ** 2) / (2 * 14.0 ** 2)).astype(np.float32)
+            self.flood_map = np.clip(0.42 + 0.75 * pools, 0.3, 1.25).astype(np.float32)
+        self.sun_dir = np.array(self.SUN_DIR, np.float64)
+        self.sun_dir /= np.linalg.norm(self.sun_dir)
+        yy, xx = np.mgrid[0:self.h, 0:self.w].astype(np.float32)
+        self._xx, self._yy = xx, yy
+
+    def _ground_map(self, m, sky_value):
+        Mw = self.r.last_Hp2i @ self.M_map
+        g = cv2.warpPerspective(m, Mw, (self.w, self.h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        bg = getattr(self.r, "last_bg_mask", None)
+        if bg is not None:
+            g[bg] = sky_value
+        return g
+
+    def _sun_uv(self):
+        cam = self.r.cam
+        uv, z = cam.project((cam.C + self.sun_dir * 5000.0)[None, :])
+        return (float(uv[0, 0]), float(uv[0, 1])) if z[0] > 0 else None
+
+    def apply(self, frame, cam_params):
+        o = self.o
+        img = frame.astype(np.float32)
+        # 1) megvilágítás: lelátó-árnyék (kékes) / esti reflektorfény (meleg)
+        if self.shadow_map is not None:
+            g = self._ground_map(self.shadow_map, 0.0)
+            s = float(o["arnyek"])
+            for c, tint in ((0, 1.14), (1, 1.0), (2, 0.86)):       # BGR: kékes árnyék
+                img[..., c] *= 1.0 - g * (1.0 - s * tint)
+        if self.flood_map is not None:
+            g = self._ground_map(self.flood_map, 0.33)
+            for c, cast in ((0, 0.72), (1, 0.90), (2, 1.06)):      # meleg (nátriumlámpás) színezet
+                img[..., c] *= g * cast
+        # 2) nap: túlexponálás (beégett csúcsfények) + fátyolfény + csillanás
+        if o.get("nap"):
+            a = float(o["nap"])
+            img *= 1.0 + 0.28 * a
+            sun = self._sun_uv()
+            su, sv = sun if sun is not None else (self.w * 1.1, -0.1 * self.h)
+            su = float(np.clip(su, -0.6 * self.w, 1.6 * self.w))
+            sv = float(np.clip(sv, -0.6 * self.h, 1.6 * self.h))
+            d2 = (self._xx - su) ** 2 + (self._yy - sv) ** 2
+            sig = 0.42 * self.w
+            veil = np.clip(a * (1.05 * np.exp(-d2 / (2 * sig ** 2)) + 0.08), 0, 0.92)
+            if 0 <= su < self.w and 0 <= sv < self.h:
+                rr = 0.035 * self.w
+                veil = np.maximum(veil, np.clip(1.2 * np.exp(-d2 / (2 * rr ** 2)), 0, 1.0))
+            veil = veil[..., None]
+            img = img * (1.0 - veil) + 255.0 * veil * np.array([0.93, 0.98, 1.0], np.float32)
+            # szellemképek (lencse-reflexek) a nap és a képközép egyenesén
+            cx, cy = self.w / 2.0, self.h / 2.0
+            for frac, rad, col in ((0.55, 0.05, (120, 200, 255)), (1.25, 0.03, (255, 170, 120)),
+                                   (1.6, 0.07, (170, 255, 170))):
+                gu, gv = su + (cx - su) * frac, sv + (cy - sv) * frac
+                if -50 < gu < self.w + 50 and -50 < gv < self.h + 50:
+                    ov = np.zeros_like(img)
+                    cv2.circle(ov, (int(gu), int(gv)), int(rad * self.w), col, -1, cv2.LINE_AA)
+                    img += cv2.GaussianBlur(ov, (0, 0), 6) * 0.18 * a
+        # 3) mozgási elmosódás a kamera forgásából (a képtartalom elmozdulása × expozíció)
+        if o.get("elmosodas") and self.prev_cam is not None:
+            pan, tilt, f = cam_params
+            du = (pan - self.prev_cam[0]) * f
+            dv = (tilt - self.prev_cam[1]) * f
+            ln = float(o["elmosodas"]) * math.hypot(du, dv)
+            if ln >= 1.5:
+                k = int(math.ceil(ln)) | 1
+                ker = np.zeros((k, k), np.float32)
+                c0 = k // 2
+                ang = math.atan2(dv, du)
+                ex, ey = math.cos(ang) * ln / 2, math.sin(ang) * ln / 2
+                cv2.line(ker, (int(round((c0 - ex) * 4)), int(round((c0 - ey) * 4))),
+                         (int(round((c0 + ex) * 4)), int(round((c0 + ey) * 4))), 1.0, 1, cv2.LINE_AA, 2)
+                ker /= max(1e-6, float(ker.sum()))
+                img = cv2.filter2D(img, -1, ker, borderType=cv2.BORDER_REPLICATE)
+        self.prev_cam = tuple(cam_params)
+        # 4) szenzorzaj (esti képnél alapból erősebb)
+        sigma = float(o.get("zaj") or (6.5 if o.get("esti") else 0.0))
+        if sigma > 0:
+            img += self.rng.standard_normal((self.h, self.w, 1)).astype(np.float32) * sigma
+            img += self.rng.standard_normal((self.h, self.w, 3)).astype(np.float32) * (0.45 * sigma)
+        return np.clip(img, 0, 255).astype(np.uint8)
+
+    def encoder_args(self, crf):
+        """A H.264 kódoló minőség-paraméterei: tömörítésnél magas CRF, deblocking nélkül (kockásodás)."""
+        n = self.o.get("tomorites")
+        if not n:
+            return ["-crf", str(crf)]
+        return ["-crf", str(int(n)), "-x264-params", "no-deblock=1:aq-mode=0"]
+
+
 # ============================================================ fő folyamat
 def find_ffmpeg():
     return os.environ.get("FFMPEG_PATH") or shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
@@ -1266,12 +1462,16 @@ def _r(v, n=2):
 
 def generate(out_path, gt_path=None, duration=60.0, width=1280, height=720, fps=25, seed=7,
              segments=None, audio=True, crf=23, preset="veryfast", progress=True, save_frames=None,
-             gt_only=False):
+             gt_only=False, degrade=None, frame_hook=None):
     """
     A szintetikus meccs legenerálása. Visszatér: a ground-truth dict (és kiírja a JSON-t is).
     save_frames: {képkocka index: jpg útvonal} – mintaképek mentése.
     gt_only: csak a szimuláció + ground-truth JSON (nincs renderelés / ffmpeg); a képkockákban
              ilyenkor csak t, seg, ball (xyz, on) és xy szerepel (nincs H, cam, objs, uv).
+    degrade: képromlások (lásd Degrader, degrade_options), pl. {"arnyek": 0.5, "nap": 0.6}; a ground
+             truth ettől nem változik (saját véletlenszám-generátor).
+    frame_hook: opcionális fv(képkocka index, (rontott) képkocka, renderer) – pl. a valós fűmaszk
+             (renderer.grass_gt_mask()) mentéséhez tesztekben.
     """
     if gt_only:
         return _generate_gt_only(out_path, gt_path, duration, fps, seed, segments, progress)
@@ -1291,6 +1491,7 @@ def generate(out_path, gt_path=None, duration=60.0, width=1280, height=720, fps=
     cams = camera_path(states, fps, width)
     renderer = Renderer(width, height, np.random.default_rng(seed + 1))
     people = sim.people
+    degrader = Degrader(renderer, degrade, seed) if degrade else None
 
     gt_path = gt_path or os.path.splitext(out_path)[0] + "_gt.json"
     tmpdir = tempfile.mkdtemp(prefix="synth_")
@@ -1300,7 +1501,8 @@ def generate(out_path, gt_path=None, duration=60.0, width=1280, height=720, fps=
     if audio:
         make_audio(wav, total_sec + 1.0, sim.whistles, seed=seed)
         cmd += ["-i", wav, "-c:a", "aac", "-b:a", "64k", "-shortest"]
-    cmd += ["-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p",
+    cmd += ["-c:v", "libx264", "-preset", preset] + (degrader.encoder_args(crf) if degrader else ["-crf", str(crf)])
+    cmd += ["-pix_fmt", "yuv420p",
             "-g", str(fps * 2), out_path]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
@@ -1311,6 +1513,10 @@ def generate(out_path, gt_path=None, duration=60.0, width=1280, height=720, fps=
             gait += np.linalg.norm(st["vel"], axis=1) / fps * 2.6
             frame, Hp2i, boxes, ball_box, ball_info = renderer.render(
                 st, states[fi - 1] if fi > 0 else None, cams[fi], people, gait)
+            if degrader is not None:
+                frame = degrader.apply(frame, cams[fi])
+            if frame_hook is not None:
+                frame_hook(fi, frame, renderer)
             proc.stdin.write(frame.tobytes())
             if save_frames and fi in save_frames:
                 cv2.imwrite(save_frames[fi], frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
@@ -1370,6 +1576,7 @@ def generate(out_path, gt_path=None, duration=60.0, width=1280, height=720, fps=
         "duration": round(total_sec, 3), "seed": seed,
         "pitch": {"length": L, "width": W},
         "camera": {"position": CAM_POS.tolist(), "model": "tűlyuk, pan/tilt/zoom, torzítás nélkül"},
+        "degrade": degrade or None,
         "segments": [{"name": n, "duration": d} for n, d in segs],
         "periods": sim.periods,
         "whistles": sim.whistles,
@@ -1392,6 +1599,42 @@ def generate(out_path, gt_path=None, duration=60.0, width=1280, height=720, fps=
     if progress:
         print(f"Kész: {out_path} + {gt_path} ({time.time() - t_start:.1f} s)")
     return gt
+
+
+def render_sample_frames(frame_ids, duration=4.0, width=1280, height=720, fps=25, seed=7, degrade=None,
+                         renderer=None):
+    """
+    Néhány képkocka renderelése videókódolás nélkül (tesztekhez): a képkockák (rontással), a valós
+    fűmaszk (renderer.grass_gt_mask) és a látható alakok [(person_id, szerep, csapat, doboz, pálya (x, y))] listája.
+    Visszatér: (eredmények listája dict-ekkel, renderer) – a renderer újrahasznosítható (lassú felépíteni).
+    """
+    rng = np.random.default_rng(seed)
+    sim = MatchSim(fps, parse_segments(None, duration), rng)
+    states = sim.run()
+    cams = camera_path(states, fps, width)
+    if renderer is None:
+        renderer = Renderer(width, height, np.random.default_rng(seed + 1))
+    degrader = Degrader(renderer, degrade, seed) if degrade else None
+    want = set(int(i) for i in frame_ids)
+    last = min(max(want), len(states) - 1)
+    gait = np.zeros(len(sim.people))
+    out = []
+    for fi in range(last + 1):
+        st = states[fi]
+        gait += np.linalg.norm(st["vel"], axis=1) / fps * 2.6
+        if fi not in want:
+            # a kihagyott képkockákon csak a kamera állása kell (a mozgási elmosódáshoz)
+            if degrader is not None:
+                degrader.prev_cam = tuple(cams[fi])
+            continue
+        frame, _H, boxes, _bb, _bi = renderer.render(st, states[fi - 1] if fi > 0 else None, cams[fi], sim.people, gait)
+        if degrader is not None:
+            frame = degrader.apply(frame, cams[fi])
+        figs = [(i, sim.people[i].role, sim.people[i].team, bb, (float(st["pos"][i][0]), float(st["pos"][i][1])))
+                for i, (bb, _z, _f) in boxes.items()]
+        out.append({"index": fi, "frame": frame, "grass_gt": renderer.grass_gt_mask(), "people": figs,
+                    "H": np.linalg.inv(_H)})
+    return out, renderer
 
 
 def _generate_gt_only(out_path, gt_path, duration, fps, seed, segments, progress):
@@ -1453,14 +1696,35 @@ def main(argv=None):
                     help="csak a ground-truth JSON (renderelés és ffmpeg nélkül, gyors)")
     ap.add_argument("--save-frames", default=None,
                     help="mintaképek mentése: 'index1,index2,...:könyvtár' (pl. '0,300,900:/tmp/kepek')")
+    rg = ap.add_argument_group("képromlások (valódi amatőr felvétel utánzása; a ground truth nem változik)")
+    rg.add_argument("--arnyek", type=float, nargs="?", const=0.5, default=None, metavar="FÉNYERŐ",
+                    help="éles szélű lelátó-árnyék a pálya túlsó részén (a pálya ~50%%-a), fényerő-szorzó "
+                         "(alap: 0.5, javasolt 0.45–0.6), enyhén kékes")
+    rg.add_argument("--nap", type=float, nargs="?", const=1.0, default=None, metavar="ERŐSSÉG",
+                    help="napfény-csillanás: fényes folt + szellemképek, fátyolfény (kisebb kontraszt), "
+                         "beégett csúcsfények (alap: 1.0)")
+    rg.add_argument("--tomorites", type=int, default=None, metavar="CRF",
+                    help="erős tömörítés: H.264 ezzel a CRF-fel, deblocking nélkül (kockásodás; pl. 38–45)")
+    rg.add_argument("--zaj", type=float, default=None, metavar="SZIGMA",
+                    help="Gauss-zaj szórása (0–255 skála, pl. 4–10), enyhe színzajjal")
+    rg.add_argument("--elmosodas", type=float, nargs="?", const=1.0, default=None, metavar="SZORZÓ",
+                    help="irányított mozgási elmosódás a kamera forgási sebességével arányosan "
+                         "(szorzó = expozíció / képkocka-idő, alap: 1.0)")
+    rg.add_argument("--esti", action="store_true",
+                    help="esti felvétel: sötétebb, meleg színezet, reflektor-fényfoltok, zaj")
+    rg.add_argument("--rossz", action="store_true",
+                    help="előre beállított közepes rontás-csomag: árnyék 0.55 + nap 0.6 + tömörítés CRF 36 + "
+                         "zaj 4 + elmosódás 0.7 (a külön megadott kapcsolók felülírják)")
     args = ap.parse_args(argv)
+    degrade = degrade_options(args.arnyek, args.nap, args.tomorites, args.zaj, args.elmosodas, args.esti, args.rossz)
     save = None
     if args.save_frames:
         idx, _, d = args.save_frames.partition(":")
         os.makedirs(d or ".", exist_ok=True)
         save = {int(i): os.path.join(d or ".", f"frame_{int(i):05d}.jpg") for i in idx.split(",") if i.strip()}
     generate(args.out, args.gt, args.duration, args.width, args.height, args.fps, args.seed,
-             args.segments, audio=not args.no_audio, crf=args.crf, save_frames=save, gt_only=args.gt_only)
+             args.segments, audio=not args.no_audio, crf=args.crf, save_frames=save, gt_only=args.gt_only,
+             degrade=degrade)
     return 0
 
 

@@ -121,10 +121,11 @@ class StationaryFilter:
             del self.history[tid]
 
 
-def extract_dominant_color(image_crop, grass_lower=None, grass_upper=None):
+def extract_dominant_color(image_crop, grass_lower=None, grass_upper=None, grass_model=None):
     """
     Mezszín a felsőtestből – gyors változat (KMeans helyett medián).
-    A fűszínű pixeleket kihagyja, hogy a háttér ne torzítsa.
+    A fűszínű pixeleket kihagyja, hogy a háttér ne torzítsa (grass_model: adaptív fűmodell –
+    ha tanult, ez dönti el, mi a fű, a HSV tartomány helyett).
     Visszatér: [R, G, B]
     """
     if image_crop.size == 0:
@@ -135,7 +136,11 @@ def extract_dominant_color(image_crop, grass_lower=None, grass_upper=None):
         return [0, 0, 0]
 
     pixels = torso.reshape(-1, 3)
-    if grass_lower is not None and grass_upper is not None and not is_full_range(grass_lower, grass_upper):
+    if grass_model is not None and getattr(grass_model, "ready", False):
+        not_grass = ~grass_model.is_grass_pixels(pixels)
+        if np.count_nonzero(not_grass) >= 5:
+            pixels = pixels[not_grass]
+    elif grass_lower is not None and grass_upper is not None and not is_full_range(grass_lower, grass_upper):
         hsv = cv2.cvtColor(torso, cv2.COLOR_BGR2HSV)
         not_grass = cv2.inRange(hsv, grass_lower, grass_upper).reshape(-1) == 0
         if np.count_nonzero(not_grass) >= 5:
@@ -452,3 +457,538 @@ class KeeperGate:
     def prune(self, frame_idx):
         for tid in [t for t, tr in self.tracks.items() if frame_idx - tr["last"] > self.ttl]:
             del self.tracks[tid]
+
+
+# ======================================================================
+# ADAPTÍV FŰMODELL: a fű színeloszlása videónként tanulva (árnyék-, csillanás- és színezet-tűrő)
+# ======================================================================
+DEFAULT_GRASS_HSV = (np.array([30, 40, 40]), np.array([85, 255, 255]))   # a /cut-raw alapértéke = "auto"
+_LOG_K = 3.0       # eltolás a log-színarányban (a sötét pixelek zaja ellen)
+_LOG_LUT = np.log(np.arange(256, dtype=np.float32) + _LOG_K).astype(np.float32)
+
+
+def grass_mode_from_config(config):
+    """
+    Melyik fűmaszk fusson: "auto" (adaptív modell) vagy "hsv" (a kliens fix HSV tartománya).
+    A kézzel beállított (az alapértéktől és a teljes tartománytól eltérő) HSV tartomány mindig nyer;
+    grass_model = "hsv" a régi, fix tartományos működést kényszeríti.
+    """
+    if str(config.get("grass_model", "auto")).strip().lower() == "hsv":
+        return "hsv"
+    lo, hi = config.get("grass_lower"), config.get("grass_upper")
+    if lo is None or hi is None:
+        return "auto"
+    lo, hi = np.asarray(lo), np.asarray(hi)
+    if is_full_range(lo, hi) or (np.array_equal(lo, DEFAULT_GRASS_HSV[0]) and np.array_equal(hi, DEFAULT_GRASS_HSV[1])):
+        return "auto"
+    return "hsv"
+
+
+def _features(bgr):
+    """(..., 3) uint8 BGR -> (..., 3) float32: log-színarány (G/R, G/B) és log-világosság.
+    A két színarány független a megvilágítás erősségétől (árnyék = szorzó), a színezet (pl. kékes
+    árnyék, meleg reflektorfény) csak eltolja őket."""
+    f = _LOG_LUT[bgr]
+    gray = (0.114 * bgr[..., 0] + 0.587 * bgr[..., 1] + 0.299 * bgr[..., 2]).astype(np.uint8)
+    out = np.empty(bgr.shape[:-1] + (3,), np.float32)
+    out[..., 0] = f[..., 1] - f[..., 2]
+    out[..., 1] = f[..., 1] - f[..., 0]
+    out[..., 2] = _LOG_LUT[gray]
+    return out
+
+
+class _Mode:
+    """Egy fű-módus (pl. napos / árnyékos fű): 2D Gauss a színarányokon + világosság-tartomány."""
+    __slots__ = ("mu", "cov", "icov", "lv", "slv", "w", "bgr")
+
+    def __init__(self, mu, cov, lv, slv, w, bgr):
+        self.mu = np.asarray(mu, np.float64)
+        self.cov = np.asarray(cov, np.float64)
+        self.lv, self.slv, self.w = float(lv), float(slv), float(w)
+        self.bgr = np.asarray(bgr, np.float64)
+        self._inv()
+
+    def _inv(self):
+        c = self.cov + np.eye(2) * GrassModel.CHROMA_FLOOR ** 2
+        self.icov = np.linalg.inv(c)
+
+    def d2(self, F):
+        dx = F[..., 0] - self.mu[0]
+        dy = F[..., 1] - self.mu[1]
+        a, b, c = self.icov[0, 0], self.icov[0, 1], self.icov[1, 1]
+        return a * dx * dx + 2 * b * dx * dy + c * dy * dy
+
+    def blend(self, other, a):
+        self.mu = (1 - a) * self.mu + a * other.mu
+        self.cov = (1 - a) * self.cov + a * other.cov
+        self.lv = (1 - a) * self.lv + a * other.lv
+        self.slv = (1 - a) * self.slv + a * other.slv
+        self.w = (1 - a) * self.w + a * other.w
+        self.bgr = (1 - a) * self.bgr + a * other.bgr
+        self._inv()
+
+
+class GrassModel:
+    """
+    Videónként tanult fűmodell a fix HSV-doboz helyett.
+
+    * Jellemzők: log(G/R), log(G/B) színarány (a fényerőtől független) + log-világosság.
+    * Tanulás (observe): a kép alsó-középső részéből (ott szinte biztosan fű van) robusztus kezdő
+      becslés, majd a kép alsó 65%-ának "zöldes" pixeleire legfeljebb 2 módusú Gauss-keverék (EM):
+      napos és árnyékos fű (az árnyékos módus színaránya a napostól legfeljebb MODE_CHROMA_GAP-re
+      lehet – így a fák / reklámtábla nem lesznek "fű"). Később lassan frissül (felejtő átlag), és
+      ha új, elég nagy árnyékos / megvilágított rész jelenik meg, a második módus akkor is létrejön.
+    * Maszk (mask): a pixel fű, ha valamelyik módus színarány-Mahalanobis távolsága < D2_MAX és a
+      világossága a módus tartományában van; vagy ha a napos módus "kifakult" (csillanás /
+      fátyolfény: a fehér felé eltolódott, de világosabb) változata. Utána zárás, mint a régi
+      build_grass_mask-nál (a fehér vonalak és a lábak árnyéka kitöltődik).
+    * Kimenetek a többi lépésnek: mask() (foot_on_grass, labdakövető), is_grass_pixels() (mezszín
+      fű-kiszűrése), hsv_bounds() (HSV-tartományt váró kód, pl. a pályakövető), illumination_gain()
+      (a játékos körüli fű alapján megvilágítás-korrekció a mezszínhez).
+    Tanulás előtt (ready == False) a mask() a fix alap HSV tartományra esik vissza.
+    """
+
+    CHROMA_FLOOR = 0.05      # a színarány-szórás alsó korlátja (zaj, tömörítés)
+    D2_MAX = 9.0             # ~3 szigma
+    LV_TOL = 3.0             # világosság-tűrés (szigma)
+    LV_TOL_MIN = 0.45        # ... de legalább ennyi (log; ~x1.6)
+    LV_TOL_DARK = 1.0        # sötétebb irányban legalább ennyi (log; ~x0,37: az alakok saját árnyéka is fű)
+    MODE_CHROMA_GAP = 0.45   # a második módus színaránya legfeljebb ennyire térhet el az elsőtől
+    MODE_LV_GAP = 0.25       # ... és világosságban legalább ennyire különbözzön (vagy színarányban 2,5 szigmára)
+    MIN_MODE_W = 0.07        # a második módus minimális súlya
+    DENS_WIN, DENS_MIN = 5, 0.5   # többségi szűrő: ablakméret (px) és a fű-pixelek minimális aránya
+    EDGE_GROW = 0            # a kész maszk tágítása (px, a maszk felbontásán; 0 = nincs)
+    D2_WEAK = 36.0           # gyenge jelölt színarány-tűrése (~6 szigma)
+    WEAK = 4                 # a gyenge jelölt címkéje
+    FADED_T_MIN = 0.2        # a "kifakult" (csillanás) fű minimális megmaradt színessége a napos módushoz képest
+
+    def __init__(self, update_alpha=0.15, max_samples=24000, learn_frames=3, learn_scale=0.5, seed=0):
+        self.modes = []
+        self.learn_scale = float(learn_scale)
+        self.learn_frames = max(1, int(learn_frames))
+        self.update_alpha = float(update_alpha)
+        self.max_samples = int(max_samples)
+        self.rng = np.random.default_rng(seed)
+        self.n_obs = 0
+        self.n_fits = 0
+        self._hsv_bounds = None
+        self._pending = []          # a kezdeti tanulás mintái (több képkocka)
+        self.history = []           # (megfigyelés sorszáma, módusok száma, árnyék-arány) – naplóhoz
+
+    @property
+    def ready(self):
+        return bool(self.modes)
+
+    # ------------------------------------------------------------------ tanulás
+    def _candidates(self, frame):
+        """
+        A tanulás mintái egy képkockából, a maszk felbontásán (learn_scale):
+        (mag-pixelek, mag-jellemzők), (pálya-pixelek, pálya-jellemzők). Pálya-pixel: durván zöldes,
+        nem túl sötét, nem beégett, a referencia (napos) fű színarányához közeli, ÉS a kép alsó-középső
+        részéhez (ahol biztosan fű van) összefüggő területen van – így a fasor, a távoli bokrok a
+        reklámtábla / salakpálya mögött nem kerülnek a mintába (a második, árnyékos módus sem tanulhat rájuk).
+        """
+        sc = self.learn_scale
+        small = cv2.resize(frame, None, fx=sc, fy=sc, interpolation=cv2.INTER_AREA) if sc != 1.0 else frame
+        h, w = small.shape[:2]
+        F = _features(small)
+        green = (F[..., 0] > 0.04) & (F[..., 1] > -0.15) & (F[..., 2] > np.log(14.0)) & (small.max(axis=2) < 253)
+        sy0, sy1, sx0, sx1 = int(h * 0.60), int(h * 0.97), int(w * 0.15), int(w * 0.85)
+        seed_zone = np.zeros((h, w), bool)
+        seed_zone[sy0:sy1, sx0:sx1] = True
+        ref = self.modes[0].mu if self.ready else None
+        if ref is None:
+            sf = F[seed_zone & green]
+            if len(sf) < 50:
+                e = np.zeros((0, 3), np.float32)
+                return (e.astype(np.uint8), e), (e.astype(np.uint8), e)
+            ref = np.median(sf[:, :2], axis=0)
+        near = green & (np.hypot(F[..., 0] - ref[0], F[..., 1] - ref[1]) < self.MODE_CHROMA_GAP + 0.1)
+        dens = cv2.blur(near.astype(np.float32), (5, 5)) >= 0.5
+        n, cc = cv2.connectedComponents(dens.astype(np.uint8), connectivity=8)
+        if n > 1:
+            counts = np.bincount(cc[seed_zone].ravel(), minlength=n)
+            counts[0] = 0
+            keep = counts >= max(20, 0.05 * counts.sum())
+            region = keep[cc] & near
+        else:
+            region = near
+        seed = region & seed_zone
+        return (small[seed], F[seed]), (small[region], F[region])
+
+    def _fit(self, seed_px, seed_F, px, F, init=None):
+        """Legfeljebb 2 módusú, korlátozott EM. Visszatér: módus-lista vagy None."""
+        if len(seed_F) < 50 and init is None:
+            return None
+        if len(F) > self.max_samples:
+            idx = self.rng.choice(len(F), self.max_samples, replace=False)
+            F, px = F[idx], px[idx]
+        if init is None:
+            med = np.median(seed_F, axis=0)
+            mad = np.median(np.abs(seed_F - med), axis=0) * 1.4826 + 1e-3
+            core = np.all(np.abs(seed_F - med) < 3 * mad, axis=1)
+            sf = seed_F[core] if core.sum() >= 30 else seed_F
+            A = _Mode(sf[:, :2].mean(0), np.cov(sf[:, :2].T), sf[:, 2].mean(), max(0.08, sf[:, 2].std()), 1.0,
+                      seed_px[core].mean(0) if core.sum() >= 30 else seed_px.mean(0))
+            modes = [A]
+        else:
+            modes = [_Mode(m.mu, m.cov, m.lv, m.slv, m.w, m.bgr) for m in init]
+        A = modes[0]
+        # csak a napos módus közelében lévő (színarányban) pixelek számítanak – fák, tábla, salak kiesnek
+        near = np.hypot(F[:, 0] - A.mu[0], F[:, 1] - A.mu[1]) < self.MODE_CHROMA_GAP + 0.1
+        F, px = F[near], px[near]
+        if len(F) < 50:
+            return modes if init is not None else None
+        # második módus keresése: a napos módushoz nem illő, de közeli színarányú, elég sok pixel
+        if len(modes) == 1:
+            dA = A.d2(F)
+            lvok = np.abs(F[:, 2] - A.lv) <= max(self.LV_TOL * A.slv, self.LV_TOL_MIN)
+            out = ~((dA < self.D2_MAX) & lvok)
+            if out.mean() >= self.MIN_MODE_W:
+                Fo = F[out]
+                modes.append(_Mode(np.median(Fo[:, :2], 0), np.cov(Fo[:, :2].T), np.median(Fo[:, 2]),
+                                   max(0.08, Fo[:, 2].std()), out.mean(), px[out].mean(0)))
+        # EM (3D Gauss: színarány + világosság), néhány lépés
+        for _ in range(8):
+            ll = []
+            for m in modes:
+                d = m.d2(F) + ((F[:, 2] - m.lv) / max(m.slv, 0.05)) ** 2
+                det = np.linalg.det(m.cov + np.eye(2) * self.CHROMA_FLOOR ** 2) * max(m.slv, 0.05) ** 2
+                ll.append(np.log(max(m.w, 1e-3)) - 0.5 * d - 0.5 * np.log(max(det, 1e-12)))
+            ll = np.stack(ll, 1)
+            ll -= ll.max(1, keepdims=True)
+            R = np.exp(ll)
+            R /= R.sum(1, keepdims=True)
+            for k, m in enumerate(modes):
+                r = R[:, k]
+                s = r.sum()
+                if s < 20:
+                    continue
+                mu = (F[:, :2] * r[:, None]).sum(0) / s
+                X = F[:, :2] - mu
+                cov = (X * r[:, None]).T @ X / s
+                lv = float((F[:, 2] * r).sum() / s)
+                slv = float(np.sqrt(((F[:, 2] - lv) ** 2 * r).sum() / s))
+                m.mu, m.cov, m.lv, m.slv, m.w = mu, cov, lv, max(0.06, slv), float(s / len(F))
+                m.bgr = (px * r[:, None]).sum(0) / s
+                m._inv()
+        # épség: a második módus a napostól nem túl távoli színarányú és elég nagy; különben eldobjuk
+        if len(modes) == 2:
+            a, b = modes
+            gap = float(np.hypot(*(a.mu - b.mu)))
+            separate = abs(a.lv - b.lv) >= self.MODE_LV_GAP or b.d2(a.mu[None, :])[0] > 6.0
+            if b.w < self.MIN_MODE_W or gap > self.MODE_CHROMA_GAP or not separate:
+                modes = [a]
+                a.w = 1.0
+            # a világosabb módus legyen az első ("napos" referencia)
+            if len(modes) == 2 and modes[1].lv > modes[0].lv:
+                modes = [modes[1], modes[0]]
+        return modes
+
+    def observe(self, frame):
+        """Egy képkocka megfigyelése (tanulás / lassú frissítés). Visszatér: True, ha a modell változott.
+        Az első illesztés learn_frames képkocka mintáiból készül (lásd még flush())."""
+        (sp, sF), (wp, wF) = self._candidates(frame)
+        self.n_obs += 1
+        if not self.ready:
+            self._pending.append((sp, sF, wp, wF))
+            if len(self._pending) < self.learn_frames:
+                return False
+            return self.flush()
+        return self._update(sp, sF, wp, wF)
+
+    def flush(self):
+        """A kezdeti tanulás lezárása az eddig gyűjtött mintákból. Visszatér: True, ha kész a modell."""
+        if self.ready or not self._pending:
+            return self.ready
+        sp = np.concatenate([p[0] for p in self._pending])
+        sF = np.concatenate([p[1] for p in self._pending])
+        wp = np.concatenate([p[2] for p in self._pending])
+        wF = np.concatenate([p[3] for p in self._pending])
+        modes = self._fit(sp, sF, wp, wF)
+        if modes is None:
+            self._pending = self._pending[-self.learn_frames:]
+            return False
+        self.modes = modes
+        self._pending = []
+        self.n_fits += 1
+        self._update_hsv(wp, wF)
+        self.history.append((self.n_obs, len(self.modes), self.shadow_weight()))
+        return True
+
+    def _update(self, sp, sF, wp, wF):
+        # lassú frissítés: a jelenlegi modellből indított EM, felejtő átlaggal
+        new = self._fit(sp, sF, wp, wF, init=self.modes if len(self.modes) == 2 else None)
+        if new is None and len(self.modes) == 1:
+            new = self._fit(sp, sF, wp, wF, init=self.modes)
+        if not new:
+            return False
+        a = self.update_alpha
+        # az új módusok párosítása a meglévőkhöz (színarány + világosság szerint)
+        used = set()
+        for m in self.modes:
+            dist = [float(np.hypot(*(m.mu - n.mu)) + abs(m.lv - n.lv)) if j not in used else 1e9
+                    for j, n in enumerate(new)]
+            j = int(np.argmin(dist)) if dist else -1
+            if j >= 0 and dist[j] < 0.6:
+                used.add(j)
+                m.blend(new[j], a)
+            else:
+                m.w *= (1 - a)          # most nem látszik: lassan felejtjük
+        for j, n in enumerate(new):
+            if j not in used and len(self.modes) < 2 and n.w >= self.MIN_MODE_W:
+                # új (pl. árnyékos) rész jelent meg: a második módus azonnal felvéve, kisebb súllyal
+                n.w = max(self.MIN_MODE_W, n.w * 0.5)
+                self.modes.append(n)
+        if len(self.modes) == 2 and min(m.w for m in self.modes) < self.MIN_MODE_W * 0.5:
+            self.modes = [max(self.modes, key=lambda m: m.w)]
+        self.modes.sort(key=lambda m: -m.lv)     # a világosabb a "napos" referencia
+        self.n_fits += 1
+        self._update_hsv(wp, wF)
+        self.history.append((self.n_obs, len(self.modes), self.shadow_weight()))
+        return True
+
+    def shadow_weight(self):
+        return 0.0 if len(self.modes) < 2 else float(self.modes[1].w / (self.modes[0].w + self.modes[1].w))
+
+    # ------------------------------------------------------------------ osztályozás
+    def classify_features(self, F):
+        """F: (..., 3) jellemzők -> címke: 0 = nem fű, 1 = napos módus, 2 = második módus, 3 = kifakult
+        (csillanás), 4 (WEAK) = gyenge jelölt (csak biztos fű mellett fű)."""
+        lab = np.zeros(F.shape[:-1], np.uint8)
+        if not self.ready:
+            return lab
+        best = None
+        for k, m in enumerate(self.modes):
+            # a világosság-tűrés lefelé nagyobb: a játékosok / labda saját árnyéka is fű (a színarány marad)
+            dlv = F[..., 2] - m.lv
+            tol_up = max(self.LV_TOL * m.slv, self.LV_TOL_MIN)
+            tol_dn = max(self.LV_TOL * m.slv, self.LV_TOL_DARK)
+            # a módusnál sötétebb (árnyékos) pixel színaránya zajosabb és kissé a 0 felé húz: nagyobb tűrés
+            d2 = m.d2(F) / (1.0 + (np.minimum(dlv, 0.0) / 0.4) ** 2)
+            lvok = (dlv <= tol_up) & (dlv >= -tol_dn)
+            ok = (d2 < self.D2_MAX) & lvok
+            weak = (d2 < self.D2_WEAK) & lvok
+            weak_any = weak if k == 0 else (weak_any | weak)
+            score = np.where(ok, d2 + (dlv / max(m.slv, 0.1)) ** 2, np.inf)
+            if best is None:
+                best = score
+                lab[ok] = k + 1
+            else:
+                closer = score < best
+                lab[closer] = k + 1
+                best = np.minimum(best, score)
+        # félárnyék (az árnyék éle): a két módus keveréke – a kettőt összekötő szakasz közelében
+        if len(self.modes) == 2:
+            A, B = self.modes
+            d = np.array([B.mu[0] - A.mu[0], B.mu[1] - A.mu[1], B.lv - A.lv])
+            nd = float(d @ d)
+            if nd > 1e-6:
+                X0, X1, X2 = F[..., 0] - A.mu[0], F[..., 1] - A.mu[1], F[..., 2] - A.lv
+                t = (X0 * d[0] + X1 * d[1] + X2 * d[2]) / nd
+                tc = np.clip(t, 0.0, 1.0)
+                e0, e1, e2 = X0 - tc * d[0], X1 - tc * d[1], X2 - tc * d[2]
+                sig = max(self.CHROMA_FLOOR, float(np.sqrt((np.trace(A.cov) + np.trace(B.cov)) / 4.0)))
+                mix = (t > 0) & (t < 1) & (np.hypot(e0, e1) < 2.5 * sig) & \
+                      (np.abs(e2) < max(A.slv, B.slv) * 2.0) & (lab == 0)
+                lab[mix] = 2
+        # csillanás / fátyolfény: a módus színaránya a fehér (0, 0) felé "kifakulva", de világosabban
+        # (napos módus: fátyolfény; árnyékos módus: az árnyékba eső, elmosott fehér vonal is ilyen)
+        for k, m in enumerate(self.modes):
+            n2 = float(m.mu @ m.mu)
+            if n2 <= 0.04:
+                continue
+            t = (F[..., 0] * m.mu[0] + F[..., 1] * m.mu[1]) / n2
+            perp = np.hypot(F[..., 0] - t * m.mu[0], F[..., 1] - t * m.mu[1])
+            sig = max(self.CHROMA_FLOOR, float(np.sqrt(np.trace(m.cov) / 2.0)))
+            t_min = self.FADED_T_MIN if k == 0 else 0.2
+            faded = (t >= t_min) & (t < 1.0) & (perp < 3.0 * sig * np.maximum(t, 0.5)) & \
+                    (F[..., 2] >= m.lv - 0.15) & (lab == 0)
+            lab[faded] = 3 if k == 0 else 2   # az árnyékos módus "kifakult" pixele (pl. vonal) árnyékos fű
+        # gyenge jelölt: a színarány tágabb tűrésen belül (a játékosok körüli színszivárgás, tömörítés);
+        # a maszkban csak a biztos fű közvetlen szomszédságában számít fűnek
+        lab[weak_any & (lab == 0)] = self.WEAK
+        return lab
+
+    LUT_BITS = 6     # a gyors osztályozó táblázat csatornánkénti felbontása (6 bit = 4-es lépés)
+
+    def labels(self, bgr):
+        """
+        Gyors osztályozás táblázatból: (..., 3) uint8 BGR -> címke (mint a classify_features). A
+        táblázat (2^18 szín, a 4-es rács középpontjaival) a modell minden változásakor újraépül.
+        """
+        bgr = np.asarray(bgr, np.uint8)
+        if not self.ready:
+            return np.zeros(bgr.shape[:-1], np.uint8)
+        key = (self.n_fits, len(self.modes))
+        if getattr(self, "_lut_key", None) != key:
+            n = 1 << self.LUT_BITS
+            step = 256 // n
+            c = (np.arange(n) * step + step // 2).astype(np.uint8)
+            B, G, R = np.meshgrid(c, c, c, indexing="ij")
+            grid = np.stack([B, G, R], -1).reshape(-1, 3)
+            self._lut = self.classify_features(_features(grid)).astype(np.uint8)
+            self._lut_key = key
+        sh = 8 - self.LUT_BITS
+        b = bgr[..., 0].astype(np.uint32) >> sh
+        g = bgr[..., 1].astype(np.uint32) >> sh
+        r = bgr[..., 2].astype(np.uint32) >> sh
+        return self._lut[(b << (2 * self.LUT_BITS)) | (g << self.LUT_BITS) | r]
+
+    def is_grass_pixels(self, bgr_pixels):
+        """(N, 3) uint8 BGR -> bool (N,): fű-e a pixel (pl. a mezszín-leíróhoz)."""
+        px = np.asarray(bgr_pixels, np.uint8).reshape(-1, 3)
+        lab = self.labels(px)
+        return (lab > 0) & (lab < self.WEAK)
+
+    def mask(self, frame_bgr, scale=0.5):
+        """Fűmaszk csökkentett felbontáson (mint a build_grass_mask). Visszatér: (maszk, scale)."""
+        if not self.ready:
+            hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+            return build_grass_mask(hsv, *DEFAULT_GRASS_HSV, scale=scale)
+        small = cv2.resize(frame_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        lab = self.labels(small)
+        strong = (lab > 0) & (lab < self.WEAK)
+        # csak a SŰRŰ biztos fű mellett (a fák / bokrok elszórt "fűszínű" foltjai mellett nem)
+        solid = (lab == 1) | (lab == 2)    # a kifakult (csillanó) rész mellett nem: ott minden szürkés-zöld
+        dense = solid & (cv2.blur(solid.astype(np.float32), (5, 5)) >= 0.7)
+        near = cv2.dilate(dense.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+        return self._clean_mask(strong, extra=(lab == self.WEAK) & near), scale
+
+    def _clean_mask(self, raw, extra=None):
+        """
+        A pixelenkénti döntés tisztítása: (1) többségi szűrő (a fák / bokrok foltjai közül csak
+        néhány pixel "fűszínű", a fű sűrű), (2) zárás (fehér vonalak, árnyékok), (3) csak a kép alsó
+        részébe nyúló vagy nagyon nagy összefüggő részek maradnak (a fasor, a távoli zöld felületek
+        nem a pálya). extra: további (gyenge) fű-pixelek – az összefüggőség-vizsgálatban nem
+        vesznek részt (nem köthetik össze a fasort a pályával), csak a végső maszkban.
+        """
+        h, w = raw.shape[:2]
+        dens = cv2.blur(raw.astype(np.float32), (self.DENS_WIN, self.DENS_WIN))
+        # a vékony (1–2 px) fehér vonalak ne vágják szét a füvet, a vastagabb tábla / salaksáv igen
+        rawd = cv2.dilate(raw.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+        core = np.where((dens >= self.DENS_MIN) & rawd, 255, 0).astype(np.uint8)
+        # az összefüggő részek a zárás ELŐTT: a reklámtábla / salaksáv még elválasztja a fasort a pályától
+        n, cc, stats, _ = cv2.connectedComponentsWithStats(core, connectivity=8)
+        if n > 2:
+            low = int(h * 0.55)
+            keep = np.zeros(n, bool)
+            for i in range(1, n):
+                y0, hh, area = stats[i, cv2.CC_STAT_TOP], stats[i, cv2.CC_STAT_HEIGHT], stats[i, cv2.CC_STAT_AREA]
+                keep[i] = (y0 + hh > low and area >= 0.002 * h * w) or area >= 0.2 * h * w
+            core = np.where(keep[cc], 255, 0).astype(np.uint8)
+        # a többségi szűrő a széleken "rág" (a játékosok körül): a megtartott részek közvetlen
+        # környezetében a pixelenkénti döntés számít
+        zone = cv2.dilate(core, np.ones((5, 5), np.uint8)) > 0
+        full = raw if extra is None else (raw | extra)
+        mask = np.where(full & zone, 255, 0).astype(np.uint8)
+        k = max(5, (int(h / 60) // 2) * 2 + 1)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        if self.EDGE_GROW > 0:
+            # a fű széle kicsit kifelé (a láb / cipő / saját árnyék / színszivárgás a fűhöz tartozik)
+            g = 2 * self.EDGE_GROW + 1
+            mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (g, g)))
+        return mask
+
+    def label_map(self, frame_bgr, scale=0.5):
+        """Módus-címkék képe (0 nem fű, 1 napos, 2 árnyékos/második, 3 kifakult) – minőségméréshez, rajzoláshoz."""
+        small = cv2.resize(frame_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale != 1.0 else frame_bgr
+        lab = self.labels(small)
+        lab[lab == self.WEAK] = 0
+        return lab
+
+    # ------------------------------------------------------------------ kimenetek más lépéseknek
+    def _update_hsv(self, px, F):
+        lab = self.classify_features(F)
+        g = px[(lab > 0) & (lab < self.WEAK)]
+        if len(g) < 50:
+            return
+        hsv = cv2.cvtColor(g.reshape(-1, 1, 3), cv2.COLOR_BGR2HSV).reshape(-1, 3).astype(np.float64)
+        lo = np.array([np.percentile(hsv[:, 0], 0.5) - 5, np.percentile(hsv[:, 1], 0.5) - 25,
+                       np.percentile(hsv[:, 2], 0.5) - 20])
+        hi = np.array([np.percentile(hsv[:, 0], 99.5) + 5, 255, 255])
+        lo = np.clip(np.round(lo), [0, 10, 10], [179, 255, 255]).astype(int)
+        hi = np.clip(np.round(hi), [0, 0, 0], [179, 255, 255]).astype(int)
+        self._hsv_bounds = (lo, hi)
+
+    def hsv_bounds(self, union_default=False):
+        """A tanult fű (mindkét módus) HSV-burka (lower, upper) a HSV tartományt váró kódnak
+        (pl. pitch_tracker.PitchTracker); tanulás előtt az alap tartomány. union_default: az alap
+        tartománnyal egyesítve (sosem szűkebb a réginél – a meglévő hangolás megmarad)."""
+        if self._hsv_bounds is None:
+            return DEFAULT_GRASS_HSV[0].copy(), DEFAULT_GRASS_HSV[1].copy()
+        lo, hi = self._hsv_bounds[0].copy(), self._hsv_bounds[1].copy()
+        if union_default:
+            lo, hi = np.minimum(lo, DEFAULT_GRASS_HSV[0]), np.maximum(hi, DEFAULT_GRASS_HSV[1])
+        return lo, hi
+
+    def reference_bgr(self):
+        """A napos (referencia) fű átlagszíne BGR-ben, vagy None."""
+        return None if not self.ready else self.modes[0].bgr.copy()
+
+    def illumination_gain(self, frame_bgr, bbox, min_pixels=12):
+        """
+        Megvilágítás-korrekció a játékos körüli fű alapján (von Kries fehéregyensúly): a láb körüli
+        sáv fűpixelei melyik módusba tartoznak; az árnyékos módus arányában a csatornánkénti szorzó
+        a napos / árnyékos fű átlagszínének aránya (a módusok átlagából – nem zajos, és a nyírási
+        csíkok sem zavarják). Visszatér: (szorzó BGR float32[3] vagy None, árnyékos arány 0..1).
+        """
+        if len(self.modes) < 2:
+            return None, 0.0
+        H, W = frame_bgr.shape[:2]
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        bw, bh = max(2, x2 - x1), max(4, y2 - y1)
+        rx1, rx2 = max(0, x1 - bw), min(W, x2 + bw)
+        ry1, ry2 = max(0, y2 - int(0.25 * bh)), min(H, y2 + int(0.25 * bh) + 1)
+        if rx2 <= rx1 or ry2 <= ry1:
+            return None, 0.0
+        step = max(1, int(min(rx2 - rx1, ry2 - ry1) / 24))
+        patch = frame_bgr[ry1:ry2:step, rx1:rx2:step]
+        inner = np.ones(patch.shape[:2], bool)
+        cx1, cx2 = (x1 - rx1) // step, (x2 - rx1 + step - 1) // step
+        cy1 = (y1 - ry1) // step
+        inner[max(0, cy1):, max(0, cx1):max(0, cx2)] = False      # maga a játékos kimarad
+        lab = self.labels(patch)[inner]
+        n1, n2 = int(np.count_nonzero(lab == 1)), int(np.count_nonzero(lab == 2))
+        if n1 + n2 < min_pixels:
+            return None, 0.0
+        frac = n2 / float(n1 + n2)
+        if frac < 0.15:
+            return None, frac
+        ratio = np.clip(self.modes[0].bgr / np.maximum(self.modes[1].bgr, 1.0), 0.4, 4.0)
+        gain = 1.0 + frac * (ratio - 1.0)
+        return gain.astype(np.float32), frac
+
+    def describe(self):
+        if not self.ready:
+            return "Adaptív fűmodell: még nincs tanulva (alap HSV tartomány)"
+        parts = []
+        for k, m in enumerate(self.modes):
+            b, g, r = [int(v) for v in m.bgr]
+            parts.append(f"{'napos' if k == 0 else 'árnyékos/második'}: RGB=({r},{g},{b}), súly {m.w:.2f}, "
+                         f"színarány ({m.mu[0]:.2f}, {m.mu[1]:.2f}), világosság e^{m.lv:.2f}")
+        lo, hi = self.hsv_bounds()
+        return (f"Adaptív fűmodell ({len(self.modes)} módus, {self.n_fits} illesztés): " + "; ".join(parts)
+                + f"; HSV-burok {lo.tolist()}–{hi.tolist()}")
+
+    @classmethod
+    def learn_from_video(cls, path, max_frames=8, step=6, **kw):
+        """Előtanulás a videó első képkockáiból (minden step-edikből, legfeljebb max_frames darab)."""
+        kw.setdefault("learn_frames", max_frames)
+        model = cls(**kw)
+        cap = cv2.VideoCapture(path)
+        try:
+            idx = used = 0
+            while used < max_frames:
+                ok, fr = cap.read()
+                if not ok:
+                    break
+                if idx % step == 0:
+                    model.observe(fr)
+                    used += 1
+                idx += 1
+            model.flush()
+        finally:
+            cap.release()
+        return model
