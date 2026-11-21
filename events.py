@@ -142,7 +142,8 @@ class EventConfig:
         self.goal_kickoff_radius_m = 2.5
         self.goal_keeper_radius_m = 2.0    # kapus ennyin belül a labdánál az átjutáskor -> valószínű védés
         self.goal_keeper_line_m = 3.0      # ... és a kapus is a gólvonal közelében van
-        self.goal_emit_unconfirmed = False  # megerősítetlen, de valószínű gól kiadása ("Valószínű GÓL")
+        self.goal_emit_unconfirmed = True   # megerősítetlen, de valószínű gól kiadása ("Valószínű GÓL",
+                                            # confirmed=False, confidence=0.5) – lásd _likely_unconfirmed
 
         # --- Kamera (a kapus kezében tartott labda vetületéhez) ---
         # "auto": szokásos Veo-elhelyezés a félpályavonalnál, a közeli (y = W) oldalvonal mögött
@@ -758,6 +759,7 @@ class EventDetector:
                 c["behind_last"] = t
             elif self._line_dist(ball, gx) > 1.5:
                 c["returned"] += 1
+                c.setdefault("first_return_t", t)
         if c["keeper_near"] and ball is not None and c["k0"] is not None:
             # A hálóban álló labdától eltávolodó kapus: nem a kezében volt (a vetület csak egybeesett)
             k = self._keepers.get(c["keeper_team"])
@@ -794,7 +796,10 @@ class EventDetector:
             self._reject_goal(c, keeper=c["keeper_near"])
             return
         if not c["keeper_near"] and c["returned"] >= 8:
-            self._reject_goal(c, keeper=False)
+            if self._likely_unconfirmed(c):
+                self._confirm_goal(c, "unconfirmed")
+            else:
+                self._reject_goal(c, keeper=False)
             return
         if t - c["t"] > cfg.goal_kickoff_window_s:
             self._finish_goal_cand(c, t)
@@ -805,10 +810,19 @@ class EventDetector:
             self._reject_goal(c, keeper=True)
         elif c["behind_n"] >= cfg.goal_persist_samples and c["behind_last"] - c["t"] >= cfg.goal_persist_s:
             self._confirm_goal(c, "persist")
-        elif cfg.goal_emit_unconfirmed and c["behind_last"] - c["t"] >= 0.3 and c["returned"] < 3:
+        elif self._likely_unconfirmed(c):
             self._confirm_goal(c, "unconfirmed")
         else:
             self._reject_goal(c, keeper=False)
+
+    def _likely_unconfirmed(self, c):
+        """Megerősítetlen, de valószínű gól (csak goal_emit_unconfirmed=True esetén): a labda több mintán
+        át a vonal mögött volt, a kapus nem volt ott, és utána legalább 3 mp-ig nem tért vissza a pályára
+        (nem kipattanó). Tipikus eset: a hálóban / középen álló labdát a detektor nem látja."""
+        if not self.cfg.goal_emit_unconfirmed or c["keeper_near"] or c["behind_n"] < 3:
+            return False
+        fr = c.get("first_return_t")
+        return fr is None or fr - c["behind_last"] >= 3.0
 
     def _reject_goal(self, c, keeper):
         self._goal_cand = None
