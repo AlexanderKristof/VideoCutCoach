@@ -35,6 +35,7 @@ from auth import hash_password, verify_password, create_access_token, get_curren
 from heatmap import TrackMetaCollector, compact_trajectories, generate_heatmaps_from_file
 from clip_export import export_clips, DEFAULT_PRE_SEC, DEFAULT_POST_SEC
 from team_classifier import TeamClassifier, auto_teams_enabled
+from pitch_tracker import PitchTracker, parse_calib_points, draw_pitch_overlay as render_pitch_overlay
 
 Base.metadata.create_all(bind=engine)
 
@@ -103,6 +104,54 @@ def is_point_in_pitch_trapezoid(foot_x, foot_y, width, height, roi_top_pct, roi_
         
     return True, "Pályán belül"
 
+def create_pitch_tracker(video_file, width, height, fps, start_sec, calib_points_str, H_static, config):
+    """
+    Pályakövető létrehozása a klip elemzéséhez. Visszatér: (tracker vagy None, leírás a naplóba).
+    - dynamic_homography = False: a régi viselkedés (egyetlen, statikus H).
+    - calib_pitch_points: a kattintott pontok pálya-koordinátái ("x,y;..." méterben) – így
+      fél pályás képen is lehet kalibrálni (pl. a 16-os sarkai); üresen a régi négysarkos sorrend.
+    - calib_time_sec: melyik videó-időpont képén kattintott a felhasználó. Ha a klip
+      közepén, a mozgást a klip elejéig visszaszámoljuk (előfuttatás, csak követés).
+    - Kalibráció nélkül a pályavonalakból próbál automatikusan kalibrálni.
+    """
+    if not config.get("dynamic_homography", True):
+        return None, "KI (statikus homográfia)" + ("" if H_static is not None else ", nincs kalibráció")
+    H0 = H_static
+    if config.get("calib_pitch_points") and calib_points_str:
+        try:
+            H0 = parse_calib_points(calib_points_str, width, height, config["calib_pitch_points"])
+        except Exception as ex:
+            print(f"Homográfia hiba (pálya-pontok): {ex}")
+    tracker = PitchTracker((width, height), np.array(config["grass_lower"]), np.array(config["grass_upper"]))
+    if H0 is None:
+        return tracker, "BE, kézi kalibráció nincs -> automatikus kalibráció a pályavonalakból"
+    msg = "BE, kézi kalibráció a klip elején"
+    calib_t = config.get("calib_time_sec")
+    k = int(round((calib_t - start_sec) * fps)) if calib_t is not None else 0
+    if k > 0:
+        cap2 = cv2.VideoCapture(video_file)
+        read_count = [0]
+
+        def frames_until_calib():
+            for _ in range(k + 1):
+                ok, fr = cap2.read()
+                if not ok:
+                    return
+                read_count[0] += 1
+                yield fr
+        try:
+            H_back, fails = tracker.backpropagate(frames_until_calib(), H0)
+        finally:
+            cap2.release()
+        if read_count[0] == k + 1:
+            H0 = H_back
+            msg = f"BE, kézi kalibráció {calib_t:.2f} mp-nél, visszaszámolva {k} képkockán (hibás lépés: {fails})"
+        else:
+            msg = f"BE, a kalibráció ideje ({calib_t:.2f} mp) a klipen kívül esik – a klip elejére vonatkoztatva"
+    tracker.set_calibration(H0)
+    return tracker, msg
+
+
 def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, calib_points_str, config, progress=None):
     clip_id = str(uuid.uuid4())[:8]
     output_filename = f"raw_{clip_id}.mp4"
@@ -140,6 +189,14 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
                 H = engine_instance.compute_homography(pts)
         except Exception as ex:
             print(f"Homográfia hiba: {ex}")
+
+    # --- Pályakövetés: képkockánkénti homográfia mozgó (Veo) kamerához (pitch_tracker.py) ---
+    pitch_tracker, pitch_setup_msg = create_pitch_tracker(temp_cut, width, height, fps, start_sec,
+                                                          calib_points_str, H, config)
+    pitch_stats = {"ok": 0, "elveszett": 0, "kalibráció szükséges": 0, "finomítás": 0}
+    pitch_boxes = []   # az előző felismerés dobozai (a követés ezeket kitakarja)
+    H_cur = H
+    # --- /Pályakövetés ---
 
     colors = {k: (np.array(config[f"{k}_lower"]), np.array(config[f"{k}_upper"])) 
               for k in ["grass", "ref", "team1", "team2", "keeper1", "keeper2"]}
@@ -202,7 +259,8 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
                          f"Fű arány min.: {config['grass_min_ratio']:.2f}, "
                          f"Álló alak ablak: {config['stationary_window_sec']:.1f}s\n")
         debug_file.write(f"Modell: {model_weights}, osztályok: {describe_role_map(role_classes, model.names)}\n")
-        debug_file.write(f"Felismerés minden {DETECT_EVERY_N}. képkockán, törölt követők: {trackers_reset}\n\n")
+        debug_file.write(f"Felismerés minden {DETECT_EVERY_N}. képkockán, törölt követők: {trackers_reset}\n")
+        debug_file.write(f"Pályakövetés: {pitch_setup_msg}\n\n")
 
         while cap.isOpened():
             ret, frame = cap.read()
@@ -214,6 +272,17 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
             if frames_done % 250 == 0:
                 stationary_filter.prune(frames_done)
 
+            # --- Pályakövetés: az aktuális képkocka homográfiája (a rajzolás előtt) ---
+            if pitch_tracker is not None:
+                H_cur, pitch_q = pitch_tracker.update(frame, pitch_boxes)
+                pitch_stats[pitch_q["status"]] = pitch_stats.get(pitch_q["status"], 0) + 1
+                pitch_stats["finomítás"] += int(pitch_q.get("refined", False))
+                if frames_done % 25 == 0:
+                    debug_file.write(f"F#{frames_done} PÁLYA: {pitch_q['status']}, bizalom={pitch_q.get('conf')}, "
+                                     f"inlier={pitch_q.get('inliers', '-')}, elveszett={pitch_q.get('lost')}, "
+                                     f"forrás={pitch_q.get('source')}\n")
+            # --- /Pályakövetés ---
+
             detected = should_detect(frames_done, DETECT_EVERY_N)
             gk_real_coords = None
 
@@ -221,6 +290,7 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
                 hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
                 grass_mask, grass_scale = build_grass_mask(hsv_frame, grass_lower, grass_upper)
                 results = model.track(frame, persist=True, tracker="bytetrack.yaml", device=device, verbose=False)
+                pitch_boxes = [tuple(map(int, b.xyxy[0])) for r in results for b in r.boxes]  # pályakövetéshez
 
                 raw_detections = []
                 referee_boxes = []
@@ -291,7 +361,7 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
 
                             # --- AUTO CSAPAT: mezszín-klaszterezés + követésenkénti szavazás ---
                             if team_clf is not None:
-                                pitch_xy = engine_instance.transform_to_pitch(foot_x, foot_y, H) if H is not None else None
+                                pitch_xy = engine_instance.transform_to_pitch(foot_x, foot_y, H_cur) if H_cur is not None else None
                                 auto = team_clf.observe(tid, crop, current_time_sec, pitch_xy=pitch_xy,
                                                         model_keeper=model_keeper)
                                 if (auto["is_referee"] or auto["role"] == "other") and not is_keeper:
@@ -321,8 +391,8 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
                                 'bbox': (x1, y1, x2, y2)
                             })
 
-                if H is not None:
-                    valid_players, real_ball = engine_instance.update_tracks(frames_done, current_time_sec, raw_detections, ball_pixel, H)
+                if H_cur is not None:
+                    valid_players, real_ball = engine_instance.update_tracks(frames_done, current_time_sec, raw_detections, ball_pixel, H_cur)
                 else:
                     valid_players = raw_detections
                     real_ball = None
@@ -334,6 +404,9 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
                 # statisztika és esemény nem keletkezik belőle (különben duplán számolnánk)
                 valid_players, referee_boxes, ball_pixels = last_valid_players, last_referee_boxes, last_ball_pixels
                 real_ball = None
+
+            if H_cur is not None and config.get("draw_pitch_overlay", True):
+                render_pitch_overlay(frame, H_cur)  # halvány pályavonalak: látszik, mennyire pontos a kalibráció
 
             for bp in ball_pixels:
                 cv2.circle(frame, bp, 5, (0, 255, 255), -1)
@@ -368,7 +441,7 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
 
             if review is not None:
                 review.add_frame(frames_done, current_time_sec, frame,
-                                 valid_players if H is not None else None, real_ball)
+                                 valid_players if H_cur is not None else None, real_ball)
                 feed_review_events()
 
             process.stdin.write(frame.tobytes())
@@ -397,6 +470,7 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
         "events": timeline_events,
         "review_url": f"/clips/review_{clip_id}/index.html" if review is not None else None,
         "match_stats": engine_instance.stats,
+        "pitch_tracking": {"setup": pitch_setup_msg, "frames": pitch_stats},
         "source": {"video_path": video_path, "start_sec": start_sec, "end_sec": end_sec},
         # Tömörített pályák (5 Hz, 0.1 m) a hőtérképhez / statisztikához – lásd heatmap.py
         "trajectories": compact_trajectories(engine_instance.player_trajectories, track_meta.summary()),
@@ -433,12 +507,19 @@ async def cut_raw_endpoint(
     team1_attacks_right: bool = Form(True),
     review_export: bool = Form(True),
     auto_teams: bool = Form(True),
-    swap_teams: bool = Form(False)
+    swap_teams: bool = Form(False),
+    dynamic_homography: bool = Form(True),
+    draw_pitch_overlay: bool = Form(True),
+    calib_time_sec: Optional[float] = Form(None),
+    calib_pitch_points: str = Form("")
 ):
     config = {
         "team1_attacks_right": team1_attacks_right,
         "auto_teams": auto_teams, "swap_teams": swap_teams,
         "review_export": review_export,
+        # Pályakövetés (lásd pitch_tracker.py, docs/FEJLESZTESI_TERV.md)
+        "dynamic_homography": dynamic_homography, "draw_pitch_overlay": draw_pitch_overlay,
+        "calib_time_sec": calib_time_sec, "calib_pitch_points": calib_pitch_points,
         "roi_top_pct": roi_top_pct, "roi_bottom_pct": roi_bottom_pct, "min_player_height_pct": min_player_height_pct,
         "use_static_roi": use_static_roi, "grass_min_ratio": grass_min_ratio,
         "stationary_window_sec": stationary_window_sec, "stationary_max_move": stationary_max_move,

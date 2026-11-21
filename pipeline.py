@@ -47,6 +47,10 @@ ANALYSIS_DEFAULTS = {
     "review_export": True,
     "auto_teams": True,              # automatikus csapatba sorolás mezszín alapján
     "swap_teams": False,             # az 1. félidőre vonatkozik, a 2.-ban megfordul
+    "dynamic_homography": True,      # képkockánkénti pályakövetés (forgó Veo kamera)
+    "draw_pitch_overlay": True,
+    "calib_time_sec": None,          # a kézi kalibráció képének ideje (eredeti videóban)
+    "calib_pitch_points": "",
 }
 
 # A teljes folyamat saját beállításai
@@ -114,7 +118,9 @@ def coerce_options(raw, defaults=None):
             continue
         value = raw[key]
         try:
-            if isinstance(default, bool):
+            if default is None:  # opcionális szám (pl. calib_time_sec); üres = nincs megadva
+                out[key] = None if str(value).strip() == "" else float(value)
+            elif isinstance(default, bool):
                 out[key] = _to_bool(value)
             elif isinstance(default, float):
                 out[key] = float(value)
@@ -138,6 +144,8 @@ def build_analysis_config(opts):
         "team1_attacks_right": o["team1_attacks_right"],
         "review_export": o["review_export"],
         "auto_teams": o["auto_teams"], "swap_teams": o["swap_teams"],
+        "dynamic_homography": o["dynamic_homography"], "draw_pitch_overlay": o["draw_pitch_overlay"],
+        "calib_time_sec": o["calib_time_sec"], "calib_pitch_points": o["calib_pitch_points"],
         "roi_top_pct": o["roi_top_pct"], "roi_bottom_pct": o["roi_bottom_pct"],
         "min_player_height_pct": o["min_player_height_pct"],
         "use_static_roi": o["use_static_roi"], "grass_min_ratio": o["grass_min_ratio"],
@@ -480,10 +488,18 @@ def run_match_pipeline(video_path, options=None, progress=None, funcs=None, out_
             # térfélcsere után ez a másik csapat lenne, ezért a sorrendet is megfordítjuk,
             # így a "team1" mindkét félidőben ugyanaz a csapat marad.
             cfg["swap_teams"] = not analysis_config.get("swap_teams", False)
+        # A kézi kalibráció csak abban a félidőben érvényes, amelyikben a képe készült;
+        # a másik félidőben a pályavonalakból automatikusan kalibrálunk.
+        calib_points = opts["calib_points"]
+        ct = cfg.get("calib_time_sec")
+        if calib_points and ct is not None and not (h["start_sec"] <= float(ct) <= h["end_sec"]):
+            calib_points = ""
+        elif calib_points and ct is None and key == "second_half" and cfg.get("dynamic_homography", True):
+            calib_points = ""  # idő nélküli kalibráció = az 1. félidő eleje
         label = f"{HALF_LABELS[key]} elemzése"
         progress(pos, label)
         clip_url, local_path, events_path = funcs["analyze"](
-            video_path, h["start_sec"], h["end_sec"], opts["calib_points"], cfg,
+            video_path, h["start_sec"], h["end_sec"], calib_points, cfg,
             detect_mode=opts["detect_mode"], progress=_sub(progress, pos, pos + span, label))
         pos += span
         data = _load_json(events_path) if events_path and os.path.exists(events_path) else {}
