@@ -27,6 +27,7 @@ from pitch_filters import (build_grass_mask, foot_on_grass, CameraMotion,
                            StationaryFilter, extract_dominant_color)
 from model_config import (load_model_config, resolve_weights, build_role_class_map,
                           describe_role_map, should_detect, reset_tracker)
+from review_export import ReviewExporter
 from match_segmenter import (detect_match_halves, cut_match_halves,
                              parse_time_value, format_hms)
 from auth import hash_password, verify_password, create_access_token, get_current_user
@@ -155,6 +156,22 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
 
     frames_done = 0
     timeline_events = []
+
+    # Áttekintő lapok (esemény-lapok + percenkénti áttekintés) – kevés képből ellenőrizhető az elemzés
+    review_dir = os.path.abspath(os.path.join(CLIPS_DIR, f"review_{clip_id}"))
+    review = ReviewExporter(review_dir, fps) if config.get("review_export", True) else None
+    fed_engine_events = 0
+    fed_timeline_events = 0
+
+    def feed_review_events():
+        nonlocal fed_engine_events, fed_timeline_events
+        engine_events = engine_instance.event_detector.events
+        for ev in engine_events[fed_engine_events:]:
+            review.add_event(ev)
+        fed_engine_events = len(engine_events)
+        for ev in timeline_events[fed_timeline_events:]:
+            review.add_event(ev)
+        fed_timeline_events = len(timeline_events)
     # Gyors mód: a kihagyott képkockákon az utolsó felismerés eredményét rajzoljuk ki újra,
     # így a kimeneti videóban minden képkocka megmarad
     last_valid_players = []
@@ -317,6 +334,11 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
                             "desc": f"Kapus helyezkedési hiba: {gk_eval['bisector_offset_m']} m eltolódás"
                         })
 
+            if review is not None:
+                review.add_frame(frames_done, current_time_sec, frame,
+                                 valid_players if H is not None else None, real_ball)
+                feed_review_events()
+
             process.stdin.write(frame.tobytes())
             frames_done += 1
             if frames_done % 25 == 0:
@@ -330,10 +352,14 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
 
     # Lövés/gól/kapus események lezárása és összefésülése a helyezkedési hibákkal (idő szerint rendezve)
     engine_instance.finalize(start_sec + frames_done / fps)
+    if review is not None:
+        feed_review_events()
+        review.close()
     timeline_events = engine_instance.merge_timeline(timeline_events)
 
     analysis_payload = {
         "events": timeline_events,
+        "review_url": f"/clips/review_{clip_id}/index.html" if review is not None else None,
         "match_stats": engine_instance.stats,
         "source": {"video_path": video_path, "start_sec": start_sec, "end_sec": end_sec}
     }
@@ -363,10 +389,12 @@ async def cut_raw_endpoint(
     team2_hsv_lower: str = Form("0,0,0"), team2_hsv_upper: str = Form("179,255,255"),
     keeper1_hsv_lower: str = Form("0,0,0"), keeper1_hsv_upper: str = Form("179,255,255"),
     keeper2_hsv_lower: str = Form("0,0,0"), keeper2_hsv_upper: str = Form("179,255,255"),
-    team1_attacks_right: bool = Form(True)
+    team1_attacks_right: bool = Form(True),
+    review_export: bool = Form(True)
 ):
     config = {
         "team1_attacks_right": team1_attacks_right,
+        "review_export": review_export,
         "roi_top_pct": roi_top_pct, "roi_bottom_pct": roi_bottom_pct, "min_player_height_pct": min_player_height_pct,
         "use_static_roi": use_static_roi, "grass_min_ratio": grass_min_ratio,
         "stationary_window_sec": stationary_window_sec, "stationary_max_move": stationary_max_move,
