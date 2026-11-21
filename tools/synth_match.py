@@ -1206,9 +1206,22 @@ def _iou_cover(a, b):
 
 
 # ============================================================ kamera pálya (Veo-szerű követés)
-def camera_path(states, fps, width):
+# Kameraprofilok: omega – a követés sajátfrekvenciája (1/s, nagyobb = gyorsabb pásztázás),
+# zoom – a fókusz tartománya f0 szorzójaként, zoom_tau – a zoom időállandója (s),
+# zoom_pulse – időnkénti hirtelen rázoomolás amplitúdója (0 = nincs)
+CAMERA_PROFILES = {
+    "alap": {"omega": 1.7, "zoom": (0.9, 1.45), "zoom_tau": 1.2, "zoom_pulse": 0.0},
+    "nehez": {"omega": 2.8, "zoom": (0.8, 1.9), "zoom_tau": 0.5, "zoom_pulse": 0.35},
+}
+
+
+def camera_path(states, fps, width, profile="alap", seed=0):
+    prof = CAMERA_PROFILES[profile] if isinstance(profile, str) else profile
     dt = 1.0 / fps
-    omega = 1.7
+    omega = prof["omega"]
+    zlo, zhi = prof["zoom"]
+    prng = np.random.default_rng(seed + 12345)
+    pulse, pulse_left = 0.0, 0
     f0 = (width / 2.0) / math.tan(math.radians(26.0))
     b0 = states[0]["ball"]
     aim = np.array([b0[0], b0[1]], np.float64)
@@ -1227,8 +1240,15 @@ def camera_path(states, fps, width):
         vel += acc * dt
         aim += vel * dt
         dist = math.hypot(aim[0] - CAM_POS[0], aim[1] - CAM_POS[1])
-        f_t = f0 * float(np.clip((dist / 40.0) ** 0.5, 0.9, 1.45))
-        f += (f_t - f) * (dt / 1.2)
+        f_t = f0 * float(np.clip((dist / 40.0) ** 0.5, zlo, zhi))
+        if prof["zoom_pulse"] > 0:
+            # hirtelen rázoomolás (pl. a labda közelében), majd vissza
+            if pulse_left <= 0 and prng.random() < dt / 6.0:
+                pulse, pulse_left = float(prng.uniform(0.5, 1.0)) * prof["zoom_pulse"], int(prng.integers(25, 75))
+            if pulse_left > 0:
+                pulse_left -= 1
+                f_t *= 1.0 + pulse
+        f += (f_t - f) * min(1.0, dt / prof["zoom_tau"])
         # az optikai tengely kicsit a labda elé (a kamera felé) néz: a labda a kép közepe fölé kerül,
         # a túlsó oldalvonal a kép felső negyedébe (Veo-szerű kivágás)
         to_cam = np.array([CAM_POS[0] - aim[0], CAM_POS[1] - aim[1]])
@@ -1264,10 +1284,13 @@ def _r(v, n=2):
 
 
 def generate(out_path, gt_path=None, duration=60.0, width=1280, height=720, fps=25, seed=7,
-             segments=None, audio=True, crf=23, preset="veryfast", progress=True, save_frames=None):
+             segments=None, audio=True, crf=23, preset="veryfast", progress=True, save_frames=None,
+             camera_profile="alap"):
     """
     A szintetikus meccs legenerálása. Visszatér: a ground-truth dict (és kiírja a JSON-t is).
     save_frames: {képkocka index: jpg útvonal} – mintaképek mentése.
+    camera_profile: a kamera mozgásprofilja (CAMERA_PROFILES: "alap" vagy "nehez" – gyorsabb
+    pásztázás, nagyobb és gyorsabb zoom, hirtelen rázoomolások).
     """
     ffmpeg = find_ffmpeg()
     if ffmpeg is None:
@@ -1282,7 +1305,7 @@ def generate(out_path, gt_path=None, duration=60.0, width=1280, height=720, fps=
     if progress:
         print(f"Szimuláció kész: {n_frames} képkocka, {len(sim.events)} esemény ({time.time() - t_start:.1f} s)")
 
-    cams = camera_path(states, fps, width)
+    cams = camera_path(states, fps, width, camera_profile, seed)
     renderer = Renderer(width, height, np.random.default_rng(seed + 1))
     people = sim.people
 
@@ -1363,7 +1386,8 @@ def generate(out_path, gt_path=None, duration=60.0, width=1280, height=720, fps=
         "fps": fps, "width": width, "height": height, "n_frames": n_frames,
         "duration": round(total_sec, 3), "seed": seed,
         "pitch": {"length": L, "width": W},
-        "camera": {"position": CAM_POS.tolist(), "model": "tűlyuk, pan/tilt/zoom, torzítás nélkül"},
+        "camera": {"position": CAM_POS.tolist(), "model": "tűlyuk, pan/tilt/zoom, torzítás nélkül",
+                   "profile": camera_profile if isinstance(camera_profile, str) else "egyedi"},
         "segments": [{"name": n, "duration": d} for n, d in segs],
         "periods": sim.periods,
         "whistles": sim.whistles,
@@ -1401,6 +1425,8 @@ def main(argv=None):
                     help='szakaszok, pl. "warmup:20,half1:90,break:30,half2:90" (alap: egy félidő --duration hosszal)')
     ap.add_argument("--no-audio", action="store_true", help="hangsáv (sípszavak) nélkül")
     ap.add_argument("--crf", type=int, default=23, help="H.264 minőség (alap: 23)")
+    ap.add_argument("--camera", default="alap", choices=sorted(CAMERA_PROFILES),
+                    help="kamera mozgásprofil: alap vagy nehez (gyorsabb pásztázás, több zoom; alap: alap)")
     ap.add_argument("--save-frames", default=None,
                     help="mintaképek mentése: 'index1,index2,...:könyvtár' (pl. '0,300,900:/tmp/kepek')")
     args = ap.parse_args(argv)
@@ -1410,7 +1436,8 @@ def main(argv=None):
         os.makedirs(d or ".", exist_ok=True)
         save = {int(i): os.path.join(d or ".", f"frame_{int(i):05d}.jpg") for i in idx.split(",") if i.strip()}
     generate(args.out, args.gt, args.duration, args.width, args.height, args.fps, args.seed,
-             args.segments, audio=not args.no_audio, crf=args.crf, save_frames=save)
+             args.segments, audio=not args.no_audio, crf=args.crf, save_frames=save,
+             camera_profile=args.camera)
     return 0
 
 

@@ -4,40 +4,61 @@ Pályakövetés mozgó (Veo) kamerához: képkockánkénti homográfia.
 A Veo virtuális kamerája a labdát követi: forog (pásztáz), néha zoomol,
 és egyszerre nagyjából fél pályát mutat. Az egyszer, a klip elején
 kiszámolt homográfia (kép -> pálya méter) ezért az első pásztázás után
-már hibás. Ez a modul minden képkockára saját homográfiát ad:
+már hibás. Ez a modul minden képkockára saját homográfiát ad.
 
-1. Terjesztés (propagation): két egymást követő képkocka között a kamera
-   mozgását a statikus háttérből becsüljük (fű + pályavonalak, a játékos-
-   és labdadobozok kitakarva): GFTT sarokpontok + Lucas–Kanade optikai
-   áramlás csökkentett felbontású szürke képen, majd RANSAC-os
-   homográfia (cv2.findHomography).
-   Jelölés: F_t a (t-1). kép pixeleit viszi a t. kép pixeleire
-   (x_t = F_t · x_{t-1}). Ha H_{t-1} a (t-1). kép -> pálya leképezés, akkor
-       pálya = H_{t-1} · x_{t-1} = H_{t-1} · inv(F_t) · x_t
-   tehát  H_t = H_{t-1} · inv(F_t).
-   Belül a fordítottját tároljuk (G = inv(H): pálya -> kép), ekkor
-   G_t = F_t · G_{t-1}  (ugyanaz, csak invertálás nélkül).
-   A rossz becslést (kevés inlier, nagy skála/nyírás-ugrás, nagy
-   visszavetítési hiba) eldobjuk, ilyenkor az előző H marad és nő az
-   'elveszett' számláló.
+Fizikai kameramodell ('kamera' üzemmód, alap): a Veo egy árbocon áll, a helye
+a felvétel alatt nem változik. A kalibrációból (kézi pontok vagy automatikus)
+a kamera helyét (C) és állását becsüljük; képkockánként csak az állás
+    x = (pan, tilt, roll [fok], 100·ln f)
+változik (4 szabadsági fok a 8 helyett). Így a homográfia nem "vándorolhat el"
+lehetetlen (nyírt, az égbe forduló) alakba, és a sodródás is sokkal kisebb.
 
-2. Sodródás-javítás a pályavonalakkal: időnként (refine_every képkockánként,
-   vagy ha a mozgásbecslés hibázott) a modell összes szabványos vonalát
-   (oldal- és alapvonalak, felezővonal, 16-osok, 5-ösök, kezdőkör,
-   16-os ív) a képre vetítjük, és a homográfiát úgy finomítjuk, hogy a
-   vetített pontok a felismert fehér vonalpixeleken legyenek. A vonalmaszk
-   távolság-transzformáltját mintavételezzük, és egy 8 paraméteres
-   korrekciós homográfiát Levenberg–Marquardt / Gauss–Newton lépésekkel
-   optimalizálunk (csak numpy, scipy nem kell). A finomítást csak akkor
-   fogadjuk el, ha a költség javul.
+1. Terjesztés: két képkocka között a kép a K2·R2·R1^T·K1^-1 alakú (tiszta
+   forgatás + zoom) homográfiával mozog. A sarokpontokat (GFTT) csak a
+   talajsíkon (a pálya + néhány méter, a jelenlegi becslésből; a fűszínű
+   fasor / lelátó / képre égetett felirat kizárva, a játékos-dobozok
+   kitakarva) keressük, piramisos LK követi őket – a kezdőpont az állandó
+   szögsebességű előrejelzés, így a gyors pásztázás sem szökik ki –, majd a
+   4 paramétert robosztusan (Cauchy-súlyozás) illesztjük. A becslés
+   kovarianciáját is visszük (folyamatzaj a mozgás nagyságával nő).
 
-3. Automatikus kezdeti kalibráció (best effort): ha nincs kézi kalibráció,
+2. Vonal-illesztés és önellenőrzés (refine_every képkockánként, illetve gyanús
+   állapotban minden képkockán): a modell összes szabványos vonalát a képre
+   vetítjük, és az állást MAP-becsléssel finomítjuk: a vonalmaszk
+   távolság-transzformáltján mért robosztus költség + a mozgásbecslés mint
+   előzetes. A rosszul meghatározott irányokban (pl. csak egy vonal látszik) a
+   predikció marad, más vonalra ugrani csak erős alátámasztással lehet.
+   Minőségmérték: a látható modellpontok hány %-a esik vonalpixelre
+   (pontosság) és a látható modellvonalak hány %-át támasztják alá
+   vonalpixelek (alátámasztás); ebből simított bizalom (conf).
+
+3. Kamerahely-pontosítás: a jól illeszkedő, eltérő irányú képkockák
+   kulcsképek; ezekből a kamerahelyet közösen becsüljük (bundle_adjust_camera)
+   – egy képből a kamerahely és a fókusz/dőlés nehezen választható szét,
+   több irányból viszont jól meghatározott.
+
+4. Státusz (csak 'ok' esetén ad vissza H-t, különben None):
+   'ok' – a vonalak megerősítik a becslést; 'bizonytalan' – a bizalom alacsony,
+   rég nem volt megerősítés, vagy a becsült helyzethiba nagy; 'elveszett' –
+   tartósan rossz illesztés / sikertelen mozgásbecslés: ilyenkor
+   újrapozicionálás a rögzített kamerahellyel, (pan, tilt, zoom) rácskeresés a
+   predikció körül; ha ez többször sem sikerül, teljes automatikus kalibráció;
+   'kalibráció szükséges' – nincs (elfogadható) kalibráció.
+
+5. Automatikus kezdeti kalibráció (best effort): ha nincs kézi kalibráció,
    kamera-hipotézisek rácsát (pásztázási szög, dőlés, fókusz, kamera
    távolsága és magassága; a kamera a felezővonal vonalában, a közeli
    oldalvonal mögött) pontozzuk ugyanazzal a távolság-transzformált
    mértékkel, a legjobbakat finomítjuk, és csak akkor fogadjuk el, ha a
-   vonalegyezés (pontosság és lefedettség) eléri a küszöböt. Különben a
-   státusz 'kalibráció szükséges'.
+   vonalegyezés (pontosság és lefedettség) eléri a küszöböt.
+
+Tartalék ('homográfia' üzemmód): ha a kalibráció nem írható le rögzített helyű
+lyukkamerával (pl. kézi, mozgó kamera), a régi módszer fut: a képkockák közti
+általános homográfia (RANSAC), H_t = H_{t-1} · inv(F_t), és 8 paraméteres
+korrekció a vonalakra (refine_homography).
+
+Jelölés: F_t a (t-1). kép pixeleit viszi a t. kép pixeleire (x_t = F_t · x_{t-1});
+belül G = inv(H) (pálya -> kép) a tárolt alak.
 
 Koordináta-konvenció (a TacticalEngine.compute_homography-val egyezik):
 x a pálya hossza mentén (0..105), y a szélesség mentén (0..68); a kép
@@ -59,6 +80,7 @@ DEFAULT_GRASS_HSV = (np.array([30, 40, 40]), np.array([85, 255, 255]))
 
 STATUS_OK = "ok"
 STATUS_LOST = "elveszett"
+STATUS_UNSURE = "bizonytalan"
 STATUS_NEED_CALIB = "kalibráció szükséges"
 
 
@@ -183,6 +205,30 @@ def parse_calib_points(calib_str, width, height, pitch_points_str=None):
     return homography_from_points(img, pit)
 
 
+def camera_rotation(pan_deg, tilt_deg, roll_deg=0.0):
+    """
+    A kamera forgatási mátrixa (sorai: a kép jobbra, lefelé és előre mutató tengelye a világban).
+    Konvenció: lásd camera_ground_homography. (Zárt alak: előre = (sp·ct, -cp·ct, st),
+    jobbra = előre × fel = (cp, sp, 0), le = előre × jobbra = (-st·sp, st·cp, ct).)
+    """
+    p = math.radians(pan_deg)
+    t = math.radians(tilt_deg)
+    sp, cp, st, ct = math.sin(p), math.cos(p), math.sin(t), math.cos(t)
+    fwd = (sp * ct, -cp * ct, st)
+    right = (cp, sp, 0.0)
+    down = (-st * sp, st * cp, ct)
+    if roll_deg:
+        r = math.radians(roll_deg)
+        cr, sr = math.cos(r), math.sin(r)
+        right, down = (tuple(cr * a + sr * b for a, b in zip(right, down)),
+                       tuple(-sr * a + cr * b for a, b in zip(right, down)))
+    return np.array([right, down, fwd])
+
+
+def camera_K(focal_px, img_w, img_h):
+    return np.array([[focal_px, 0, img_w / 2.0], [0, focal_px, img_h / 2.0], [0, 0, 1.0]])
+
+
 def camera_ground_homography(pan_deg, tilt_deg, focal_px, img_w, img_h, cam_pos, roll_deg=0.0):
     """
     Lyukkamera pálya-sík -> kép homográfia (G).
@@ -191,20 +237,9 @@ def camera_ground_homography(pan_deg, tilt_deg, focal_px, img_w, img_h, cam_pos,
     pan = 0: a kamera a túlsó oldalvonal felé (-y) néz; pozitív pan: jobbra (+x felé).
     tilt: lefelé dőlés fokban.
     """
-    p = math.radians(pan_deg)
-    t = math.radians(tilt_deg)
-    fwd = np.array([math.sin(p) * math.cos(t), -math.cos(p) * math.cos(t), math.sin(t)])
-    up = np.array([0.0, 0.0, -1.0])
-    right = np.cross(fwd, up)
-    right /= np.linalg.norm(right)
-    down = np.cross(fwd, right)
-    if roll_deg:
-        r = math.radians(roll_deg)
-        right, down = (math.cos(r) * right + math.sin(r) * down,
-                       -math.sin(r) * right + math.cos(r) * down)
-    R = np.stack([right, down, fwd])
+    R = camera_rotation(pan_deg, tilt_deg, roll_deg)
     C = np.asarray(cam_pos, float)
-    K = np.array([[focal_px, 0, img_w / 2.0], [0, focal_px, img_h / 2.0], [0, 0, 1]])
+    K = camera_K(focal_px, img_w, img_h)
     return K @ np.column_stack([R[:, 0], R[:, 1], -R @ C])
 
 
@@ -305,14 +340,19 @@ def _coherent(mask, sigma=2.0, min_coherence=0.45):
     f = mask.astype(np.float32) / 255.0
     gx = cv2.Sobel(f, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(f, cv2.CV_32F, 0, 1, ksize=3)
-    jxx = cv2.GaussianBlur(gx * gx, (0, 0), sigma)
-    jyy = cv2.GaussianBlur(gy * gy, (0, 0), sigma)
-    jxy = cv2.GaussianBlur(gx * gy, (0, 0), sigma)
-    tr = jxx + jyy
-    det_term = np.sqrt((jxx - jyy) ** 2 + 4 * jxy * jxy)
+    kb = 2 * int(round(1.5 * sigma)) + 1          # dobozszűrő (gyorsabb, mint a Gauss)
+    jxx = cv2.boxFilter(gx * gx, -1, (kb, kb))
+    jyy = cv2.boxFilter(gy * gy, -1, (kb, kb))
+    jxy = cv2.boxFilter(gx * gy, -1, (kb, kb))
+    # csak a maszk pixeleinél számolunk (a maszk ritka – így sokkal gyorsabb)
+    ys, xs = np.nonzero(mask)
+    a, b, c = jxx[ys, xs], jyy[ys, xs], jxy[ys, xs]
+    tr = a + b
+    det_term = np.sqrt((a - b) ** 2 + 4 * c * c)
     coh = (det_term / np.maximum(tr, 1e-6)) ** 2
     out = mask.copy()
-    out[coh < min_coherence] = 0
+    bad = coh < min_coherence
+    out[ys[bad], xs[bad]] = 0
     return out
 
 
@@ -347,19 +387,32 @@ class _LineField:
     def __init__(self, line_mask):
         self.mask = line_mask
         self.h, self.w = line_mask.shape[:2]
-        inv = np.where(line_mask > 0, 0, 255).astype(np.uint8)
-        self.D = cv2.distanceTransform(inv, cv2.DIST_L2, cv2.DIST_MASK_PRECISE).astype(np.float32)
+        inv = cv2.compare(line_mask, 0, cv2.CMP_EQ)       # 255, ahol nincs vonal
+        self.D = cv2.distanceTransform(inv, cv2.DIST_L2, 5).astype(np.float32)
         self.gx = cv2.Sobel(self.D, cv2.CV_32F, 1, 0, ksize=3) / 8.0
         self.gy = cv2.Sobel(self.D, cv2.CV_32F, 0, 1, ksize=3) / 8.0
         self.n_line = int(np.count_nonzero(line_mask))
+        self._long = None
+
+    def _long_components(self):
         # A lefedettséghez csak a hosszú (biztosan vonal) komponensek számítanak:
-        # a lelátó / reklámtábla zaja rövid darabokra esik szét
-        n, lab, stats, _ = cv2.connectedComponentsWithStats(line_mask, connectivity=8)
-        length = np.hypot(stats[:, cv2.CC_STAT_WIDTH], stats[:, cv2.CC_STAT_HEIGHT])
-        keep = length >= max(20.0, self.w / 30.0)
-        keep[0] = False
-        self.long_mask = np.where(keep[lab], 255, 0).astype(np.uint8)
-        self.n_long = int(np.count_nonzero(self.long_mask))
+        # a lelátó / reklámtábla zaja rövid darabokra esik szét (csak igény esetén számoljuk)
+        if self._long is None:
+            n, lab, stats, _ = cv2.connectedComponentsWithStats(self.mask, connectivity=8)
+            length = np.hypot(stats[:, cv2.CC_STAT_WIDTH], stats[:, cv2.CC_STAT_HEIGHT])
+            keep = length >= max(20.0, self.w / 30.0)
+            keep[0] = False
+            long_mask = np.where(keep[lab], 255, 0).astype(np.uint8)
+            self._long = (long_mask, int(np.count_nonzero(long_mask)))
+        return self._long
+
+    @property
+    def long_mask(self):
+        return self._long_components()[0]
+
+    @property
+    def n_long(self):
+        return self._long_components()[1]
 
     def inside(self, uv, w, margin=1.0):
         return ((w > 1e-6) & (uv[:, 0] >= margin) & (uv[:, 0] <= self.w - 1 - margin)
@@ -563,8 +616,6 @@ def auto_calibrate(field, img_w, img_h, pts_coarse, pts_fine, max_candidates=12,
     hfovs = (85.0, 72.0, 62.0, 53.0, 45.0, 37.0) if hfovs is None else hfovs
     cam_positions = ((PITCH_LENGTH / 2, PITCH_WIDTH + 4.0, -6.0),
                      (PITCH_LENGTH / 2, PITCH_WIDTH + 10.0, -9.0)) if cam_positions is None else cam_positions
-    tau = 10.0 * px
-    Q = np.maximum(0.0, 1.0 - field.D / tau).astype(np.float32)   # közelségi térkép (1 = vonalon)
     hyps = []
     Gs = []
     for cp in cam_positions:
@@ -579,51 +630,7 @@ def auto_calibrate(field, img_w, img_h, pts_coarse, pts_fine, max_candidates=12,
     # (lásd _point_weights), különben a nagy látószögű, távoli vonalakat mutató
     # hipotézisek nyernének. A pontosság mellett a 'lefedettség' (a felismert
     # vonalhossz mekkora részét magyarázza a hipotézis) is számít.
-    tan_c = pitch_model_tangents(_coarse_step(pts_coarse))
-    nrm_c = np.column_stack([-tan_c[:, 1], tan_c[:, 0]])
-    step_c = _coarse_step(pts_coarse)
-    d_off = 0.25
-    Pc = np.column_stack([pts_coarse, np.ones(len(pts_coarse))]).T                    # (3, M)
-    Pt = np.column_stack([pts_coarse + tan_c * d_off, np.ones(len(pts_coarse))]).T
-    Pn = np.column_stack([pts_coarse + nrm_c * d_off, np.ones(len(pts_coarse))]).T
-    if field.n_long > 0:
-        inner = cv2.distanceTransform(field.long_mask, cv2.DIST_L2, 3)
-        thickness = max(1.0, 4.0 * float(inner[field.long_mask > 0].mean()))
-        line_len = field.n_long / thickness
-    else:
-        line_len = 1.0
-    scores = np.zeros(len(Gs))
-    chunk = 300
-
-    def proj(Gc, P3):
-        X = Gc @ P3
-        wz = X[:, 2]
-        with np.errstate(divide='ignore', invalid='ignore'):
-            return X[:, 0] / wz, X[:, 1] / wz, wz
-
-    for i in range(0, len(Gs), chunk):
-        Gc = Gs[i:i + chunk]
-        u, v, wz = proj(Gc, Pc)
-        ut, vt, _ = proj(Gc, Pt)
-        un, vn, _ = proj(Gc, Pn)
-        vis = (wz > 1e-6) & (u >= 0) & (u <= img_w - 1) & (v >= 0) & (v <= img_h - 1)
-        ui = np.where(vis, u, 0).astype(np.int32)
-        vi = np.where(vis, v, 0).astype(np.int32)
-        q = np.where(vis, Q[vi, ui], 0.0)
-        tx, ty = (ut - u) / d_off, (vt - v) / d_off
-        nx, ny = (un - u) / d_off, (vn - v) / d_off
-        tl = np.sqrt(tx * tx + ty * ty)
-        width_px = np.abs(tx * ny - ty * nx) / np.maximum(tl, 1e-9) * LINE_WIDTH_M
-        wgt = np.clip(np.nan_to_num(tl * step_c), 0.1, 4.0 * step_c / 0.5) * \
-            np.clip(np.nan_to_num(width_px) / 1.5, 0.05, 1.0) ** 2
-        wgt = np.where(vis, wgt, 0.0)
-        nvis = vis.sum(axis=1)
-        matched = (wgt * q).sum(axis=1)
-        prec = matched / np.maximum(wgt.sum(axis=1), 1e-9)
-        rec = np.minimum(1.0, matched / line_len)
-        s = 2 * prec * rec / np.maximum(prec + rec, 1e-9)
-        s[nvis < min_visible] = 0
-        scores[i:i + chunk] = s
+    scores = _score_hypotheses(field, Gs, pts_coarse, img_w, img_h, px=px, min_visible=min_visible)
     order = np.argsort(-scores)
     chosen = []
     for k in order:
@@ -776,6 +783,523 @@ def _plausible(G, img_w, img_h):
 
 
 # ---------------------------------------------------------------------------
+# Fizikai kameramodell: rögzített kamerahely, képkockánként pan / tilt / roll / fókusz
+# ---------------------------------------------------------------------------
+#
+# A Veo kamera egy árbocon áll, a helye a felvétel alatt nem változik; a virtuális
+# kamera csak forog (pásztáz, dől) és zoomol. A képkockánkénti állapot ezért
+#     x = (pan [fok], tilt [fok], roll [fok], 100·ln f)      (f: fókusz, teljes felbontású px)
+# a kamera helye (C, méter, z lefelé) pedig egyetlen, lassan pontosított becslés.
+# A képkockák közti mozgás így a K2·R2·R1^T·K1^-1 alakú (tiszta forgatás + zoom) homográfia –
+# 8 helyett 4 szabadsági fok, ami a sodródást és a "lehetetlen" (az égbe forduló, nyírt)
+# homográfiákat nagyrészt kizárja.
+
+def x_focal(x):
+    return math.exp(float(x[3]) / 100.0)
+
+
+def x_to_G(x, C, img_w, img_h):
+    """Állapot + kamerahely -> pálya -> (teljes felbontású) kép homográfia."""
+    return camera_ground_homography(x[0], x[1], x_focal(x), img_w, img_h, C, roll_deg=x[2])
+
+
+def rotation_motion(x1, x2, img_w, img_h):
+    """Két kameraállás közti képtér-mozgás (teljes felbontás): az x1 kép pixelét az x2 kép pixelébe viszi."""
+    K1 = camera_K(x_focal(x1), img_w, img_h)
+    K2 = camera_K(x_focal(x2), img_w, img_h)
+    R1 = camera_rotation(x1[0], x1[1], x1[2])
+    R2 = camera_rotation(x2[0], x2[1], x2[2])
+    return K2 @ R2 @ R1.T @ np.linalg.inv(K1)
+
+
+def _rotation_to_angles(R):
+    """camera_rotation inverze: (pan, tilt, roll) fokban."""
+    fwd = R[2] / np.linalg.norm(R[2])
+    pan = math.degrees(math.atan2(fwd[0], -fwd[1]))
+    tilt = math.degrees(math.asin(float(np.clip(fwd[2], -1.0, 1.0))))
+    right0 = np.cross(fwd, np.array([0.0, 0.0, -1.0]))
+    nr = np.linalg.norm(right0)
+    if nr < 1e-9:
+        return pan, tilt, 0.0
+    right0 /= nr
+    down0 = np.cross(fwd, right0)
+    roll = math.degrees(math.atan2(float(R[0] @ down0), float(R[0] @ right0)))
+    return pan, tilt, roll
+
+
+def _transform(F, p):
+    X = p @ F[:, :2].T + F[:, 2]
+    w = X[:, 2:3]
+    w = np.where(np.abs(w) < 1e-12, 1e-12, w)
+    return X[:, :2] / w
+
+
+def _lm(res_fn, x0, eps, iters=30, lam=1e-3, tol=1e-10):
+    """Kis Levenberg–Marquardt numerikus Jacobi-mátrixszal (néhány paraméterhez)."""
+    x = np.asarray(x0, np.float64).copy()
+    r = res_fn(x)
+    cost = float(r @ r)
+    for _ in range(iters):
+        J = np.empty((len(r), len(x)))
+        for j in range(len(x)):
+            x2 = x.copy()
+            x2[j] += eps[j]
+            J[:, j] = (res_fn(x2) - r) / eps[j]
+        A = J.T @ J
+        g = J.T @ r
+        improved = False
+        for _ in range(8):
+            try:
+                dx = -np.linalg.solve(A + lam * np.diag(np.diag(A) + 1e-12), g)
+            except np.linalg.LinAlgError:
+                break
+            x2 = x + dx
+            r2 = res_fn(x2)
+            c2 = float(r2 @ r2)
+            if np.isfinite(c2) and c2 < cost:
+                done = cost - c2 < tol * max(cost, 1e-12)
+                x, r, cost = x2, r2, c2
+                lam = max(lam / 3.0, 1e-9)
+                improved = True
+                break
+            lam *= 10.0
+        if not improved or done:
+            break
+    return x, cost
+
+
+def decompose_camera(G, img_w, img_h):
+    """
+    Zárt alakú felbontás: G (pálya -> teljes kép) = K·[r1 r2 -R·C], négyzetes pixel, a kép
+    közepén lévő optikai tengely. Visszatér: (x, C) vagy None.
+    """
+    G = orient_G(G, img_w, img_h)
+    Kc = np.array([[1.0, 0, img_w / 2.0], [0, 1.0, img_h / 2.0], [0, 0, 1.0]])
+    M = np.linalg.inv(Kc) @ G
+    g1, g2 = M[:, 0], M[:, 1]
+    # r1 ⟂ r2 és |r1| = |r2|:  a·w + b = 0, w = 1/f²
+    a = np.array([g1[0] * g2[0] + g1[1] * g2[1], g1[0] ** 2 + g1[1] ** 2 - g2[0] ** 2 - g2[1] ** 2])
+    b = np.array([g1[2] * g2[2], g1[2] ** 2 - g2[2] ** 2])
+    if float(a @ a) < 1e-24:
+        return None
+    w = -float(a @ b) / float(a @ a)
+    if not np.isfinite(w) or w <= 0:
+        return None
+    f = 1.0 / math.sqrt(w)
+    Mn = np.diag([1.0 / f, 1.0 / f, 1.0]) @ M
+    lam = 0.5 * (np.linalg.norm(Mn[:, 0]) + np.linalg.norm(Mn[:, 1]))
+    r1, r2, t = Mn[:, 0] / lam, Mn[:, 1] / lam, Mn[:, 2] / lam
+    Rc = np.column_stack([r1, r2, np.cross(r1, r2)])
+    U, _, Vt = np.linalg.svd(Rc)
+    Rc = U @ Vt
+    if np.linalg.det(Rc) < 0:
+        return None
+    C = -Rc.T @ t
+    pan, tilt, roll = _rotation_to_angles(Rc)
+    return np.array([pan, tilt, roll, 100.0 * math.log(f)]), C
+
+
+def fit_camera_to_homography(H_full, img_w, img_h):
+    """
+    Fizikai kamera (pan, tilt, roll, fókusz, kamerahely) illesztése egy kép -> pálya homográfiához
+    (pl. a kézi kalibrációhoz). A képen látható pályaterület rácspontjain a kamera-vetítés és a
+    homográfia eltérését minimalizálja. Visszatér: (x, C, info) vagy None.
+    """
+    try:
+        G = orient_G(np.linalg.inv(np.asarray(H_full, np.float64)), img_w, img_h)
+    except np.linalg.LinAlgError:
+        return None
+    uu, vv = np.meshgrid(np.linspace(0.03, 0.97, 17) * img_w, np.linspace(0.03, 0.97, 11) * img_h)
+    img = np.column_stack([uu.ravel(), vv.ravel()])
+    Hn = np.linalg.inv(G)
+    X = Hn[:, :2] @ img.T + Hn[:, 2:3]
+    ok = np.abs(X[2]) > 1e-12
+    pit = (X[:2] / np.where(ok, X[2], 1.0)).T
+    _, wz = project_points(G, pit)
+    ok &= wz > 0
+    inside = ok & (pit[:, 0] > -3) & (pit[:, 0] < PITCH_LENGTH + 3) & (pit[:, 1] > -3) & (pit[:, 1] < PITCH_WIDTH + 3)
+    if inside.sum() < 12:
+        inside = ok & (np.abs(pit[:, 0] - PITCH_LENGTH / 2) < 120) & (np.abs(pit[:, 1] - PITCH_WIDTH / 2) < 100)
+    if inside.sum() < 8:
+        return None
+    img, pit = img[inside], pit[inside]
+    dec = decompose_camera(G, img_w, img_h)
+    if dec is None:
+        return None
+    x0, C0 = dec
+    y0 = np.concatenate([x0, C0])
+    sc = img_w / 1280.0
+
+    def res(y):
+        uv, w_ = project_points(x_to_G(y[:4], y[4:], img_w, img_h), pit)
+        r = ((uv - img) / sc).ravel()
+        r = np.where(np.isfinite(r), r, 1e3)
+        # gyenge előzetes: kis roll, a kamera a pálya fölött (nem alatta)
+        return np.concatenate([r, [y[2] / 10.0, max(0.0, y[6] + 1.0) * 10.0]])
+
+    y, _ = _lm(res, y0, eps=np.array([1e-3, 1e-3, 1e-3, 1e-3, 1e-3, 1e-3, 1e-3]), iters=50)
+    rr = res(y)[:-2].reshape(-1, 2)
+    resid = np.linalg.norm(rr, axis=1)
+    info = {"resid_med_px": float(np.median(resid)), "resid_max_px": float(resid.max()),
+            "height_m": float(-y[6]), "focal_px": x_focal(y[:4])}
+    return y[:4], y[4:], info
+
+
+def camera_plausible(x, C, info=None):
+    """A kamerahely és -állás fizikailag értelmes-e (Veo: az oldalvonal mögött, 1–40 m magasan)."""
+    h = -float(C[2])
+    d = math.hypot(float(C[0]) - PITCH_LENGTH / 2, float(C[1]) - PITCH_WIDTH / 2)
+    ok = 1.0 <= h <= 40.0 and d <= 150.0 and -5.0 <= x[1] <= 70.0 and abs(x[2]) <= 15.0
+    if info is not None:
+        ok = ok and info.get("resid_med_px", 0.0) <= 25.0   # zajos (néhány pontos) kézi kalibráció is mehet
+    return bool(ok)
+
+
+def model_line_ids(step=0.5):
+    """A pitch_model_points pontjaihoz tartozó vonal-sorszámok (melyik modellvonal pontja)."""
+    return np.concatenate([np.full(len(p), i, np.int32) for i, p in enumerate(pitch_polylines(step))])
+
+
+def refine_pose_lines(field, y_pred, Pinv, G_of, pts, tangents, eps, px=1.0, taus=(8.0, 4.0, 2.0),
+                      iters=5, n_eff=30.0, min_points=40, step=0.5, line_ids=None):
+    """
+    MAP-illesztés a vonalakra: a vetített modellpontok (robosztus, Cauchy) távolság-költsége +
+    a mozgásbecslésből jövő előzetes (y_pred, Pinv információs mátrix). A rosszul meghatározott
+    irányokban (pl. csak egy vonal látszik) a predikció marad.
+    G_of(y): paraméterek -> pálya -> vonal-felbontású kép homográfia.
+    n_eff: a vonal-mérés 'effektív pontszáma' (a pontok erősen korreláltak); px: pixel-lépték.
+    Visszatér: (y_új, info) vagy (None, info), ha kevés a látható pont.
+    """
+    y_pred = np.asarray(y_pred, np.float64)
+    y = y_pred.copy()
+    G = G_of(y)
+    uv, wz = project_points(G, pts)
+    vis = field.inside(uv, wz, margin=2.0)
+    P = pts[vis]
+    info = {"n_visible": int(len(P))}
+    if len(P) < min_points:
+        return None, info
+    T = None if tangents is None else tangents[vis]
+    Wp = _point_weights(G, P, T, step)
+    Wn = Wp / np.sum(Wp)
+    k = n_eff / (px * px)
+
+    def dists(G_, tau):
+        uv_, wz_ = project_points(G_, P)
+        ins = field.inside(uv_, wz_)
+        d = np.full(len(P), tau, np.float64)
+        if ins.any():
+            d[ins] = np.minimum(field.dist(uv_[ins]), tau)
+        return d, uv_, ins
+
+    def total(y_, tau):
+        d, _, _ = dists(G_of(y_), tau)
+        s = 0.5 * tau
+        dy = y_ - y_pred
+        return float(k * np.sum(Wn * s * s * np.log1p((d / s) ** 2)) + dy @ Pinv @ dy)
+
+    d0, _, _ = dists(G, max(taus))
+    info["precision_before"] = float(np.sum(Wn * (d0 < 2.0 * px)))
+    A = Pinv.copy()
+    for tau in taus:
+        tau = tau * px
+        lam = 1e-3
+        cost = total(y, tau)
+        for _ in range(iters):
+            Gc = G_of(y)
+            d, uv, ins = dists(Gc, tau)
+            sel = ins & (d < tau)
+            if np.count_nonzero(sel) < min_points // 2:
+                break
+            Ju = np.empty((len(P), len(y)))
+            Jv = np.empty((len(P), len(y)))
+            for j in range(len(y)):
+                y2 = y.copy()
+                y2[j] += eps[j]
+                uv2, _ = project_points(G_of(y2), P)
+                Ju[:, j] = (uv2[:, 0] - uv[:, 0]) / eps[j]
+                Jv[:, j] = (uv2[:, 1] - uv[:, 1]) / eps[j]
+            us, vs = uv[sel, 0], uv[sel, 1]
+            gx = _bilinear(field.gx, us, vs)
+            gy = _bilinear(field.gy, us, vs)
+            J = gx[:, None] * Ju[sel] + gy[:, None] * Jv[sel]
+            s = 0.5 * tau
+            wc = Wn[sel] / (1.0 + (d[sel] / s) ** 2)
+            A = k * (J.T @ (J * wc[:, None])) + Pinv
+            b = k * (J.T @ (d[sel] * wc)) + Pinv @ (y - y_pred)
+            improved = False
+            for _ in range(5):
+                try:
+                    dy = -np.linalg.solve(A + lam * np.diag(np.diag(A) + 1e-12), b)
+                except np.linalg.LinAlgError:
+                    break
+                y2 = y + dy
+                c2 = total(y2, tau)
+                if c2 < cost:
+                    y, cost = y2, c2
+                    lam = max(lam / 3.0, 1e-7)
+                    improved = True
+                    break
+                lam *= 10.0
+            if not improved:
+                break
+    G1 = G_of(y)
+    d1, _, ins1 = dists(G1, max(taus) * px)
+    good = d1 < 2.0 * px
+    info["precision"] = float(np.sum(Wn * good))
+    info["mean_dist"] = float(np.sum(Wn * d1))
+    info["info_matrix"] = A
+    if line_ids is not None:
+        # a látható modellvonalak (elég hosszú látható résszel) hány %-át támasztják alá vonalpixelek
+        ids = line_ids[vis]
+        sup, tot = 0.0, 0.0
+        for i in np.unique(ids):
+            m = ids == i
+            wsum = float(np.sum(Wp[m]))
+            if wsum < 3.0 * px:      # (képbeli hossz px-ben ~ a súlyok összege)
+                continue
+            tot += wsum
+            if np.sum(Wp[m] * good[m]) >= 0.4 * wsum:
+                sup += wsum
+        info["line_support"] = sup / tot if tot > 0 else 0.0
+        info["visible_len"] = tot
+    return y, info
+
+
+class _KeyField:
+    """Kulcskép a kamerahely-becsléshez: csak a vonalmaszk távolság-transzformáltja (kevés memória)."""
+
+    def __init__(self, field):
+        self.D = field.D
+        self.h, self.w = field.h, field.w
+
+    def inside(self, uv, w, margin=1.0):
+        return ((w > 1e-6) & (uv[:, 0] >= margin + 1) & (uv[:, 0] <= self.w - 2 - margin)
+                & (uv[:, 1] >= margin + 1) & (uv[:, 1] <= self.h - 2 - margin))
+
+    def dist(self, uv):
+        return _bilinear(self.D, uv[:, 0], uv[:, 1])
+
+    def grad(self, uv):
+        u, v = uv[:, 0], uv[:, 1]
+        gx = 0.5 * (_bilinear(self.D, u + 1.0, v) - _bilinear(self.D, u - 1.0, v))
+        gy = 0.5 * (_bilinear(self.D, u, v + 1.0) - _bilinear(self.D, u, v - 1.0))
+        return gx, gy
+
+
+def bundle_adjust_camera(keyframes, C0, C_prior_info, C_center, img_w, img_h, M_line, pts, tangents, px=1.0,
+                         taus=(6.0, 3.0, 1.5), iters=8, n_eff=30.0, x_sigma=(3.0, 2.0, 1.0, 15.0), step=0.5):
+    """
+    A kamerahely (C) közös becslése több kulcsképből (eltérő pásztázási szögek): a vonalak
+    távolság-költségének összege minden kulcsképen, kulcsképenként saját (pan, tilt, roll, fókusz)
+    állással. Egyetlen képből a kamerahely és a fókusz/dőlés nehezen választható szét
+    (hátrébb lépés ~ rázoomolás); több irányból nézve viszont jól meghatározott.
+    Gauss–Newton, Levenberg–Marquardt csillapítással; a kulcsképek állását Schur-komplementtel
+    elimináljuk (3x3-as rendszer a kamerahelyre).
+    keyframes: [{"field": _KeyField, "x": állás}, ...]. Visszatér: (C, [x_k], info).
+    """
+    K = len(keyframes)
+    C = np.asarray(C0, np.float64).copy()
+    xs = [np.asarray(kf["x"], np.float64).copy() for kf in keyframes]
+    x0s = [x.copy() for x in xs]
+    Px = np.diag(1.0 / np.asarray(x_sigma, np.float64) ** 2)
+    k = n_eff / (px * px)
+    eps = 1e-3
+    data = []
+    for kf, x in zip(keyframes, xs):
+        f = kf["field"]
+        G = M_line @ x_to_G(x, C, img_w, img_h)
+        uv, wz = project_points(G, pts)
+        vis = f.inside(uv, wz, margin=3.0)
+        P = pts[vis]
+        Wp = _point_weights(G, P, None if tangents is None else tangents[vis], step) if len(P) else np.zeros(0)
+        data.append((f, P, Wp / max(np.sum(Wp), 1e-9)))
+
+    def frame_cost(i, x, Cc, tau):
+        f, P, Wn = data[i]
+        if len(P) == 0:
+            return 0.0
+        uv, wz = project_points(M_line @ x_to_G(x, Cc, img_w, img_h), P)
+        ins = f.inside(uv, wz)
+        d = np.full(len(P), tau)
+        if ins.any():
+            d[ins] = np.minimum(f.dist(uv[ins]), tau)
+        s = 0.5 * tau
+        dx = x - x0s[i]
+        return float(k * np.sum(Wn * s * s * np.log1p((d / s) ** 2)) + dx @ Px @ dx)
+
+    def total(xs_, Cc, tau):
+        dC = Cc - C_center
+        return sum(frame_cost(i, xs_[i], Cc, tau) for i in range(K)) + float(dC @ C_prior_info @ dC)
+
+    info = {"keyframes": K}
+    for tau in taus:
+        tau *= px
+        lam = 1e-3
+        cost = total(xs, C, tau)
+        for _ in range(iters):
+            S = C_prior_info.copy()
+            r = C_prior_info @ (C - C_center)
+            blocks = []
+            for i in range(K):
+                f, P, Wn = data[i]
+                if len(P) < 30:
+                    blocks.append(None)
+                    continue
+                y = np.concatenate([xs[i], C])
+                uv, wz = project_points(M_line @ x_to_G(y[:4], y[4:], img_w, img_h), P)
+                ins = f.inside(uv, wz)
+                d = np.full(len(P), tau)
+                d[ins] = f.dist(uv[ins])
+                sel = ins & (d < tau)
+                if np.count_nonzero(sel) < 20:
+                    blocks.append(None)
+                    continue
+                Ju = np.empty((len(P), 7))
+                Jv = np.empty((len(P), 7))
+                for j in range(7):
+                    y2 = y.copy()
+                    y2[j] += eps
+                    uv2, _ = project_points(M_line @ x_to_G(y2[:4], y2[4:], img_w, img_h), P)
+                    Ju[:, j] = (uv2[:, 0] - uv[:, 0]) / eps
+                    Jv[:, j] = (uv2[:, 1] - uv[:, 1]) / eps
+                gx, gy = f.grad(uv[sel])
+                J = gx[:, None] * Ju[sel] + gy[:, None] * Jv[sel]
+                s = 0.5 * tau
+                wc = k * Wn[sel] / (1.0 + (d[sel] / s) ** 2)
+                A = J.T @ (J * wc[:, None])
+                b = J.T @ (d[sel] * wc)
+                Axx = A[:4, :4] + Px
+                bx = b[:4] + Px @ (xs[i] - x0s[i])
+                AxC, ACC, bC = A[:4, 4:], A[4:, 4:], b[4:]
+                try:
+                    Axx_inv = np.linalg.inv(Axx)
+                except np.linalg.LinAlgError:
+                    blocks.append(None)
+                    continue
+                S += ACC - AxC.T @ Axx_inv @ AxC
+                r += bC - AxC.T @ Axx_inv @ bx
+                blocks.append((Axx, AxC, bx))
+            improved = False
+            for _ in range(5):
+                try:
+                    Sd = S + lam * np.diag(np.diag(S) + 1e-9)
+                    dC = -np.linalg.solve(Sd, r)
+                except np.linalg.LinAlgError:
+                    break
+                xs2 = []
+                for i in range(K):
+                    bl = blocks[i]
+                    if bl is None:
+                        xs2.append(xs[i])
+                        continue
+                    Axx, AxC, bx = bl
+                    Ad = Axx + lam * np.diag(np.diag(Axx))
+                    xs2.append(xs[i] - np.linalg.solve(Ad, bx + AxC @ dC))
+                C2 = C + dC
+                c2 = total(xs2, C2, tau)
+                if c2 < cost:
+                    xs, C, cost = xs2, C2, c2
+                    lam = max(lam / 3.0, 1e-7)
+                    improved = True
+                    break
+                lam *= 10.0
+            if not improved:
+                break
+        info["S"] = S
+    info["cost"] = cost
+    return C, xs, info
+
+
+def _score_hypotheses(field, Gs, pts_coarse, img_w, img_h, px=1.0, min_visible=60):
+    """
+    Kamera-hipotézisek (G-k, pálya -> vonal-felbontású kép) gyors pontozása a vonalmaszk közelségi
+    térképén: a vetített modellpontok súlyozott pontossága és a felismert vonalhossz lefedettsége
+    (F1). Visszatér: pontszámok (K,).
+    """
+    tau = 10.0 * px
+    Q = np.maximum(0.0, 1.0 - field.D / tau).astype(np.float32)   # közelségi térkép (1 = vonalon)
+    step_c = _coarse_step(pts_coarse)
+    tan_c = pitch_model_tangents(step_c)
+    nrm_c = np.column_stack([-tan_c[:, 1], tan_c[:, 0]])
+    d_off = 0.25
+    Pc = np.column_stack([pts_coarse, np.ones(len(pts_coarse))]).T                    # (3, M)
+    Pt = np.column_stack([pts_coarse + tan_c * d_off, np.ones(len(pts_coarse))]).T
+    Pn = np.column_stack([pts_coarse + nrm_c * d_off, np.ones(len(pts_coarse))]).T
+    if field.n_long > 0:
+        inner = cv2.distanceTransform(field.long_mask, cv2.DIST_L2, 3)
+        thickness = max(1.0, 4.0 * float(inner[field.long_mask > 0].mean()))
+        line_len = field.n_long / thickness
+    else:
+        line_len = 1.0
+    scores = np.zeros(len(Gs))
+    chunk = 300
+
+    def proj(Gc, P3):
+        X = Gc @ P3
+        wz = X[:, 2]
+        with np.errstate(divide='ignore', invalid='ignore'):
+            return X[:, 0] / wz, X[:, 1] / wz, wz
+
+    for i in range(0, len(Gs), chunk):
+        Gc = Gs[i:i + chunk]
+        u, v, wz = proj(Gc, Pc)
+        ut, vt, _ = proj(Gc, Pt)
+        un, vn, _ = proj(Gc, Pn)
+        vis = (wz > 1e-6) & (u >= 0) & (u <= img_w - 1) & (v >= 0) & (v <= img_h - 1)
+        ui = np.where(vis, u, 0).astype(np.int32)
+        vi = np.where(vis, v, 0).astype(np.int32)
+        q = np.where(vis, Q[vi, ui], 0.0)
+        tx, ty = (ut - u) / d_off, (vt - v) / d_off
+        nx, ny = (un - u) / d_off, (vn - v) / d_off
+        tl = np.sqrt(tx * tx + ty * ty)
+        width_px = np.abs(tx * ny - ty * nx) / np.maximum(tl, 1e-9) * LINE_WIDTH_M
+        wgt = np.clip(np.nan_to_num(tl * step_c), 0.1, 4.0 * step_c / 0.5) * \
+            np.clip(np.nan_to_num(width_px) / 1.5, 0.05, 1.0) ** 2
+        wgt = np.where(vis, wgt, 0.0)
+        nvis = vis.sum(axis=1)
+        matched = (wgt * q).sum(axis=1)
+        prec = matched / np.maximum(wgt.sum(axis=1), 1e-9)
+        rec = np.minimum(1.0, matched / line_len)
+        s = 2 * prec * rec / np.maximum(prec + rec, 1e-9)
+        s[nvis < min_visible] = 0
+        scores[i:i + chunk] = s
+    return scores
+
+
+def search_pose(field, x_center, C, img_w, img_h, M_line, pts_coarse, px=1.0, pan_half=30.0, pan_step=1.5,
+                tilt_half=5.0, tilt_step=1.0, zooms=(0.7, 0.8, 0.9, 1.0, 1.12, 1.25, 1.4), top_k=6):
+    """
+    Újrapozicionálás rögzített kamerahellyel: a (pan, tilt, zoom) rács pontozása a predikció
+    körül (kis keresési tér – gyors). Visszatér: a legjobb, egymástól eltérő hipotézisek listája
+    [(pontszám, x), ...].
+    """
+    x_center = np.asarray(x_center, np.float64)
+    pans = x_center[0] + np.arange(-pan_half, pan_half + 1e-9, pan_step)
+    tilts = x_center[1] + np.arange(-tilt_half, tilt_half + 1e-9, tilt_step)
+    tilts = tilts[(tilts > 0.5) & (tilts < 60)]
+    xs, Gs = [], []
+    for z in zooms:
+        lf = x_center[3] + 100.0 * math.log(z)
+        for t in tilts:
+            for p in pans:
+                x = np.array([p, t, x_center[2], lf])
+                xs.append(x)
+                Gs.append(M_line @ x_to_G(x, C, img_w, img_h))
+    scores = _score_hypotheses(field, np.array(Gs), pts_coarse, field.w, field.h, px=px)
+    order = np.argsort(-scores)
+    out = []
+    for kk in order:
+        if scores[kk] <= 0 or len(out) >= top_k:
+            break
+        x = xs[kk]
+        if any(abs(x[0] - o[1][0]) <= 3 * pan_step and abs(x[1] - o[1][1]) <= 2 * tilt_step for o in out):
+            continue
+        out.append((float(scores[kk]), x))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Képkockák közötti kameramozgás
 # ---------------------------------------------------------------------------
 
@@ -798,7 +1322,13 @@ class MotionEstimator:
         self.lk = dict(winSize=(21, 21), maxLevel=3,
                        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
 
-    def estimate(self, prev_gray, gray, mask=None):
+    def track(self, prev_gray, gray, mask=None, F_init=None):
+        """
+        Sarokpontok követése: GFTT az előző képen, piramisos LK előre-hátra ellenőrzéssel.
+        F_init: a mozgás előrejelzése (előző -> aktuális kép, feldolgozási felbontás) – gyors
+        pásztázásnál ebből indul az LK (cv2.OPTFLOW_USE_INITIAL_FLOW), így a nagy elmozdulás sem
+        szökik ki a piramis befogási tartományából. Visszatér: (p0, p1, info) vagy (None, None, info).
+        """
         h, w = gray.shape[:2]
         pts = cv2.goodFeaturesToTrack(prev_gray, self.max_corners, 0.003, max(6, w // 90),
                                       mask=mask, blockSize=5)
@@ -808,15 +1338,35 @@ class MotionEstimator:
         info = {"features": 0 if pts is None else int(len(pts)), "inliers": 0, "reason": ""}
         if pts is None or len(pts) < self.min_inliers:
             info["reason"] = "kevés jellemzőpont"
-            return None, info
-        nxt, st, _ = cv2.calcOpticalFlowPyrLK(prev_gray, gray, pts, None, **self.lk)
-        back, st2, _ = cv2.calcOpticalFlowPyrLK(gray, prev_gray, nxt, None, **self.lk)
-        fb = np.linalg.norm((back - pts).reshape(-1, 2), axis=1)
-        good = (st.reshape(-1) == 1) & (st2.reshape(-1) == 1) & (fb < 1.0)
-        p0 = pts.reshape(-1, 2)[good]
-        p1 = nxt.reshape(-1, 2)[good]
+            return None, None, info
+        pts = pts.astype(np.float32)
+        good = None
+        if F_init is not None:
+            init = cv2.perspectiveTransform(pts, F_init).astype(np.float32)
+            nxt, st, _ = cv2.calcOpticalFlowPyrLK(prev_gray, gray, pts, init.copy(),
+                                                  flags=cv2.OPTFLOW_USE_INITIAL_FLOW, **self.lk)
+            back, st2, _ = cv2.calcOpticalFlowPyrLK(gray, prev_gray, nxt, pts.copy(),
+                                                    flags=cv2.OPTFLOW_USE_INITIAL_FLOW, **self.lk)
+            fb = np.linalg.norm((back - pts).reshape(-1, 2), axis=1)
+            good = (st.reshape(-1) == 1) & (st2.reshape(-1) == 1) & (fb < 1.0)
+            if good.sum() < max(self.min_inliers, 0.3 * len(pts)):
+                good = None      # rossz előrejelzés: előrejelzés nélkül újra
+        if good is None:
+            nxt, st, _ = cv2.calcOpticalFlowPyrLK(prev_gray, gray, pts, None, **self.lk)
+            back, st2, _ = cv2.calcOpticalFlowPyrLK(gray, prev_gray, nxt, None, **self.lk)
+            fb = np.linalg.norm((back - pts).reshape(-1, 2), axis=1)
+            good = (st.reshape(-1) == 1) & (st2.reshape(-1) == 1) & (fb < 1.0)
+        p0 = pts.reshape(-1, 2)[good].astype(np.float64)
+        p1 = nxt.reshape(-1, 2)[good].astype(np.float64)
         if len(p0) < self.min_inliers:
             info["reason"] = "kevés követett pont"
+            return None, None, info
+        return p0, p1, info
+
+    def estimate(self, prev_gray, gray, mask=None, F_init=None):
+        h, w = gray.shape[:2]
+        p0, p1, info = self.track(prev_gray, gray, mask, F_init)
+        if p0 is None:
             return None, info
         F, inl = cv2.findHomography(p0, p1, cv2.RANSAC, self.ransac_px, maxIters=2000, confidence=0.995)
         if F is None:
@@ -861,6 +1411,96 @@ class MotionEstimator:
         return F, info
 
 
+class RotationMotionEstimator:
+    """
+    Képkockák közti mozgás rögzített helyű, forgó + zoomoló kamerára: az új állapot
+    (pan, tilt, roll, fókusz) 4 paraméteres robosztus illesztése a követett sarokpontokra
+    (x_t = K_t·R_t·R_{t-1}^T·K_{t-1}^-1 · x_{t-1}). A mozgó tárgyak (játékosok, nézők) a
+    Cauchy-súlyozással kiesnek; az előrejelzés (állandó szögsebesség) az LK kezdőpontja.
+    """
+
+    def __init__(self, tracker=None, min_inliers=25, inlier_px=2.0, max_resid=1.6):
+        self.tracker = tracker or MotionEstimator()
+        self.min_inliers = min_inliers
+        self.inlier_px = inlier_px          # teljes felbontású px (1280 széles képre vetítve)
+        self.max_resid = max_resid
+
+    def estimate(self, prev_gray, gray, mask, x_prev, x_pred, img_w, img_h, S):
+        Sinv = np.linalg.inv(S)
+        F_pred = S @ rotation_motion(x_prev, x_pred, img_w, img_h) @ Sinv
+        p0, p1, info = self.tracker.track(prev_gray, gray, mask, F_pred / F_pred[2, 2])
+        if p0 is None:
+            return None, info
+        p0f = _transform(Sinv, p0)
+        p1f = _transform(Sinv, p1)
+        sc = img_w / 1280.0
+        K1inv = np.linalg.inv(camera_K(x_focal(x_prev), img_w, img_h))
+        R1t = camera_rotation(x_prev[0], x_prev[1], x_prev[2]).T
+        B = R1t @ K1inv           # az előző kép pixeléből világ-irány
+
+        def pred(x2):
+            M = camera_K(x_focal(x2), img_w, img_h) @ camera_rotation(x2[0], x2[1], x2[2]) @ B
+            return _transform(M, p0f)
+
+        x = np.asarray(x_pred, np.float64).copy()
+        eps = np.array([1e-3, 1e-3, 1e-3, 1e-3])
+        r = None
+        for scale in (8.0, 4.0, 2.0, 1.0, 1.0):
+            s = scale * sc
+            for _ in range(2):
+                uv = pred(x)
+                r = (uv - p1f).ravel()
+                J = np.empty((len(r), 4))
+                for j in range(4):
+                    x2 = x.copy()
+                    x2[j] += eps[j]
+                    J[:, j] = ((pred(x2) - p1f).ravel() - r) / eps[j]
+                e = np.repeat(np.linalg.norm((uv - p1f), axis=1), 2)
+                wgt = 1.0 / (1.0 + (e / s) ** 2)
+                A = J.T @ (J * wgt[:, None])
+                b = J.T @ (r * wgt)
+                try:
+                    dx = -np.linalg.solve(A + 1e-6 * np.diag(np.diag(A) + 1e-9), b)
+                except np.linalg.LinAlgError:
+                    break
+                x = x + dx
+        e = np.linalg.norm(pred(x) - p1f, axis=1) / sc
+        inl = e < self.inlier_px
+        info["inliers"] = int(inl.sum())
+        info["inlier_ratio"] = float(inl.mean())
+        info["reproj"] = float(np.median(e[inl])) if inl.any() else float("inf")
+        if inl.sum() < self.min_inliers or inl.mean() < 0.3:
+            # Rossz kezdőpont (hirtelen irányváltás): RANSAC homográfia az inlierekhez, azokon újraillesztés
+            F, m = cv2.findHomography(p0, p1, cv2.RANSAC, 1.5, maxIters=2000, confidence=0.995)
+            if F is None or m is None or m.sum() < self.min_inliers:
+                info["reason"] = "kevés inlier"
+                return None, info
+            m = m.reshape(-1).astype(bool)
+            q0, q1 = p0f[m], p1f[m]
+
+            def res(x2):
+                M = camera_K(x_focal(x2), img_w, img_h) @ camera_rotation(x2[0], x2[1], x2[2]) @ B
+                return (_transform(M, q0) - q1).ravel()
+            x, _ = _lm(res, np.asarray(x_prev, np.float64), eps, iters=20)
+            e = np.linalg.norm(pred(x) - p1f, axis=1) / sc
+            inl = e < self.inlier_px
+            info["inliers"] = int(inl.sum())
+            info["inlier_ratio"] = float(inl.mean())
+            info["reproj"] = float(np.median(e[inl])) if inl.any() else float("inf")
+            info["fallback"] = True
+            if inl.sum() < self.min_inliers or inl.mean() < 0.25:
+                info["reason"] = "kevés inlier"
+                return None, info
+        if info["reproj"] > self.max_resid:
+            info["reason"] = f"nagy visszavetítési hiba ({info['reproj']:.2f} px)"
+            return None, info
+        d = x - np.asarray(x_prev)
+        if abs(d[0]) > 8.0 or abs(d[1]) > 4.0 or abs(d[2]) > 2.0 or abs(d[3]) > 15.0:
+            info["reason"] = "valószínűtlen ugrás"
+            return None, info
+        return x, info
+
+
 # ---------------------------------------------------------------------------
 # A követő
 # ---------------------------------------------------------------------------
@@ -875,12 +1515,21 @@ class PitchTracker:
             H_t, q = tracker.update(frame, boxes)   # boxes: [(x1, y1, x2, y2), ...] teljes felbontásban
             if H_t is not None: ...
 
-    A visszaadott H_t teljes felbontású kép pixel -> pálya méter (mint a régi statikus H).
-    q: minőség-szótár (status, conf, inliers, lost, refined, source, ...).
+    A visszaadott H_t teljes felbontású kép pixel -> pálya méter (mint a régi statikus H). Csak
+    megbízható ('ok' státuszú) képkockán ad H-t; 'bizonytalan', 'elveszett' és 'kalibráció
+    szükséges' esetén None (a belső becslés a current_H()-val ekkor is lekérdezhető).
+    q: minőség-szótár (status, conf, inliers, lost, refined, source, err_m, ...).
+
+    Két üzemmód:
+      * 'kamera' (alap): rögzített helyű, forgó + zoomoló kamera (Veo). A kalibrációból a kamera
+        helyét (C) és állását (pan, tilt, roll, fókusz) becsüljük; képkockánként csak az
+        állás változik (4 paraméter), a kamerahelyet a jól illeszkedő képkockák lassan pontosítják.
+      * 'homográfia' (tartalék): ha a kalibráció nem írható le ilyen kamerával (pl. nem Veo,
+        hanem mozgó kézi kamera), az általános 8 paraméteres homográfiát követjük (régi módszer).
     """
 
     def __init__(self, frame_size, grass_lower=None, grass_upper=None, H0=None, proc_width=640,
-                 line_width=960, refine_every=10, auto_init=True, auto_init_every=50, auto_init_max_every=250, max_lost=15,
+                 line_width=960, refine_every=3, auto_init=True, auto_init_every=50, auto_init_max_every=250, max_lost=15,
                  relocalize_after=75, min_conf=0.35, refine_gain=0.5):
         self.W, self.H = int(frame_size[0]), int(frame_size[1])
         self.s = min(1.0, float(proc_width) / max(1, self.W))
@@ -908,10 +1557,29 @@ class PitchTracker:
         self.min_conf = min_conf
         self.refine_gain = refine_gain
         self.motion = MotionEstimator()
+        self.rot_motion = RotationMotionEstimator(self.motion)
         self.pts_fine = pitch_model_points(0.5)
         self.tan_fine = pitch_model_tangents(0.5)
+        self.ids_fine = model_line_ids(0.5)
         self.pts_coarse = pitch_model_points(1.5)
-        self.G = None            # pálya -> feldolgozási kép
+        # --- önértékelés / fizikai modell hangolása ---
+        self.conf_ok = 0.6           # ennél kisebb (simított) vonalegyezés: 'bizonytalan'
+        self.conf_lost = 0.3         # ennél kisebb: újrapozicionálás
+        self.err_ok_m = 2.5          # a becsült (kovariancia alapú) helyzethiba felső határa 'ok'-hoz
+        self.stale_frames = 75       # ennyi képkocka vonal-megerősítés nélkül: 'bizonytalan'
+        self.pose_floor = (0.25, 0.25, 0.25, 1.5)   # (fok, fok, fok, 100·ln f) – lásd _check_pose
+        self.keyframe_gap = 25       # legalább ennyi képkocka két kulcskép között (kamerahely-becslés)
+        self.max_keyframes = 10
+        self.reloc_every = 8         # újrapozicionálási kísérletek gyakorisága
+        self.reloc_max_fails = 4     # ennyi sikertelen újrapozicionálás után teljes automatikus kalibráció
+        self.reloc_fails = 0
+        # --- állapot ---
+        self.mode = None             # 'kamera' | 'homográfia' | None
+        self.x = None                # kameraállás (pan, tilt, roll, 100·ln f)
+        self.C = None                # kamerahely (m, z lefelé)
+        self.P = None                # az állás kovarianciája (4x4)
+        self.v = np.zeros(4)         # állandó-szögsebesség előrejelzés
+        self.G = None                # pálya -> feldolgozási kép
         self.source = None
         self.frame_idx = -1
         self.prev_gray = None
@@ -919,6 +1587,13 @@ class PitchTracker:
         self.prev_mask = None
         self.lost = 0            # egymás utáni sikertelen mozgásbecslések / rossz illesztések
         self.since_refine = 0
+        self.since_verified = 0  # képkockák a legutóbbi jó vonal-megerősítés óta
+        self.keyframes = []      # kulcsképek a kamerahely becsléséhez
+        self.last_keyframe = -10 ** 9
+        self.C_calib = None      # a kalibrációból becsült kamerahely (az előzetes középpontja)
+        self.C_prior_info = None
+        self.bad_streak = 0      # egymás utáni rossz vonal-ellenőrzések
+        self.last_reloc_try = -10 ** 9
         self.last_auto_try = None
         self.conf = 0.0
         self.last_info = {}
@@ -930,12 +1605,42 @@ class PitchTracker:
         """Kézi (vagy külső) kalibráció beállítása az aktuális képkockára: H teljes felbontású kép -> pálya."""
         if H_full is None:
             return
-        G_full = np.linalg.inv(np.asarray(H_full, np.float64))
-        self.G = orient_G(self.S @ G_full, self.ws, self.hs)
+        H_full = np.asarray(H_full, np.float64)
         self.source = source
         self.lost = 0
-        self.conf = max(self.conf, 0.5)
+        self.bad_streak = 0
+        self.conf = max(self.conf, 0.6)
         self.since_refine = self.refine_every   # az első képkockán rögtön finomítunk
+        self.since_verified = 0
+        fit = fit_camera_to_homography(H_full, self.W, self.H)
+        if fit is not None and camera_plausible(fit[0], fit[1], fit[2]):
+            x, C, info = fit
+            # a kézi kalibráció pontatlansága: a kamerahely néhány méteres, az állás tized fokos hibájú lehet
+            self._set_pose(x, C, P=np.diag([0.3, 0.3, 0.3, 2.0]) ** 2, C_sigma=5.0)
+            self.last_info = {"camera_fit": info}
+        else:
+            self.mode = "homográfia"
+            self.x = None
+            self.C = None
+            G_full = np.linalg.inv(H_full)
+            self.G = orient_G(self.S @ G_full, self.ws, self.hs)
+
+    def _set_pose(self, x, C, P=None, C_sigma=None):
+        self.mode = "kamera"
+        self.x = np.asarray(x, np.float64).copy()
+        self.C = np.asarray(C, np.float64).copy()
+        if P is not None:
+            self.P = np.asarray(P, np.float64)
+        if C_sigma is not None:
+            self.C_calib = self.C.copy()
+            self.C_prior_info = np.eye(3) / C_sigma ** 2
+            self.keyframes = []
+        self.v = np.zeros(4)
+        self._update_G()
+
+    def _update_G(self):
+        if self.mode == "kamera" and self.x is not None:
+            self.G = orient_G(self.S @ x_to_G(self.x, self.C, self.W, self.H), self.ws, self.hs)
 
     def frame_motion(self):
         """
@@ -951,12 +1656,20 @@ class PitchTracker:
         return Ff / Ff[2, 2] if abs(Ff[2, 2]) > 1e-12 else Ff
 
     def current_H(self):
-        """Teljes felbontású kép -> pálya homográfia (vagy None)."""
+        """Teljes felbontású kép -> pálya homográfia (vagy None) – a belső becslés, státusztól függetlenül."""
         if self.G is None:
             return None
         Gf = np.linalg.inv(self.S) @ self.G
         H = np.linalg.inv(Gf)
         return H / H[2, 2] if abs(H[2, 2]) > 1e-12 else H
+
+    def camera_state(self):
+        """A fizikai kameramodell állapota (vagy None): pan, tilt, roll (fok), fókusz (px), kamerahely (m)."""
+        if self.mode != "kamera" or self.x is None:
+            return None
+        return {"pan": float(self.x[0]), "tilt": float(self.x[1]), "roll": float(self.x[2]),
+                "focal_px": x_focal(self.x), "position": [float(v) for v in self.C],
+                "height_m": float(-self.C[2])}
 
     # --- előfeldolgozás ---------------------------------------------------
     def _prepare(self, frame):
@@ -981,8 +1694,39 @@ class PitchTracker:
         else:
             kd = _odd(max(9, self.ws / 30))
             m = cv2.dilate(grass, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kd, kd)))
+        if self.mode == "kamera" and self.G is not None:
+            # Csak a talajsík a pálya körül: a fűszínű fasor / lelátó, a képre égetett feliratok
+            # (eredményjelző) és a horizont feletti részek nem a kamera forgásával mozognak
+            g = self._ground_region_mask()
+            if g is not None:
+                m2 = m & g
+                if np.count_nonzero(m2) > 0.05 * m2.size:
+                    m = m2
         m[box_mask > 0] = 0
         return m
+
+    def _ground_region_mask(self, margin=4.0, cell=4):
+        """A pálya (+ margin m) talajsík-tartománya a feldolgozási képen (255), a jelenlegi G alapján."""
+        gw, gh = (self.ws + cell - 1) // cell, (self.hs + cell - 1) // cell
+        key = (gw, gh)
+        if getattr(self, "_grid_key", None) != key:
+            uu, vv = np.meshgrid((np.arange(gw) + 0.5) * cell, (np.arange(gh) + 0.5) * cell)
+            self._grid_pts = np.stack([uu.ravel(), vv.ravel(), np.ones(gw * gh)])
+            self._grid_key = key
+        try:
+            Hn = np.linalg.inv(self.G)
+        except np.linalg.LinAlgError:
+            return None
+        X = Hn @ self._grid_pts
+        w = X[2]
+        ok = np.abs(w) > 1e-12
+        xy = X[:2] / np.where(ok, w, 1.0)
+        # a talajpont a kamera előtt van: G·(x, y, 1) harmadik komponense pozitív (orient_G)
+        wz = self.G[2, 0] * xy[0] + self.G[2, 1] * xy[1] + self.G[2, 2]
+        ok &= (wz > 0) & (xy[0] > -margin) & (xy[0] < PITCH_LENGTH + margin) & \
+            (xy[1] > -margin) & (xy[1] < PITCH_WIDTH + margin)
+        m = (ok.reshape(gh, gw) * 255).astype(np.uint8)
+        return cv2.resize(m, (self.ws, self.hs), interpolation=cv2.INTER_NEAREST)
 
     # --- fő lépés -----------------------------------------------------------
     def update(self, frame, boxes=None):
@@ -990,42 +1734,41 @@ class PitchTracker:
         self.frame_idx += 1
         small, gray, hsv, grass = self._prepare(frame)
         box_mask = _boxes_mask(gray.shape, boxes, self.s)
-        q = {"frame": self.frame_idx, "refined": False, "motion_ok": None}
+        q = {"frame": self.frame_idx, "refined": False, "motion_ok": None, "refine_tried": False}
 
-        # 1) Terjesztés: G_t = F_t · G_{t-1}  (azaz H_t = H_{t-1} · inv(F_t))
+        # 1) Terjesztés a képkockák közti mozgással
         motion_failed = False
         self.last_F = None     # a labdakövetőnek: képtér-mozgás (előző -> aktuális kép), lásd frame_motion()
         if self.prev_gray is not None:
-            F, minfo = self.motion.estimate(self.prev_gray, gray, self.prev_mask)
-            q["inliers"] = minfo.get("inliers", 0)
-            self.last_F = F
-            if F is not None:
-                q["motion_ok"] = True
-                if self.G is not None:
-                    self.G = F @ self.G
-                    self.G /= np.linalg.norm(self.G)
+            if self.mode == "kamera":
+                motion_failed = not self._propagate_pose(gray, q)
             else:
-                q["motion_ok"] = False
-                q["motion_reason"] = minfo.get("reason", "")
-                motion_failed = True
-                if self.G is not None:
-                    self.lost += 1
+                motion_failed = not self._propagate_homography(gray, q)
         self.prev_gray = gray
         self.prev_mask = self._feature_mask(grass, box_mask)
 
         field = None
-        # 2) Sodródás-javítás a vonalakkal
+        # 2) Sodródás-javítás és önellenőrzés a vonalakkal
         if self.G is not None:
             self.since_refine += 1
-            if self.since_refine >= self.refine_every or motion_failed or self.lost > 0 or self.conf < self.min_conf:
+            self.since_verified += 1
+            need = (self.since_refine >= self.refine_every or motion_failed or self.lost > 0
+                    or self.conf < max(self.min_conf, self.conf_ok if self.mode == "kamera" else -1.0)
+                    or self.bad_streak > 0)
+            if need:
                 field = self._line_field(frame, small, hsv, grass, box_mask, boxes)
-                self._refine(field, q, wide=self.lost > 0)
-            if self.lost > self.relocalize_after:
+                if self.mode == "kamera":
+                    self._check_pose(field, q)
+                else:
+                    self._refine(field, q, wide=self.lost > 0)
+            if self.mode == "kamera" and (self.bad_streak >= 4 or self.lost > self.max_lost) \
+                    and self.frame_idx - self.last_reloc_try >= self.reloc_every:
+                if field is None:
+                    field = self._line_field(frame, small, hsv, grass, box_mask, boxes)
+                self._relocalize(field, q)
+            if self.lost > self.relocalize_after or (self.mode == "kamera" and self.bad_streak > self.relocalize_after):
                 # Tartósan elveszett: újra kell kalibrálni (automatikusan, ha engedélyezett)
-                self.G = None
-                self.source = None
-                self.conf = 0.0
-                self.lost = 0
+                self._reset()
 
         # 3) Automatikus kezdeti kalibráció
         if self.G is None and self.auto_init and (
@@ -1042,18 +1785,295 @@ class PitchTracker:
         q["lost"] = self.lost
         q["conf"] = round(float(self.conf), 3)
         q["source"] = self.source
+        q["mode"] = self.mode
         if self.G is None:
             q["status"] = STATUS_NEED_CALIB
             return None, q
         if self.lost > self.max_lost:
             q["status"] = STATUS_LOST
             return None, q
+        if self.mode == "kamera":
+            err_m = self._pose_error_m()
+            q["err_m"] = round(err_m, 2)
+            if self.bad_streak >= 4 and self.conf < self.conf_lost:
+                q["status"] = STATUS_LOST
+                return None, q
+            if self.conf < self.conf_ok or err_m > self.err_ok_m or self.since_verified > self.stale_frames:
+                q["status"] = STATUS_UNSURE
+                return None, q
         q["status"] = STATUS_OK
         return self.current_H(), q
+
+    def _reset(self):
+        self.G = None
+        self.x = None
+        self.C = None
+        self.mode = None
+        self.source = None
+        self.conf = 0.0
+        self.lost = 0
+        self.bad_streak = 0
+        self.last_auto_try = None       # azonnal próbálkozhat az automatikus kalibrációval
+        self._auto_wait = self.auto_init_every
+
+    # --- fizikai kameramodell ---------------------------------------------
+    def _propagate_pose(self, gray, q):
+        x_prev = self.x
+        x_pred = x_prev + self.v
+        x_new, minfo = self.rot_motion.estimate(self.prev_gray, gray, self.prev_mask, x_prev, x_pred,
+                                                self.W, self.H, self.S)
+        q["inliers"] = minfo.get("inliers", 0)
+        if x_new is not None:
+            q["motion_ok"] = True
+            d = x_new - x_prev
+            self.v = d
+            F_full = rotation_motion(x_prev, x_new, self.W, self.H)
+            F = self.S @ F_full @ np.linalg.inv(self.S)
+            self.last_F = F / F[2, 2]
+            # folyamatzaj: gyors mozgásnál és nagy maradéknál a becslés bizonytalanabb
+            res = min(2.0, float(minfo.get("reproj", 1.0)))
+            sa = 0.004 + 0.02 * np.abs(d[:3]) + 0.01 * res
+            sf = 0.02 + 0.03 * abs(d[3]) + 0.02 * res
+            Q = np.diag(np.concatenate([sa, [sf]]) ** 2)
+            self.x = x_new
+            ok = True
+        else:
+            q["motion_ok"] = False
+            q["motion_reason"] = minfo.get("reason", "")
+            self.x = x_pred
+            Q = np.diag(np.concatenate([0.1 + np.abs(self.v[:3]), [0.5 + abs(self.v[3])]]) ** 2)
+            self.v = 0.5 * self.v
+            self.lost += 1
+            ok = False
+        self.P = self.P + Q
+        self._update_G()
+        return ok
+
+    def _pose_error_m(self):
+        """A kovarianciából becsült helyzethiba (m) a kép alsó kétharmadának néhány pontján."""
+        if self.P is None or self.x is None:
+            return float("inf")
+        pts_img = np.array([[self.W * a, self.H * b] for a in (0.25, 0.5, 0.75) for b in (0.45, 0.75)])
+        H0 = np.linalg.inv(x_to_G(self.x, self.C, self.W, self.H))
+
+        def back(x):
+            Hx = np.linalg.inv(x_to_G(x, self.C, self.W, self.H))
+            X = Hx[:, :2] @ pts_img.T + Hx[:, 2:3]
+            return (X[:2] / X[2]).T
+
+        base = back(self.x)
+        X0 = H0[:, :2] @ pts_img.T + H0[:, 2:3]
+        ok = (X0[2] * np.sign((H0 @ np.array([self.W / 2, self.H - 1, 1.0]))[2]) > 0) & \
+             (base[:, 0] > -5) & (base[:, 0] < PITCH_LENGTH + 5) & (base[:, 1] > -5) & (base[:, 1] < PITCH_WIDTH + 5)
+        if not ok.any():
+            return 0.0
+        var = np.zeros(len(pts_img))
+        L = np.linalg.cholesky(self.P + 1e-12 * np.eye(4))
+        for j in range(4):
+            dx = L[:, j]
+            p = back(self.x + dx)
+            var += np.sum((p - base) ** 2, axis=1)
+        return float(np.sqrt(np.median(var[ok])))
+
+    def _G_line_of(self, C=None):
+        C = self.C if C is None else C
+        SL, W, H = self.SL, self.W, self.H
+
+        def G_of(y):
+            return SL @ x_to_G(y, C, W, H)
+        return G_of
+
+    def _check_pose(self, field, q):
+        """Vonal-illesztés (MAP, a mozgás-előrejelzéssel mint előzetessel) + önellenőrzés."""
+        self.since_refine = 0
+        q["refine_tried"] = True
+        sig = np.sqrt(np.diag(self.P))
+        wide = sig[0] > 0.4 or sig[1] > 0.25 or self.bad_streak > 0
+        taus = (16.0, 8.0, 4.0, 2.0) if wide else (8.0, 4.0, 2.0)
+        # A vonal-mérés felé engedékeny előzetes: a mozgásbecslés kovarianciája alulbecsüli a lassú
+        # (zoom-) sodródást, ezért legalább pose_floor szórást engedünk – a vonalakkal rosszul
+        # meghatározott irányokban így is a predikció marad
+        Pinv = np.linalg.inv(self.P + np.diag(self.pose_floor) ** 2)
+        y, info = refine_pose_lines(field, self.x, Pinv, self._G_line_of(), self.pts_fine, self.tan_fine,
+                                    eps=np.full(4, 1e-3), px=self.px, taus=taus, line_ids=self.ids_fine)
+        n_vis = info.get("n_visible", 0)
+        q["n_visible"] = n_vis
+        if y is None:
+            # nincs mit ellenőrizni (kevés látható vonal): a bizonytalanság nő, a bizalom lassan csökken
+            self.conf = 0.97 * self.conf
+            return False
+        prec, sup = info["precision"], info.get("line_support", 0.0)
+        dy = y - self.x
+        maha = float(dy @ Pinv @ dy)
+        q["precision"] = round(prec, 3)
+        q["support"] = round(sup, 3)
+        q["innovation"] = round(maha, 2)
+        accepted = (prec >= info["precision_before"] - 0.02 and
+                    _plausible(self._G_line_of()(y), self.wl, self.hl))
+        # nagy ugrást (más vonalra ugrás) csak erős alátámasztással fogadunk el
+        if accepted and maha > 30.0 and not (prec >= 0.7 and sup >= 0.7):
+            accepted = False
+            q["refine_reason"] = "nagy ugrás, gyenge alátámasztás"
+        if accepted:
+            self.x = y
+            A = info["info_matrix"]
+            try:
+                P_post = np.linalg.inv(A)
+            except np.linalg.LinAlgError:
+                P_post = self.P
+            # ne legyen túl magabiztos (a pontok korreláltak, a modell nem tökéletes)
+            self.P = P_post + np.diag([0.01, 0.01, 0.01, 0.05]) ** 2
+            q["refined"] = True
+            self._update_G()
+        m = prec if accepted else info["precision_before"]
+        weight = min(1.0, n_vis / 300.0) * (0.5 + 0.5 * min(1.0, info.get("visible_len", 0.0) / (150.0 * self.px)))
+        quality = 0.5 * m + 0.5 * sup if accepted else 0.5 * m
+        # erős megerősítés (pl. takarás / elvesztés után) gyorsabban emeli a bizalmat
+        a = (0.6 if quality >= 0.8 and quality > self.conf else 0.35) * weight
+        self.conf = (1 - a) * self.conf + a * quality
+        good = accepted and prec >= 0.5 and sup >= 0.5 and n_vis >= 80
+        if good:
+            self.since_verified = 0
+            self.lost = 0
+            self.bad_streak = 0
+            if prec >= 0.6 and sup >= 0.6 and n_vis >= 150:
+                self._maybe_add_keyframe(field, q)
+        elif n_vis >= 80 and quality < 0.4:
+            self.bad_streak += 1
+        return accepted
+
+    def _maybe_add_keyframe(self, field, q):
+        """
+        Jól illeszkedő képkocka felvétele kulcsképnek (eltérő irányokból), és a kamerahely közös
+        újrabecslése a kulcsképekből (bundle_adjust_camera).
+        """
+        if self.frame_idx - self.last_keyframe < self.keyframe_gap:
+            return
+        x = self.x
+        for i, kf in enumerate(self.keyframes):
+            if abs(kf["x"][0] - x[0]) < 3.0 and abs(kf["x"][1] - x[1]) < 1.5 and abs(kf["x"][3] - x[3]) < 8.0:
+                if self.frame_idx - kf["frame"] < 500:
+                    return                     # ilyen nézetünk már van
+                self.keyframes.pop(i)          # régi, hasonló nézet: frissítjük
+                break
+        self.keyframes.append({"field": _KeyField(field), "x": x.copy(), "frame": self.frame_idx})
+        self.last_keyframe = self.frame_idx
+        if len(self.keyframes) > self.max_keyframes:
+            # a legkevésbé eltérő (legközelebbi pásztázási szögű) kulcskép kiesik
+            pans = np.array([kf["x"][0] for kf in self.keyframes])
+            dmin = [np.min(np.abs(np.delete(pans, i) - pans[i])) for i in range(len(pans) - 1)]
+            self.keyframes.pop(int(np.argmin(dmin)))
+        pans = [kf["x"][0] for kf in self.keyframes]
+        if len(self.keyframes) < 3 or max(pans) - min(pans) < 10.0:
+            return
+        C_new, xs, info = bundle_adjust_camera(self.keyframes, self.C, self.C_prior_info, self.C_calib,
+                                               self.W, self.H, self.SL, self.pts_fine, self.tan_fine, px=self.px)
+        q["camera_ba"] = {"keyframes": len(self.keyframes), "shift_m": round(float(np.linalg.norm(C_new - self.C)), 2)}
+        if not camera_plausible(self.x, C_new) or np.linalg.norm(C_new - self.C_calib) > 15.0:
+            return
+        for kf, xk in zip(self.keyframes, xs):
+            kf["x"] = xk
+        G_old = x_to_G(self.x, self.C, self.W, self.H)
+        self.C = C_new
+        self.x = self._fit_pose_to_G(G_old, self.x)
+        self.P = self.P + np.diag([0.02, 0.02, 0.02, 0.1]) ** 2
+        self._update_G()
+        q["camera_refined"] = True
+
+    def _fit_pose_to_G(self, G_full, x0):
+        """Az állás (4 paraméter) illesztése egy adott G-hez a jelenlegi kamerahellyel (a kép ne ugorjon)."""
+        uu, vv = np.meshgrid(np.linspace(0.05, 0.95, 9) * self.W, np.linspace(0.3, 0.95, 6) * self.H)
+        img = np.column_stack([uu.ravel(), vv.ravel()])
+        Hn = np.linalg.inv(G_full)
+        X = Hn[:, :2] @ img.T + Hn[:, 2:3]
+        pit = (X[:2] / X[2]).T
+        _, wz = project_points(G_full, pit)
+        ok = (wz > 0) & (np.abs(pit[:, 0] - PITCH_LENGTH / 2) < 90) & (np.abs(pit[:, 1] - PITCH_WIDTH / 2) < 70)
+        if ok.sum() < 6:
+            return x0
+        img, pit = img[ok], pit[ok]
+        C, W, H = self.C, self.W, self.H
+
+        def res(x):
+            uv, _ = project_points(x_to_G(x, C, W, H), pit)
+            return (uv - img).ravel()
+        x, _ = _lm(res, x0, eps=np.full(4, 1e-3), iters=15)
+        return x
+
+    def _relocalize(self, field, q):
+        """Elveszett / rossz illesztés: (pan, tilt, zoom) keresés a predikció körül, rögzített kamerahellyel."""
+        self.last_reloc_try = self.frame_idx
+        wide = self.bad_streak > 20 or self.lost > 3 * self.max_lost
+        cands = search_pose(field, self.x, self.C, self.W, self.H, self.SL, self.pts_coarse, px=self.px,
+                            pan_half=60.0 if wide else 25.0, pan_step=2.0 if wide else 1.5,
+                            tilt_half=6.0 if wide else 4.0)
+        best = None
+        weak = np.diag([1.0 / 20.0 ** 2, 1.0 / 5.0 ** 2, 1.0 / 2.0 ** 2, 1.0 / 20.0 ** 2])
+        for score, x0 in cands:
+            Pinv = weak
+            y, info = refine_pose_lines(field, x0, Pinv, self._G_line_of(), self.pts_fine, self.tan_fine,
+                                        eps=np.full(4, 1e-3), px=self.px, taus=(16.0, 8.0, 4.0, 2.0), iters=6,
+                                        line_ids=self.ids_fine)
+            if y is None:
+                continue
+            fit = 0.5 * info["precision"] + 0.5 * info.get("line_support", 0.0)
+            if best is None or fit > best[0]:
+                best = (fit, y, info)
+        q["relocalize"] = {"candidates": len(cands), "accepted": False}
+        ok = False
+        if best is not None:
+            fit, y, info = best
+            G = self._G_line_of()(y)
+            rec = line_recall(field, G)
+            q["relocalize"].update({"fit": round(fit, 3), "recall": round(rec, 3)})
+            ok = (info["precision"] >= 0.7 and info.get("line_support", 0) >= 0.7 and rec >= 0.4
+                  and info["n_visible"] >= 100 and _plausible(G, self.wl, self.hl))
+        if not ok:
+            self.reloc_fails += 1
+            if self.reloc_fails >= self.reloc_max_fails and self.auto_init:
+                # A rögzített kamerahellyel nem található jó állás: lehet, hogy maga a kamerahely
+                # (a kalibráció) rossz – teljes automatikus kalibráció (kamerahely-hipotézisekkel)
+                self.reloc_fails = 0
+                q["relocalize"]["auto"] = self.try_auto_calibrate(field, q)
+                return q["relocalize"]["auto"]
+            return False
+        self.reloc_fails = 0
+        self.x = y
+        self.v = np.zeros(4)
+        self.P = np.diag([0.1, 0.1, 0.1, 0.5]) ** 2
+        self.conf = max(self.conf, 0.5 * info["precision"] + 0.5 * info.get("line_support", 0))
+        self.lost = 0
+        self.bad_streak = 0
+        self.since_verified = 0
+        self._update_G()
+        q["relocalize"]["accepted"] = True
+        return True
+
+    # --- általános homográfia (tartalék üzemmód) ---------------------------
+    def _propagate_homography(self, gray, q):
+        F_init = None if self.last_F_h is None else self.last_F_h
+        F, minfo = self.motion.estimate(self.prev_gray, gray, self.prev_mask, F_init=F_init)
+        q["inliers"] = minfo.get("inliers", 0)
+        self.last_F = F
+        self.last_F_h = F
+        if F is not None:
+            q["motion_ok"] = True
+            if self.G is not None:
+                self.G = F @ self.G
+                self.G /= np.linalg.norm(self.G)
+            return True
+        q["motion_ok"] = False
+        q["motion_reason"] = minfo.get("reason", "")
+        if self.G is not None:
+            self.lost += 1
+        return False
+
+    last_F_h = None
 
     def _refine(self, field, q, wide=False):
         taus = tuple(t * self.px for t in ((16.0, 8.0, 4.0, 2.0) if wide else (6.0, 3.0, 1.5)))
         G_cur = self.P2L @ self.G
+        q["refine_tried"] = True
         G_new, info = refine_homography(field, G_cur, self.pts_fine, taus=taus, tangents=self.tan_fine)
         self.since_refine = 0
         q["n_visible"] = info.get("n_visible", 0)
@@ -1104,11 +2124,21 @@ class PitchTracker:
                               for k, v in info.items() if k in ("fit", "precision", "recall", "n_visible", "pan", "tilt", "hfov")}
             q["auto_init"]["accepted"] = bool(ok)
         if ok:
-            self.G = orient_G(self.L2P @ G, self.ws, self.hs)
+            G_full = np.linalg.inv(self.SL) @ G
             self.source = "automatikus"
             self.conf = info["precision"]
             self.lost = 0
+            self.bad_streak = 0
             self.since_refine = 0
+            self.since_verified = 0
+            fit = fit_camera_to_homography(np.linalg.inv(G_full), self.W, self.H)
+            if fit is not None and camera_plausible(fit[0], fit[1], fit[2]):
+                self._set_pose(fit[0], fit[1], P=np.diag([0.2, 0.2, 0.2, 1.5]) ** 2, C_sigma=5.0)
+            else:
+                self.mode = "homográfia"
+                self.x = None
+                self.C = None
+                self.G = orient_G(self.L2P @ G, self.ws, self.hs)
         return ok
 
     # --- visszafelé terjesztés (kalibráció a klip közepén) ----------------
@@ -1159,6 +2189,8 @@ def draw_pitch_overlay(frame, H, color=(255, 255, 0), alpha=0.45, thickness=1):
     except np.linalg.LinAlgError:
         return frame
     h, w = frame.shape[:2]
+    # a homográfia előjele tetszőleges (pl. H[2,2] = 1-re normálva): a kamera előtti pontokhoz w > 0 kell
+    G = orient_G(G, w, h)
     mask = np.zeros((h, w), np.uint8)
     for poly in _OVERLAY_POLYS:
         uv, wz = project_points(G, poly)
