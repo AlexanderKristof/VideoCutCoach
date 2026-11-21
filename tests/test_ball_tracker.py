@@ -112,6 +112,62 @@ class BallTrackerTests(unittest.TestCase):
         self.assertEqual(s.status, STATUS_DETECTED)
         self.assertLess(abs(s.x - 909), 3.0)
 
+    def test_relocated_ball_at_restart_spot(self):
+        # LABDA-ÁTHELYEZÉS: kép -> pálya H 10 px / m; a középpont (52,5; 34) m = (525, 340) px
+        H = np.diag([0.1, 0.1, 1.0])
+        tr = BallTracker(25, frame_size=(1280, 720))
+        for i in range(6):
+            tr.update([cand(200 + 8 * i, 500, conf=0.7, size=3.0)], pitch_H=H)
+        for _ in range(20):   # a labdát elviszik (gól után): a követés elvész
+            s = tr.update([], pitch_H=H)
+        self.assertFalse(s.found)
+        # álló, gyenge (init_conf alatti) jelölt a középponton: két detektálás elég, köztük kimaradással is
+        self.assertEqual(tr.update([cand(525, 340, conf=0.25, size=3.0)], pitch_H=H).status, STATUS_LOST)
+        tr.update([], pitch_H=H)
+        s = tr.update([cand(525.5, 340, conf=0.25, size=3.0)], pitch_H=H)
+        self.assertEqual(s.status, STATUS_DETECTED)
+        self.assertLess(abs(s.x - 525.5), 1.0)
+        self.assertEqual(tr.stats["relocated"], 1)
+        # máshol (nem újraindítási ponton) a gyenge álló jelölthöz továbbra is 3 detektálás kell
+        tr = BallTracker(25, frame_size=(1280, 720))
+        self.assertEqual(tr.update([cand(300, 200, conf=0.25, size=3.0)], pitch_H=H).status, STATUS_LOST)
+        self.assertEqual(tr.update([cand(300, 200, conf=0.25, size=3.0)], pitch_H=H).status, STATUS_LOST)
+        self.assertEqual(tr.update([cand(300, 200, conf=0.25, size=3.0)], pitch_H=H).status, STATUS_DETECTED)
+
+    def test_static_ball_reacquired_while_coasting(self):
+        # a mozgó labda hirtelen megáll a kapun kívül (alapvonalon túl, ill. hálóban): a becslés továbbsodródik,
+        # az álló, következetes jelölt viszont nem kap álló-folt büntetést -> a követő átvált rá
+        H = np.diag([0.1, 0.1, 1.0])
+        tr = BallTracker(25, frame_size=(1280, 720))
+        for i in range(8):
+            tr.update([cand(800 + 25 * i, 345, conf=0.7, size=3.0)], pitch_H=H)
+        net = (1060.0, 345.0)   # (106, 34,5) m: a jobb kapu hálójában
+        found = None
+        for k in range(8):
+            s = tr.update([cand(*net, conf=0.5, size=3.0)] if k % 2 == 0 else [], pitch_H=H)
+            if s.status == STATUS_DETECTED and abs(s.x - net[0]) < 2 and found is None:
+                found = k
+        self.assertIsNotNone(found, "a hálóban álló labdát vissza kell találni")
+        self.assertLessEqual(found, 4)
+        pr = tr._priors([_cand_center_size(cand(*net, conf=0.5, size=3.0))], tr._geometry(H, (1280, 720)), [])
+        self.assertAlmostEqual(pr[0][0], 1.0)
+        self.assertEqual(pr[0][3], "kapuháló")
+
+    def test_engine_accepts_ball_in_net(self):
+        # a motor a hálóban nyugvó labdát (a gólvonal mögött, a kapufák között) is átadja az events.py-nak
+        try:
+            from tactical_engine import TacticalEngine
+        except ImportError as ex:   # pragma: no cover
+            self.skipTest(f"hiányzó csomag: {ex}")
+        eng = TacticalEngine()
+        H = np.eye(3)
+        self.assertIsNotNone(eng.transform_ball_to_pitch(-3.5, 34.0, H))     # bal háló (vetítési tűréssel)
+        self.assertIsNotNone(eng.transform_ball_to_pitch(107.2, 37.0, H))    # jobb háló
+        self.assertIsNone(eng.transform_ball_to_pitch(-3.5, 20.0, H))        # alapvonal mögött, a kapun kívül
+        self.assertIsNone(eng.transform_ball_to_pitch(108.6, 28.0, H))       # pl. a kapus kezében tartott labda vetülete
+        self.assertIsNotNone(eng.transform_ball_to_pitch(-1.5, 60.0, H))     # a régi 2 m-es tűrés megmaradt
+        self.assertIsNone(eng.transform_ball_to_pitch(50.0, 71.0, H))
+
     def test_interpolate_and_pitch(self):
         pts, flags = interpolate_gaps([(0, 0), None, None, (3, 3), None], max_gap=2)
         self.assertEqual(flags, ["measured", "interpolated", "interpolated", "measured", None])

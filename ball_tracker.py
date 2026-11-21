@@ -18,7 +18,11 @@ pedig nem volt labda. Ez a modul:
   * opcionálisan pályakoordinátát számol a kép -> pálya homográfiával,
   * téves jelöltek elleni priorok (pályán van-e, a H-ból várható méret, fej / felsőtest,
     álló folt) és mag-követés: elvesztés után csak 2–3 egymást követő, következetes
-    detektálásból indul újra (lásd BallTracker).
+    detektálásból indul újra (lásd BallTracker),
+  * labda-áthelyezés: gól / játékon kívül után a labda állva jelenik meg egy újraindítási ponton
+    (középpont, ötös, szöglet, oldalvonal, büntetőpont) vagy a hálóban nyugszik: elvesztett / nem
+    magabiztos követésnél az álló jelölt nem kap álló-folt büntetést, és újraindítási ponton
+    2 következetes (kimaradással is megengedett) detektálás elég az újrainduláshoz.
 
 Csak numpy + OpenCV (a rajzoláshoz / homográfiához) kell, torch / ultralytics nem.
 """
@@ -35,6 +39,44 @@ STATUS_DETECTED = "detected"
 STATUS_PREDICTED = "predicted"
 STATUS_LOST = "lost"
 STATUS_COASTING = "coasting"   # belül még követjük (kapuzáshoz), de a becslés már túl bizonytalan a kiadáshoz
+
+# --- LABDA-ÁTHELYEZÉS: pálya-geometria (m, 105x68, bal kapu x=0) az újraindítási pontokhoz és a kapuhálóhoz ---
+PITCH_L, PITCH_W = 105.0, 68.0
+POST_LO, POST_HI = 30.34, 37.66
+GOAL_DEPTH_M = 2.5          # a kapuháló mélysége a gólvonal mögött
+
+
+def in_goal_net(x, y, tol=0.0):
+    """A kapun belül, a gólvonal mögött (hálóban) van-e: x in [-2,5; 0] / [105; 107,5], y a kapufák ±1 m-en."""
+    if not (POST_LO - 1.0 - tol <= y <= POST_HI + 1.0 + tol):
+        return False
+    return -GOAL_DEPTH_M - tol <= x <= tol or PITCH_L - tol <= x <= PITCH_L + GOAL_DEPTH_M + tol
+
+
+def restart_spot(x, y, tol=1.5):
+    """
+    Hol állhat a labda áthelyezés (gól / labda a játékon kívül) után: középpont, büntetőpont, ötös
+    (kirúgás), szögletív, oldalvonal, illetve a kapuháló (gól után ott nyugvó labda).
+    Visszatér: a hely neve vagy None. tol: vetítési / pozíciózaj (m).
+    """
+    L, W = PITCH_L, PITCH_W
+    if math.hypot(x - L / 2, y - W / 2) <= 1.0 + tol:
+        return "középpont"
+    if in_goal_net(x, y, tol):
+        return "kapuháló"
+    for px in (11.0, L - 11.0):
+        if math.hypot(x - px, y - W / 2) <= 0.5 + tol:
+            return "büntetőpont"
+    if W / 2 - 9.16 - tol <= y <= W / 2 + 9.16 + tol and (-tol <= x <= 5.5 + tol or L - 5.5 - tol <= x <= L + tol):
+        return "ötös"
+    for cx in (0.0, L):
+        for cy in (0.0, W):
+            if math.hypot(x - cx, y - cy) <= 1.0 + tol:
+                return "szöglet"
+    if -tol <= x <= L + tol and (abs(y) <= tol or abs(y - W) <= tol):
+        return "oldalvonal"
+    return None
+# --- /LABDA-ÁTHELYEZÉS ---
 
 
 class BallState:
@@ -117,7 +159,8 @@ class BallTracker:
                  min_score=0.25, reinit_frames=3, velocity_damping=0.97,
                  w_conf=0.40, w_dist=0.35, w_size=0.15, w_grass=0.10,
                  init_frames=2, init_frames_weak=3, ball_diameter_m=0.22, pitch_margin_m=3.0, air_margin_m=7.0,
-                 head_penalty=0.35, static_penalty=0.35, static_frames=3, seed_min_prior=0.4):
+                 head_penalty=0.35, static_penalty=0.35, static_frames=3, seed_min_prior=0.4,
+                 relocate_frames=2, static_seed_gap_sec=0.4, static_seed_px=None, confident_hits=3):
         self.fps = float(fps or 25.0)
         self.frame_size = frame_size
         diag = math.hypot(*frame_size) if frame_size else 1468.0
@@ -144,6 +187,15 @@ class BallTracker:
         self.static_penalty = float(static_penalty)
         self.static_frames = int(static_frames)
         self.seed_min_prior = float(seed_min_prior)
+        # LABDA-ÁTHELYEZÉS: gól / játékon kívül után a labda állva jelenik meg egy újraindítási ponton
+        # (középpont, ötös, szöglet, oldalvonal, háló). Elvesztett vagy nem magabiztos (sodródó) követésnél
+        # ehhez relocate_frames következetes, álló detektálás elég; az álló jelölt ilyenkor nem kap
+        # álló-folt büntetést, és két detektálása között static_seed_gap_sec kimaradás is lehet
+        # (a lehelyezett labda nem mozdul, a detektor viszont gyakran kihagyja).
+        self.relocate_frames = max(1, int(relocate_frames))
+        self.static_seed_gap = max(2, int(round(static_seed_gap_sec * self.fps)))
+        self.static_seed_px = float(static_seed_px) if static_seed_px is not None else 0.25 * self.gate_base
+        self.confident_hits = int(confident_hits)
         self.reset()
 
     # ------------------------------------------------------------ állapot
@@ -157,8 +209,10 @@ class BallTracker:
         self.seeds = []            # elveszett állapotban: induló labda-hipotézisek (mag-követés)
         self.hist = []             # az előző hívások jelöltjeinek képpontjai (álló folt felismeréshez)
         self.frame_idx = -1
+        self.hits = 0              # egymást követő mért (detektált) frissítések száma
         self.stats = {"frames": 0, "detected": 0, "predicted": 0, "coasting": 0, "lost": 0, "rejected": 0, "reinit": 0,
-                      "multi_candidate_frames": 0, "prior_penalized": 0, "seed_started": 0}
+                      "multi_candidate_frames": 0, "prior_penalized": 0, "seed_started": 0,
+                      "relocated": 0}
 
     @property
     def active(self):
@@ -270,20 +324,25 @@ class BallTracker:
         return PitchGeometry(pitch_H, frame_size)
 
     def _priors(self, cands, geom, person_boxes):
-        """Jelöltenként: (pálya + méret szorzó, fej/felsőtest-e, hány korábbi hívásban volt ott álló jelölt)."""
+        """Jelöltenként: (pálya + méret szorzó, fej/felsőtest-e, hány korábbi hívásban volt ott álló jelölt,
+        újraindítási hely neve vagy None – lásd restart_spot)."""
         out = []
         for cx, cy, size, conf, box in cands:
             f = 1.0
+            spot = None
             bw, bh = max(1.0, box[2] - box[0]), max(1.0, box[3] - box[1])
             if geom is not None:
                 xy = geom.to_pitch(cx, cy)
                 if xy is None:
                     f *= 0.1                                    # a horizont fölé vetül (lelátó, ég)
                 else:
+                    spot = restart_spot(xy[0], xy[1])
                     # a szálló labda talajra vetülete a kamerától TÁVOLABB esik (a kapuk / a túlsó
                     # oldalvonal mögé), ezért arra nagyobb a tűrés; a közeli oldalvonalon túl nem
                     d_away = math.hypot(max(0.0, -xy[0], xy[0] - 105.0), max(0.0, -xy[1]))
                     d_near = max(0.0, xy[1] - 68.0)
+                    if in_goal_net(xy[0], xy[1], tol=1.5):
+                        d_away = d_near = 0.0                   # LABDA-ÁTHELYEZÉS: a hálóban lévő labda érvényes
                     if d_near > self.pitch_margin:
                         f *= max(0.15, math.exp(-(d_near - self.pitch_margin) / 6.0))
                     if d_away > self.air_margin:
@@ -306,16 +365,28 @@ class BallTracker:
                     break
             rad = max(1.5, 0.35 * size)
             n_static = sum(1 for h in self.hist if any(math.hypot(cx - x, cy - y) <= rad for x, y in h))
-            out.append((f, head, n_static))
+            out.append((f, head, n_static, spot))
         return out
 
-    def _seed_factor(self, prior):
-        f, head, n_static = prior
+    def _seed_factor(self, prior, static_ok=False):
+        """static_ok: nincs magabiztos, mozgó követés -> az álló jelöltet nem büntetjük (áthelyezett labda)."""
+        f, head, n_static = prior[:3]
         if head:
             f *= self.head_penalty
-        if n_static >= self.static_frames:
+        if n_static >= self.static_frames and not static_ok:
             f *= self.static_penalty
         return f
+
+    def _still_match(self, d, gap):
+        """Álló labda következő detektálása: ugyanott (kis sugár), kis látszó sebességgel, hosszabb kimaradással is."""
+        gap = max(1, gap)
+        return d <= self.static_seed_px and gap <= self.static_seed_gap and d / gap <= 1.5
+
+    def _confident(self):
+        """Magabiztos, mozgó követés: az utóbbi frissítések folyamatosan mértek, és a labda mozog."""
+        if self.x is None or self.gap > 0 or self.hits < self.confident_hits:
+            return False
+        return math.hypot(self.x[2], self.x[3]) >= 1.0
 
     # ------------------------------------------------------------ fő lépés
     def update(self, candidates, camera_shift=None, camera_H=None, grass_mask=None, grass_scale=1.0,
@@ -346,6 +417,7 @@ class BallTracker:
             self.hist = (self.hist + [[(c[0], c[1]) for c in cands]])[-(self.static_frames + 1):]
 
     def _step(self, cands, priors, grass_mask, grass_scale, dt_frames):
+        confident = self._confident()
         self._predict(float(dt_frames))
         gap_after = self.gap + dt_frames
         gate = self.gate_base + self.gate_grow * min(gap_after, self.max_gap_frames)
@@ -361,11 +433,11 @@ class BallTracker:
                 outside.append((c, pr))
                 continue
             dist_term = math.exp(-0.5 * (d / (0.5 * gate)) ** 2)
-            f, head, n_static = pr
+            f, head, n_static = pr[:3]
             if head:
                 f *= 0.6 if dist_term > 0.6 else self.head_penalty   # a becslés mellett (fejelés) enyhébb
-            if n_static >= self.static_frames and dist_term < 0.3:
-                f *= self.static_penalty                             # álló folt a becsléstől messze
+            if n_static >= self.static_frames and dist_term < 0.3 and confident:
+                f *= self.static_penalty                             # álló folt messze a mozgó labda becslésétől
             if f < 0.999:
                 self.stats["prior_penalized"] += 1
             sc = f * self._score(conf, dist_term, size, self._grass_score(cx, cy, grass_mask, grass_scale))
@@ -389,19 +461,27 @@ class BallTracker:
             self.gap = 0
             self.last_meas = (self.frame_idx, cx, cy)
             self.challenger = None
+            self.hits += 1
             self.stats["detected"] += 1
             return BallState(self.frame_idx, STATUS_DETECTED, float(self.x[0]), float(self.x[1]),
                              float(self.x[2]), float(self.x[3]), conf, box, best_score, 0, len(cands))
 
         # nincs elfogadható mérés: előrejelzés, közben figyeljük a kapun kívüli következetes jelöltet
         self.gap = gap_after
-        if self._challenge(outside):
+        self.hits = 0
+        if self._challenge(outside, static_ok=not confident):
             return self._emit_reinit(len(cands))
         self.x[2] *= self.damping ** dt_frames
         self.x[3] *= self.damping ** dt_frames
         if self.gap > self.max_gap_frames or not self._in_frame(self.x[0], self.x[1]):
             self.x = None
             self.P = None
+            ch = self.challenger
+            if ch is not None:   # LABDA-ÁTHELYEZÉS: a kapun kívüli kihívó magként folytatódik (nem kezdjük elölről)
+                self.seeds = [{"x": ch["x"], "y": ch["y"], "vx": 0.0, "vy": 0.0, "n": ch["n"], "frame": ch["frame"],
+                               "conf": ch["conf"], "fmin": 0.6, "c": ch["c"], "f": 0.6,
+                               "still": ch["still"], "spot": ch["spot"]}]
+                self.challenger = None
             self.stats["lost"] += 1
             return BallState(self.frame_idx, STATUS_LOST, gap_frames=self.gap, n_candidates=len(cands))
         status = STATUS_PREDICTED if self.gap <= self.max_output_gap_frames else STATUS_COASTING
@@ -416,27 +496,55 @@ class BallTracker:
         m = 0.05 * w
         return -m <= x <= w + m and -m <= y <= h + m
 
-    def _challenge(self, outside):
-        """Kapun kívüli, erős, jó priorú jelölt, ami több képkockán át folytonosan jelen van -> átváltás."""
-        strong = [c for c, pr in outside if c[3] >= self.init_conf and self._seed_factor(pr) >= 0.5]
-        if not strong:
-            if self.challenger is not None and self.frame_idx - self.challenger["frame"] > 2:
+    def _challenge(self, outside, static_ok=False):
+        """
+        Kapun kívüli, erős, jó priorú jelölt, ami több képkockán át folytonosan jelen van -> átváltás.
+        LABDA-ÁTHELYEZÉS (static_ok: nincs magabiztos mozgó követés): az újraindítási ponton álló jelölt
+        gyengébb konfidenciával is kihívó lehet; ha egy helyben marad, két detektálása között
+        static_seed_gap kimaradás is lehet, és relocate_frames detektálás után átvált.
+        """
+        pool, spot_ids = [], set()
+        for c, pr in outside:
+            if self._seed_factor(pr, static_ok) < 0.5:
+                continue
+            at_spot = static_ok and pr[3] is not None
+            if c[3] >= self.init_conf or at_spot:
+                if at_spot:
+                    spot_ids.add(id(c))
+                pool.append(c)
+        ch = self.challenger
+        keep = 0 if ch is None else (self.static_seed_gap if ch["still"] else 2)
+        if not pool:
+            if ch is not None and self.frame_idx - ch["frame"] > keep:
                 self.challenger = None
             return False
-        ch = self.challenger
         if ch is not None:
-            near = min(strong, key=lambda c: math.hypot(c[0] - ch["x"], c[1] - ch["y"]))
-            if math.hypot(near[0] - ch["x"], near[1] - ch["y"]) <= self.gate_base + self.gate_grow * 2:
-                ch.update({"x": near[0], "y": near[1], "n": ch["n"] + 1, "frame": self.frame_idx, "c": near})
-                return ch["n"] >= self.reinit_frames
-        best = max(strong, key=lambda c: c[3])
-        self.challenger = {"x": best[0], "y": best[1], "n": 1, "frame": self.frame_idx, "c": best}
+            near = min(pool, key=lambda c: math.hypot(c[0] - ch["x"], c[1] - ch["y"]))
+            d = math.hypot(near[0] - ch["x"], near[1] - ch["y"])
+            gap = self.frame_idx - ch["frame"]
+            still = ch["still"] and self._still_match(d, gap)
+            if still or (d <= self.gate_base + self.gate_grow * 2 and gap <= 2):
+                spot = ch["spot"] and id(near) in spot_ids
+                ch.update({"x": near[0], "y": near[1], "n": ch["n"] + 1, "frame": self.frame_idx, "c": near,
+                           "still": still, "spot": spot, "conf": ch["conf"] + near[3]})
+                n_req = self.relocate_frames if (still and spot) else self.reinit_frames
+                if ch["n"] >= n_req:
+                    if still and spot:
+                        self.stats["relocated"] += 1
+                    return True
+                return False
+            if gap <= keep and near is not None and near[3] < self.init_conf:
+                return False   # a korábbi (álló) kihívót egy gyenge, máshol lévő jelölt nem írja felül
+        best = max(pool, key=lambda c: c[3])
+        self.challenger = {"x": best[0], "y": best[1], "n": 1, "frame": self.frame_idx, "c": best,
+                           "still": True, "spot": id(best) in spot_ids, "conf": best[3]}
         return False
 
     def _emit_reinit(self, n_cands):
         cx, cy, size, conf, box = self.challenger["c"]
         self._init_track(cx, cy, size)
         self.last_meas = (self.frame_idx, cx, cy)
+        self.hits = 1
         self.stats["reinit"] += 1
         self.stats["detected"] += 1
         return BallState(self.frame_idx, STATUS_DETECTED, cx, cy, 0.0, 0.0, conf, box, conf, 0, n_cands)
@@ -447,14 +555,33 @@ class BallTracker:
         a következő detektálások mozgásban következetesen folytatnak. A követés akkor indul, ha egy
         mag elég hosszú: init_frames egymást követő detektálás (átlagosan erős konfidencia és jó
         prior mellett), különben init_frames_weak. Egy detektálásnyi kimaradás megengedett.
+        LABDA-ÁTHELYEZÉS: elvesztett követésnél az álló jelöltet nem büntetjük; az egy helyben maradó
+        (álló) mag két detektálása között static_seed_gap kimaradás is lehet, és ha minden detektálása
+        újraindítási ponton volt (restart_spot), relocate_frames detektálás után indul.
         """
         max_seed_gap = max(2, 2 * dt_frames)
-        self.seeds = [s for s in self.seeds if self.frame_idx - s["frame"] <= max_seed_gap]
-        usable = [(c, self._seed_factor(pr)) for c, pr in zip(cands, priors)]
-        usable = [(c, f) for c, f in usable if f >= self.seed_min_prior]
+        self.seeds = [s for s in self.seeds if self.frame_idx - s["frame"] <=
+                      (max(max_seed_gap, self.static_seed_gap) if s["still"] else max_seed_gap)]
+        usable = [(c, self._seed_factor(pr, static_ok=True), pr[3] is not None) for c, pr in zip(cands, priors)]
+        usable = [u for u in usable if u[1] >= self.seed_min_prior]
         used = set()
         for s in sorted(self.seeds, key=lambda s: -s["n"]):
             gap = max(1, self.frame_idx - s["frame"])
+            if s["still"]:   # álló mag: a következő detektálás ugyanott (kis sugár), hosszabb kimaradással is
+                bi, bd = None, None
+                for k, (c, f, sp) in enumerate(usable):
+                    d = math.hypot(c[0] - s["x"], c[1] - s["y"])
+                    if k not in used and self._still_match(d, gap) and (bd is None or d < bd):
+                        bi, bd = k, d
+                if bi is not None:
+                    used.add(bi)
+                    c, f, sp = usable[bi]
+                    s.update({"x": c[0], "y": c[1], "vx": 0.0, "vy": 0.0, "n": s["n"] + 1, "frame": self.frame_idx,
+                              "conf": s["conf"] + c[3], "fmin": min(s["fmin"], f), "c": c, "f": f,
+                              "spot": s["spot"] and sp})
+                    continue
+                if gap > max_seed_gap:
+                    continue
             if s["n"] >= 2:
                 px, py = s["x"] + s["vx"] * gap, s["y"] + s["vy"] * gap
                 rad = self.gate_base * (0.5 + 0.25 * (gap - 1))
@@ -462,7 +589,7 @@ class BallTracker:
                 px, py = s["x"], s["y"]
                 rad = self.gate_base * gap
             bi, bd = None, None
-            for k, (c, f) in enumerate(usable):
+            for k, (c, f, sp) in enumerate(usable):
                 if k in used:
                     continue
                 d = math.hypot(c[0] - px, c[1] - py)
@@ -471,16 +598,17 @@ class BallTracker:
             if bi is None:
                 continue
             used.add(bi)
-            c, f = usable[bi]
+            c, f, sp = usable[bi]
             vx, vy = (c[0] - s["x"]) / gap, (c[1] - s["y"]) / gap
             if s["n"] >= 2:
                 vx, vy = 0.5 * (vx + s["vx"]), 0.5 * (vy + s["vy"])
             s.update({"x": c[0], "y": c[1], "vx": vx, "vy": vy, "n": s["n"] + 1, "frame": self.frame_idx,
-                      "conf": s["conf"] + c[3], "fmin": min(s["fmin"], f), "c": c, "f": f})
-        for k, (c, f) in enumerate(usable):
+                      "conf": s["conf"] + c[3], "fmin": min(s["fmin"], f), "c": c, "f": f, "spot": False,
+                      "still": False})   # elmozdult: mozgó mag
+        for k, (c, f, sp) in enumerate(usable):
             if k not in used:
                 self.seeds.append({"x": c[0], "y": c[1], "vx": 0.0, "vy": 0.0, "n": 1, "frame": self.frame_idx,
-                                   "conf": c[3], "fmin": f, "c": c, "f": f})
+                                   "conf": c[3], "fmin": f, "c": c, "f": f, "still": True, "spot": sp})
         self.seeds = sorted(self.seeds, key=lambda s: (-s["n"], -s["conf"]))[:16]
 
         ready = []
@@ -488,7 +616,8 @@ class BallTracker:
             if s["frame"] != self.frame_idx:
                 continue
             strong = s["conf"] / s["n"] >= self.init_conf and s["fmin"] >= 0.6
-            if s["n"] >= (self.init_frames if strong else self.init_frames_weak):
+            relocate = s["still"] and s["spot"] and s["fmin"] >= 0.6
+            if s["n"] >= (self.relocate_frames if relocate else self.init_frames if strong else self.init_frames_weak):
                 ready.append(s)
         if not ready:
             self.stats["lost"] += 1
@@ -500,6 +629,9 @@ class BallTracker:
         self.last_meas = (self.frame_idx, cx, cy)
         self.stats["detected"] += 1
         self.stats["seed_started"] += 1
+        self.hits = 1
+        if s["still"] and s["spot"]:
+            self.stats["relocated"] += 1
         grass = self._grass_score(cx, cy, grass_mask, grass_scale)
         sc = s["f"] * self._score(conf, 1.0, size, grass)
         return BallState(self.frame_idx, STATUS_DETECTED, cx, cy, vx, vy, conf, box, sc, 0, len(cands))
@@ -513,7 +645,8 @@ class BallTracker:
                 f"nincs labda {s['lost'] + s['coasting']} (ebből belső követés {s['coasting']}), "
                 f"kidobott jelölt {s['rejected']}, újraindítás {s['reinit']}, "
                 f"több jelöltes képkocka {s['multi_candidate_frames']}, "
-                f"prior-büntetés {s['prior_penalized']}, mag-követésből indult {s['seed_started']}")
+                f"prior-büntetés {s['prior_penalized']}, mag-követésből indult {s['seed_started']}, "
+                f"áthelyezett (álló, újraindítási ponton) labda {s['relocated']}")
 
 
 def pitch_position(state, H):
