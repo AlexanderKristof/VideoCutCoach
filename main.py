@@ -25,7 +25,8 @@ from database import get_db, engine
 from models import Base, User, Match
 from tactical_engine import TacticalEngine
 from pitch_filters import (build_grass_mask, foot_on_grass, CameraMotion,
-                           StationaryFilter, extract_dominant_color)
+                           StationaryFilter, extract_dominant_color,
+                           PitchBoundary, PitchTrackSanity, KeeperGate, pitch_h_trusted)  # PÁLYAHATÁR
 from model_config import (load_model_config, resolve_weights, build_role_class_map,
                           describe_role_map, should_detect, reset_tracker)
 from review_export import ReviewExporter
@@ -295,6 +296,17 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
     camera_motion = CameraMotion()
     stationary_filter = StationaryFilter(fps, config["stationary_window_sec"], config["stationary_max_move"])
 
+    # --- PÁLYAHATÁR / KÖVETÉS-ÉPSÉG / KAPUS-MEGERŐSÍTÉS (pitch_filters.py) ---
+    # Csak megbízható képkockánkénti H mellett szűr (pitch_h_trusted); pitch_margin_m <= 0: kikapcsolva.
+    pitch_margin_m = float(config.get("pitch_margin_m", 2.5))
+    pitch_boundary = PitchBoundary((width, height), margin_m=pitch_margin_m)
+    track_sanity = PitchTrackSanity(fps) if pitch_margin_m > 0 else None
+    keeper_gate = KeeperGate(fps)
+    pitch_q = None               # a pályakövető minősége (statikus H-nál None)
+    referee_votes = {}           # követés -> [bíró osztályú, összes] detektálás (bíró játékosnak tévesztve)
+    ball_last_frame = None       # LABDAKÖVETÉS: a legutóbbi követő-frissítés képkockája (gyors mód: dt_frames)
+    # --- /PÁLYAHATÁR ---
+
     # --- AUTO CSAPAT (team_classifier.py): csak ha nincs kézi csapat-HSV tartomány ---
     team_clf = None
     if auto_teams_enabled(config):
@@ -376,6 +388,9 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
             camera_motion.update(frame)
             if frames_done % 250 == 0:
                 stationary_filter.prune(frames_done)
+                keeper_gate.prune(frames_done)  # PÁLYAHATÁR
+                if track_sanity is not None:
+                    track_sanity.prune(frames_done)
 
             # --- Pályakövetés: az aktuális képkocka homográfiája (a rajzolás előtt) ---
             if pitch_tracker is not None:
@@ -401,6 +416,11 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
                 _raw_ball_buf["boxes"] = None   # NYERS LABDA: a callback tölti ki a track() alatt
                 results = model.track(frame, persist=True, tracker="bytetrack.yaml", device=device, verbose=False)
                 pitch_boxes = [tuple(map(int, b.xyxy[0])) for r in results for b in r.boxes]  # pályakövetéshez
+                # PÁLYAHATÁR: a képkocka H-ja csak akkor szűr, ha megbízható (a pályakövető None-t is adhat)
+                h_trusted = pitch_h_trusted(H_cur, pitch_q if pitch_tracker is not None else None)
+                pitch_boundary.set_frame(H_cur, h_trusted)
+                ball_person_boxes = [tuple(float(v) for v in b.xyxy[0][:4]) for r in results for b in r.boxes
+                                     if int(b.cls[0]) not in role_classes["ball"]]  # LABDA: fej-prior
 
                 raw_detections = []
                 referee_boxes = []
@@ -434,6 +454,10 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
                     # Bírók: nem kerülnek a játékosok közé, csak semleges színnel rajzoljuk ki őket
                     for box in [b for b in r.boxes if int(b.cls[0]) in role_classes["referee"]]:
                         x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        if box.id is not None:  # PÁLYAHATÁR: követésenkénti bíró-szavazat
+                            rv = referee_votes.setdefault(int(box.id[0].item()), [0, 0])
+                            rv[0] += 1
+                            rv[1] += 1
                         on_grass, _ = foot_on_grass(grass_mask, grass_scale, x1, x2, y2, config["grass_min_ratio"])
                         if on_grass:
                             referee_boxes.append((x1, y1, x2, y2))
@@ -472,15 +496,47 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
                                 debug_file.write(f"F#{frames_done} ID#{tid}: ELDOBVA -> Nem füvön áll (fű arány={grass_ratio:.2f})\n")
                                 continue
 
+                            # --- PÁLYAHATÁR: 4b. a (megbízható) képkocka-H szerinti pályahatár + margó ---
+                            in_bounds, bound_reason, pitch_raw = pitch_boundary.check(foot_x, foot_y, box_h)
+                            if not in_bounds:
+                                debug_file.write(f"F#{frames_done} ID#{tid}: ELDOBVA -> {bound_reason}\n")
+                                continue
+                            # bíró, akit a modell néha játékosnak lát: a követés többségi osztálya dönt
+                            if tid is not None:
+                                rv = referee_votes.setdefault(tid, [0, 0])
+                                rv[1] += 1
+                                if rv[1] >= 5 and rv[0] >= 0.5 * rv[1]:
+                                    referee_boxes.append((x1, y1, x2, y2))
+                                    continue
+                            # --- /PÁLYAHATÁR ---
+
                             is_k1 = check_color_match(hsv_frame, x1, y1, x2, y2, colors["keeper1"][0], colors["keeper1"][1])
                             is_k2 = check_color_match(hsv_frame, x1, y1, x2, y2, colors["keeper2"][0], colors["keeper2"][1])
-                            is_keeper = is_k1 or is_k2 or model_keeper
+                            # PÁLYAHATÁR: kapus-megerősítés – a csak színre egyező, a 16-osokon kívül élő alak
+                            # (pl. narancs mezes csere a sárga kapus tartományában) nem kapus
+                            is_keeper, keeper_confirmed, colour_ok = keeper_gate.update(
+                                tid, frames_done, model_keeper, is_k1 or is_k2, pitch_raw)
+                            if (is_k1 or is_k2) and not colour_ok:
+                                if frames_done % 25 == 0:
+                                    debug_file.write(f"F#{frames_done} ID#{tid}: kapus-szín, de a 16-osokon kívül él -> nem kapus\n")
+                                is_k1 = is_k2 = False
+                            if team_clf is not None and team_clf.is_keeper_track(tid, current_time_sec):
+                                keeper_confirmed = True  # AUTO CSAPAT: pozíció alapú kapus
 
-                            # 5. Álló alak szűrő (néző, edző) – a kapus kivétel, ő sokáig állhat egy helyben
+                            # --- PÁLYAHATÁR: 4c. követés-épség pályatérben (kint él / sosem mozdul) ---
+                            if track_sanity is not None and h_trusted:
+                                suppressed, why = track_sanity.update(tid, frames_done, pitch_raw,
+                                                                      exempt_still=keeper_confirmed)
+                                if suppressed:
+                                    debug_file.write(f"F#{frames_done} ID#{tid}: ELDOBVA -> {why}\n")
+                                    continue
+                            # --- /PÁLYAHATÁR ---
+
+                            # 5. Álló alak szűrő (néző, edző) – csak a MEGERŐSÍTETT kapus kivétel (modell / pozíció),
+                            # a csak színre egyező nem
                             stab_x, stab_y = camera_motion.stabilize(foot_x, foot_y)
                             is_static = stationary_filter.update(tid, frames_done, stab_x, stab_y, box_h)
-                            if is_static and not is_keeper and not (
-                                    team_clf is not None and team_clf.is_keeper_track(tid, current_time_sec)):  # AUTO CSAPAT: kapus kivétel
+                            if is_static and not keeper_confirmed:
                                 debug_file.write(f"F#{frames_done} ID#{tid}: ELDOBVA -> Mozdulatlan alak ({config['stationary_window_sec']:.1f}s)\n")
                                 continue
 
@@ -542,9 +598,14 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
                             cam_H = None
                     if cam_H is None and cam_shift is not None:
                         ball_comp_stats["eltolás"] += 1
+                    # PÁLYAHATÁR: dt_frames = a valódi képkocka-különbség (gyors mód), pálya/méret/fej priorok
+                    ball_dt = 1 if ball_last_frame is None else max(1, frames_done - ball_last_frame)
+                    ball_last_frame = frames_done
                     last_ball_state = ball_tracker.update(ball_candidates, camera_shift=cam_shift, camera_H=cam_H,
                                                           grass_mask=grass_mask, grass_scale=grass_scale,
-                                                          frame_idx=frames_done)
+                                                          frame_idx=frames_done, dt_frames=ball_dt,
+                                                          pitch_H=pitch_boundary.geom,
+                                                          person_boxes=ball_person_boxes)
                     ball_motion_H = np.eye(3) if pitch_tracker is not None else None
                     ball_H_ref = None if H_cur is None else np.array(H_cur, np.float64)
                     ball_pixel = last_ball_state.pixel
@@ -614,6 +675,9 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
 
         if team_clf is not None:  # AUTO CSAPAT: a tanult klaszterek a naplóba
             debug_file.write("\n" + team_clf.describe() + "\n")
+        # PÁLYAHATÁR: összesítés a naplóba
+        debug_file.write(f"\nPályahatár (margó {pitch_margin_m:.1f} m) kizárások: {pitch_boundary.stats}"
+                         + (f", követés-épség: {track_sanity.stats}" if track_sanity is not None else "") + "\n")
 
         if ball_tracker is not None:  # LABDAKÖVETÉS: összesítés a naplóba
             debug_file.write("\n" + ball_tracker.summary() + "\n")
@@ -682,7 +746,8 @@ async def cut_raw_endpoint(
     dynamic_homography: bool = Form(True),
     draw_pitch_overlay: bool = Form(True),
     calib_time_sec: Optional[float] = Form(None),
-    calib_pitch_points: str = Form("")
+    calib_pitch_points: str = Form(""),
+    pitch_margin_m: float = Form(2.5)
 ):
     config = {
         "team1_attacks_right": team1_attacks_right,
@@ -691,6 +756,7 @@ async def cut_raw_endpoint(
         # Pályakövetés (lásd pitch_tracker.py, docs/FEJLESZTESI_TERV.md)
         "dynamic_homography": dynamic_homography, "draw_pitch_overlay": draw_pitch_overlay,
         "calib_time_sec": calib_time_sec, "calib_pitch_points": calib_pitch_points,
+        "pitch_margin_m": pitch_margin_m,  # PÁLYAHATÁR: a pályán kívüli tűrés (m), 0 = ki
         "roi_top_pct": roi_top_pct, "roi_bottom_pct": roi_bottom_pct, "min_player_height_pct": min_player_height_pct,
         "use_static_roi": use_static_roi, "grass_min_ratio": grass_min_ratio,
         "stationary_window_sec": stationary_window_sec, "stationary_max_move": stationary_max_move,

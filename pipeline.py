@@ -51,6 +51,7 @@ ANALYSIS_DEFAULTS = {
     "draw_pitch_overlay": True,
     "calib_time_sec": None,          # a kézi kalibráció képének ideje (eredeti videóban)
     "calib_pitch_points": "",
+    "pitch_margin_m": 2.5,           # pályahatár-szűrő: ennyi m-rel a vonalon túl még elfogadott (0 = ki)
 }
 
 # A teljes folyamat saját beállításai
@@ -146,6 +147,7 @@ def build_analysis_config(opts):
         "auto_teams": o["auto_teams"], "swap_teams": o["swap_teams"],
         "dynamic_homography": o["dynamic_homography"], "draw_pitch_overlay": o["draw_pitch_overlay"],
         "calib_time_sec": o["calib_time_sec"], "calib_pitch_points": o["calib_pitch_points"],
+        "pitch_margin_m": o["pitch_margin_m"],
         "roi_top_pct": o["roi_top_pct"], "roi_bottom_pct": o["roi_bottom_pct"],
         "min_player_height_pct": o["min_player_height_pct"],
         "use_static_roi": o["use_static_roi"], "grass_min_ratio": o["grass_min_ratio"],

@@ -10,7 +10,7 @@ import unittest
 import numpy as np
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from ball_tracker import (BallTracker, interpolate_gaps, pitch_position,  # noqa: E402
+from ball_tracker import (BallTracker, interpolate_gaps, pitch_position, _cand_center_size,  # noqa: E402
                           STATUS_DETECTED, STATUS_PREDICTED, STATUS_LOST)
 
 
@@ -19,13 +19,60 @@ def cand(x, y, conf=0.6, size=8.0):
 
 
 class BallTrackerTests(unittest.TestCase):
-    def test_init_requires_strong_or_confirmed(self):
+    def test_init_requires_consecutive_detections(self):
+        # gyenge jelöltből csak 3 egymást követő, következetes detektálás indít követést
         tr = BallTracker(25, frame_size=(1280, 720))
         s = tr.update([cand(100, 100, conf=0.2)])
         self.assertEqual(s.status, STATUS_LOST)
-        # a második, közeli gyenge jelölt megerősíti
         s = tr.update([cand(104, 101, conf=0.2)])
+        self.assertEqual(s.status, STATUS_LOST)
+        s = tr.update([cand(108, 102, conf=0.2)])
         self.assertEqual(s.status, STATUS_DETECTED)
+        self.assertAlmostEqual(s.vx, 4.0, delta=0.5)
+        # erős jelöltből kettő elég; egyetlen erős (pl. téves) jelölt nem indít
+        tr = BallTracker(25, frame_size=(1280, 720))
+        self.assertEqual(tr.update([cand(500, 300, conf=0.8)]).status, STATUS_LOST)
+        self.assertEqual(tr.update([cand(506, 302, conf=0.8)]).status, STATUS_DETECTED)
+        # egymástól messzi, egyszeri téves jelöltek sosem indítanak
+        tr = BallTracker(25, frame_size=(1280, 720))
+        for i in range(6):
+            s = tr.update([cand(100 + 200 * i, 150 + 90 * (i % 3), conf=0.8)])
+            self.assertEqual(s.status, STATUS_LOST)
+
+    def test_priors_head_size_pitch(self):
+        # kép -> pálya H: 10 px / m, a kép (0,0) = pálya (0,0); a labda várható átmérője 2,2 px
+        H = np.diag([0.1, 0.1, 1.0])
+        tr = BallTracker(25, frame_size=(1280, 720))
+        head_box = (300.0, 200.0, 320.0, 260.0)
+        on_head = cand(310, 210, conf=0.8, size=3.0)
+        tiny = cand(600, 400, conf=0.8, size=0.6)       # sokkal kisebb a várható labdánál
+        off_pitch = cand(1200, 710, conf=0.8, size=3.0)  # pálya: (120, 71) m – messze kint
+        good = cand(500, 300, conf=0.8, size=3.0)
+        pr = tr._priors([_cand_center_size(c) for c in [on_head, tiny, off_pitch, good]],
+                        tr._geometry(H, (1280, 720)), [head_box])
+        self.assertTrue(pr[0][1], "fej-régió")
+        self.assertLess(pr[1][0], 0.2, "túl kicsi")
+        self.assertLess(pr[2][0], 0.6, "pályán kívül (enyhe: a szálló labda vetülete is kieshet)")
+        self.assertAlmostEqual(pr[3][0], 1.0)
+        self.assertFalse(pr[3][1])
+        # fejen lévő jelöltekből nem indul követés, a jó jelöltekből igen
+        for i in range(4):
+            s = tr.update([cand(310 + i, 210, conf=0.8, size=3.0)], pitch_H=H, person_boxes=[head_box])
+            self.assertEqual(s.status, STATUS_LOST)
+        tr.update([good], pitch_H=H, person_boxes=[head_box])
+        s = tr.update([cand(503, 300, conf=0.8, size=3.0)], pitch_H=H, person_boxes=[head_box])
+        self.assertEqual(s.status, STATUS_DETECTED)
+
+    def test_dt_frames_prediction(self):
+        # gyors mód: minden 3. képkockán hívjuk – a becslés a valódi képkocka-különbséggel lép
+        tr = BallTracker(25, frame_size=(1280, 720))
+        for i in range(6):
+            s = tr.update([cand(100 + 30 * i, 300)], frame_idx=3 * i, dt_frames=3)
+        self.assertEqual(s.status, STATUS_DETECTED)
+        self.assertAlmostEqual(s.vx, 10.0, delta=1.5)   # px / képkocka
+        s = tr.update([], frame_idx=18, dt_frames=3)
+        self.assertEqual(s.status, STATUS_PREDICTED)
+        self.assertLess(abs(s.x - 280), 6.0)
 
     def test_prediction_through_short_gap(self):
         tr = BallTracker(25, frame_size=(1280, 720))
@@ -70,6 +117,7 @@ class BallTrackerTests(unittest.TestCase):
         self.assertEqual(flags, ["measured", "interpolated", "interpolated", "measured", None])
         self.assertAlmostEqual(pts[1][0], 1.0)
         tr = BallTracker(25)
+        tr.update([cand(9, 20, conf=0.9)])
         s = tr.update([cand(10, 20, conf=0.9)])
         H = np.diag([0.5, 0.5, 1.0])
         x, y = pitch_position(s, H)

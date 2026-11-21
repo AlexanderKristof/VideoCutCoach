@@ -42,7 +42,7 @@ Az elemzés mindig az **eredeti** videón fut (a félidők határaival), ezért 
 | `compilations` | `goalkeepers,highlights` | klip-összeállítások vesszővel: `goalkeepers` (kapusonként), `highlights` (gólok + lövések); üres = nincs |
 | `clip_pre_sec` / `clip_post_sec` | `5` / `4` | a csak időponttal megadott eseményeknél a klip eleje / vége |
 | `clip_accurate` | `true` | képkocka-pontos (újrakódolt) klipek |
-| a `/cut-raw` összes hangolási mezője | ugyanaz, mint ott | `calib_points`, `roi_top_pct`, `min_player_height_pct`, `use_static_roi`, `grass_min_ratio`, `stationary_window_sec`, `stationary_max_move`, `*_hsv_lower` / `*_hsv_upper`, `team1_attacks_right` (az 1. félidőre), `review_export`, `detect_mode` |
+| a `/cut-raw` összes hangolási mezője | ugyanaz, mint ott | `calib_points`, `roi_top_pct`, `min_player_height_pct`, `use_static_roi`, `grass_min_ratio`, `stationary_window_sec`, `stationary_max_move`, `pitch_margin_m`, `*_hsv_lower` / `*_hsv_upper`, `team1_attacks_right` (az 1. félidőre), `review_export`, `detect_mode` |
 
 Az ismert mezők listája a `pipeline.py` `ANALYSIS_DEFAULTS` / `PIPELINE_DEFAULTS` szótára (új mezőt ott kell felvenni;
 a teszt ellenőrzi, hogy a `/cut-raw` alapértékeivel egyezik). Ismeretlen mezőket a szerver figyelmen kívül hagy.

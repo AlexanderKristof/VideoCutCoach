@@ -17,6 +17,8 @@ Módok (E2E_MODES, alap "dyn_manual,dyn_auto,oracle"):
                sarkai ...) 1,5 px kattintási zajjal, calib_pitch_points-szal
   dyn_auto   – képkockánkénti homográfia, kalibráció nélkül (automatikus kalibráció a vonalakból)
   oracle     – a motor a valós képkockánkénti H-t kapja (referencia)
+  oracle_full – mint az oracle, de a main.py szűrői (pályahatár, követés-épség, labda-priorok) is a
+               valós H-t kapják a pályakövető helyett (szűrő-hangolás a H-sodródástól függetlenül)
   régi módok: static_off / static_on (statikus H a négy – akár képen kívüli – pályasarokból),
               oracle_off / oracle_on (labdakövető nélkül / vele)
 
@@ -83,7 +85,29 @@ MODES = {
     "oracle_off": ("valós H (orákulum), követő nélkül", "landmarks", True, False, True),
     "oracle_on": ("valós H (orákulum) + labdakövető", "landmarks", True, True, True),
 }
+MODES["oracle_full"] = ("valós H a motornak ÉS a main.py szűrőinek", "landmarks", True, True, True)
+# ezekben a módokban a pályakövető helyett is a valós H fut (a szűrők hangolása a H-sodródástól függetlenül)
+ORACLE_TRACKER_MODES = {"oracle_full"}
 MODE_LABELS = {k: v[0] for k, v in MODES.items()}
+
+
+class OraclePitchTracker:
+    """A pitch_tracker.PitchTracker helyettesítője: a valós képkockánkénti H (és képtér-mozgás)."""
+
+    def __init__(self, gt):
+        self.H = [np.array(f["H"], np.float64).reshape(3, 3) for f in gt["frames"]]
+        self.i = -1
+
+    def update(self, frame, boxes=None):
+        self.i += 1
+        return self.H[min(self.i, len(self.H) - 1)], {"status": "ok", "conf": 1.0, "lost": 0, "inliers": 0,
+                                                      "source": "orákulum", "refined": False}
+
+    def frame_motion(self):
+        if self.i <= 0 or self.i >= len(self.H):
+            return None
+        F = np.linalg.inv(self.H[self.i]) @ self.H[self.i - 1]
+        return F / F[2, 2]
 DEFAULT_MODES = "dyn_manual,dyn_auto,oracle"
 
 # Kattintható pályapontok (m): (név, x, y) – a 105x68-as pályán
@@ -455,12 +479,17 @@ def run_mode(main_mod, fake, gt, video, mode):
         else:
             config["calib_pitch_points"] = pitch_pts
             print(f"Kézi kalibráció {len(calib_names)} látható ponttal: {', '.join(calib_names)}")
+    original_cpt = main_mod.create_pitch_tracker
+    if mode in ORACLE_TRACKER_MODES:
+        # a main.py szűrői (pályahatár, követés-épség, labda-priorok) is a valós H-t kapják
+        main_mod.create_pitch_tracker = lambda *a, **k: (OraclePitchTracker(gt), "orákulum (valós H)")
     t0 = time.time()
     try:
         _url, out_path, events_path = main_mod.cut_and_analyze_sync(
             video, 0.0, gt["duration"], True, "team", calib, config)
     finally:
         main_mod.TacticalEngine = original
+        main_mod.create_pitch_tracker = original_cpt
     elapsed = time.time() - t0
     with open(events_path, encoding="utf-8") as f:
         payload = json.load(f)
