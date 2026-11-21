@@ -277,7 +277,7 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
     # --- Pályakövetés: képkockánkénti homográfia mozgó (Veo) kamerához (pitch_tracker.py) ---
     pitch_tracker, pitch_setup_msg = create_pitch_tracker(temp_cut, width, height, fps, start_sec,
                                                           calib_points_str, H, config)
-    pitch_stats = {"ok": 0, "elveszett": 0, "kalibráció szükséges": 0, "finomítás": 0}
+    pitch_stats = {"ok": 0, "bizonytalan": 0, "elveszett": 0, "kalibráció szükséges": 0, "finomítás": 0}
     pitch_boxes = []   # az előző felismerés dobozai (a követés ezeket kitakarja)
     H_cur = H
     # --- /Pályakövetés ---
