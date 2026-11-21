@@ -96,7 +96,8 @@ def install_stubs(fake_model):
     status = types.SimpleNamespace(HTTP_400_BAD_REQUEST=400, HTTP_401_UNAUTHORIZED=401, HTTP_404_NOT_FOUND=404,
                                    HTTP_403_FORBIDDEN=403, HTTP_500_INTERNAL_SERVER_ERROR=500)
     mod("fastapi", FastAPI=_App, Form=lambda default=None, *a, **k: default, Depends=lambda *a, **k: None,
-        HTTPException=_HTTPException, status=status, File=lambda *a, **k: None, UploadFile=object)
+        HTTPException=_HTTPException, status=status, File=lambda *a, **k: None, UploadFile=object,
+        Request=object)
     mod("fastapi.staticfiles", StaticFiles=lambda *a, **k: None)
     mod("fastapi.security", OAuth2PasswordRequestForm=object, OAuth2PasswordBearer=lambda *a, **k: None)
     mod("fastapi.responses", HTMLResponse=lambda *a, **k: None, FileResponse=lambda *a, **k: None,

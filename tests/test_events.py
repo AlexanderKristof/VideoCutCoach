@@ -237,6 +237,120 @@ def test_sweeper():
     check(len(sw) == 1 and sw[0]["team"] == "team1", sw)
 
 
+# ------------------------------------------------ zajtűrés / regressziók
+def test_goal_kick_not_from_ball_behind_goal_line():
+    # Gól után a labda a gólvonal mögött (a hálóban) pihen, majd eltűnik és a középponton jelenik meg:
+    # ez NEM kirúgás (régi hiba: a vonal mögötti labdát "az ötösben állónak" vette)
+    s = Sim()
+    att = P(7, 1, 87.5, 34)
+    gk = P(1, 2, 103.0, 41.0, keeper=True)
+    s.hold(1.0, (88.0, 34.0), [att, gk])
+    s.move((88.0, 34.0), (106.0, 34.5), 25.0, lambda b: [att, gk])
+    s.hold(2.0, (106.0, 34.5), [att, gk])
+    s.hold(3.0, None, [att, gk])
+    s.hold(2.5, (52.5, 34.0), [P(9, 2, 53.5, 34.0), gk])        # középkezdés
+    s.move((52.5, 34.0), (45.0, 30.0), 10.0, lambda b: [gk])
+    s.hold(1.0, (45.0, 30.0), [gk])
+    s.finalize()
+    check(len(s.of_type("goal")) == 1, s.of_type("goal"))
+    check(not s.of_type("gk_goal_kick"), s.of_type("gk_goal_kick"))
+    check(not s.of_type("gk_long_ball") and not s.of_type("gk_short_pass"), s.det.events)
+
+
+def test_goal_kick_timed_at_kick():
+    # Alapvonalon túl -> a labda 3 mp-ig áll az ötösben -> elrúgják: az esemény ideje az elrúgás
+    s = Sim()
+    gk = P(1, 2, 101.0, 39.0, keeper=True)
+    s.hold(1.0, (95.0, 50.0), [gk])
+    s.move((95.0, 50.0), (106.5, 52.0), 12.0, lambda b: [gk])
+    s.hold(2.0, None, [gk])
+    s.hold(3.0, (100.0, 39.0), [gk])
+    t_kick = s.t
+    recv = P(6, 2, 52.0, 30.0)
+    s.move((100.0, 39.0), (52.0, 30.0), 22.0, lambda b: [gk, recv])
+    s.hold(1.0, (52.0, 30.0), [gk, recv])
+    s.finalize()
+    gks = s.of_type("gk_goal_kick")
+    check(len(gks) == 1 and gks[0]["team"] == "team2", gks)
+    check(abs(gks[0]["time"] - t_kick) <= 0.2, (gks, t_kick))
+
+
+def test_keeper_held_ball_projected_behind_line_is_save():
+    # Egykamerás vetítés: a kapus kezében ~1 m magasan tartott labda talajra vetített képe a gólvonal
+    # mögé, a kapufák közé esik. Ez védés, nem gól (a kapus utána kidobja a labdát).
+    s = Sim()
+    att = P(7, 1, 82.5, 36.0)
+    gk = P(1, 2, 98.5, 37.0, keeper=True)
+    s.hold(1.0, (83.0, 36.0), [att, gk])
+    s.move((83.0, 36.0), (98.0, 36.8), 24.0, lambda b: [att, gk])
+    # a kamera (52.5, 74, 7) felől nézve az 1 m magasan tartott labda vetülete: ~(106.2, 30.8)
+    s.hold(2.0, (106.2, 31.0), [att, gk])
+    recv = P(4, 2, 85.0, 50.0)
+    s.move((97.0, 38.0), (85.0, 50.0), 12.0, lambda b: [gk, recv])
+    s.hold(1.0, (85.0, 50.0), [gk, recv])
+    s.finalize()
+    check(not s.of_type("goal"), s.of_type("goal"))
+    saves = s.of_type("gk_save")
+    check(len(saves) == 1 and saves[0]["team"] == "team2", saves)
+    check(len(s.of_type("shot")) == 1, s.of_type("shot"))
+
+
+def test_goal_with_keeper_near_confirmed_by_kickoff():
+    # A kapus a labda mellett vetődik (a gólvonalnál): a gólt csak a középkezdés erősíti meg
+    s = Sim()
+    att = P(7, 1, 87.5, 34)
+    gk = P(1, 2, 104.2, 35.5, keeper=True)
+    s.hold(1.0, (88.0, 34.0), [att, gk])
+    s.move((88.0, 34.0), (105.8, 35.0), 25.0, lambda b: [att, gk])
+    s.hold(0.5, (105.8, 35.0), [att, gk])
+    s.hold(6.0, None, [att, gk])
+    check(not s.of_type("goal"), "középkezdés nélkül még nincs megerősítve")
+    s.hold(2.0, (52.5, 34.0), [P(9, 2, 53.5, 34.0), gk])
+    goals = s.of_type("goal")
+    check(len(goals) == 1 and goals[0]["team"] == "team1", goals)
+    check(goals[0]["confirmation"] == "kickoff" and goals[0]["confidence"] >= 0.9, goals)
+    check(abs(goals[0]["time"] - 1.7) < 0.3, goals)       # az időpont a gólvonal átlépése
+    check(not s.of_type("gk_save"), s.of_type("gk_save"))
+
+
+def test_noisy_shot_and_blips():
+    # Zajos labdapozíció (±0,5 m), kiesések és egy téves felvillanás: egyetlen lövés, nincs gól
+    import random
+    rng = random.Random(3)
+    s = Sim()
+    att = P(7, 1, 84.5, 34)
+    gk = P(1, 2, 103.5, 34.0, keeper=True)
+    for _ in range(25):
+        s.step((85.0 + rng.gauss(0, 0.5), 34.0 + rng.gauss(0, 0.5)), [att, gk])
+    n = 30
+    for i in range(1, n + 1):
+        x, y = 85.0 + 18.0 * i / n, 34.0 + 6.5 * i / n
+        if i in (5, 6, 12, 13, 14):
+            ball = None                        # kiesés
+        elif i == 9:
+            ball = (60.0, 10.0)                # téves felvillanás
+        else:
+            ball = (x + rng.gauss(0, 0.5), y + rng.gauss(0, 0.5))
+        s.step(ball, [att, gk])
+    s.hold(2.0, None, [att, gk])
+    s.finalize()
+    check(len(s.of_type("shot")) == 1, s.of_type("shot"))
+    check(not s.of_type("goal"), s.of_type("goal"))
+
+
+def test_backpass_not_shot():
+    # A védekező csapat játékosa a saját kapusához passzol gyorsan: nem lövés
+    s = Sim()
+    defender = P(3, 1, 25.5, 34.0)
+    gk = P(1, 1, 3.0, 34.0, keeper=True)
+    s.hold(1.0, (25.0, 34.0), [defender, gk])
+    s.move((25.0, 34.0), (3.5, 34.0), 16.0, lambda b: [defender, gk])
+    s.hold(1.0, (3.5, 34.0), [gk])
+    s.finalize()
+    check(not s.of_type("shot"), s.of_type("shot"))
+    check(not s.of_type("gk_save"), s.of_type("gk_save"))
+
+
 def test_engine_integration():
     try:
         import numpy as np
