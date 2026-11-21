@@ -128,14 +128,17 @@ def test_shutdown_cancels_and_marks_jobs():
                 time.sleep(0.02)
 
         stuck_release = threading.Event()
+        stuck_started = threading.Event()
 
         def stuck(progress):  # nem kooperatív (pl. hosszú ffmpeg hívás)
+            stuck_started.set()
             stuck_release.wait(10)
             return {"ok": True}
 
         j1 = jm.submit("coop", coop)
         j2 = jm.submit("stuck", stuck)
         assert started.wait(5)
+        assert stuck_started.wait(5)  # különben a még sorban álló job "cancelled" lesz (időzítési verseny)
         stopped = threading.Event()
 
         class FakeServer:

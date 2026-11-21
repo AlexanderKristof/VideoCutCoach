@@ -70,9 +70,13 @@ def _lab_to_rgb(lab):
     return [int(r), int(g), int(b)]
 
 
-def jersey_descriptor(crop_bgr, grass_lower=None, grass_upper=None):
+def jersey_descriptor(crop_bgr, grass_lower=None, grass_upper=None, grass_model=None, gain=None):
     """
     Mezszín-leíró a játékos dobozának kivágásából.
+    grass_model: adaptív fűmodell (pitch_filters.GrassModel) – ha van, a fű-pixeleket ez szűri ki
+                 a fix HSV tartomány helyett (árnyékos / kifakult fűre is működik);
+    gain: megvilágítás-korrekció (BGR szorzó, GrassModel.illumination_gain) – az árnyékban álló
+          játékos mezét a napos fű szerinti fehéregyensúlyra hozza (árnyéktűrő leíró).
     Visszatér: (leíró float32[DESC_DIM], Lab medián float32[3] (OpenCV 8 bites skála))
     vagy (None, None), ha a kivágás használhatatlan.
     """
@@ -87,12 +91,21 @@ def jersey_descriptor(crop_bgr, grass_lower=None, grass_upper=None):
     if torso.size == 0:
         return None, None
     patch = cv2.resize(torso, PATCH_SIZE, interpolation=cv2.INTER_AREA)
+    keep = np.ones(PATCH_SIZE[0] * PATCH_SIZE[1], dtype=bool)
+    if grass_model is not None and getattr(grass_model, "ready", False):
+        # a fű kiszűrése a korrekció ELŐTT (a modell a kép eredeti színeit ismeri)
+        grass = grass_model.is_grass_pixels(patch.reshape(-1, 3))
+        if (~grass).sum() >= 0.25 * keep.size:
+            keep = ~grass
+    if gain is not None:
+        patch = np.clip(patch.astype(np.float32) * np.asarray(gain, np.float32).reshape(1, 1, 3), 0, 255).astype(np.uint8)
     hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV).reshape(-1, 3)
     lab = cv2.cvtColor(patch, cv2.COLOR_BGR2LAB).reshape(-1, 3)
     n = hsv.shape[0]
 
-    keep = np.ones(n, dtype=bool)
-    if grass_lower is not None and grass_upper is not None and \
+    if grass_model is not None and getattr(grass_model, "ready", False):
+        pass
+    elif grass_lower is not None and grass_upper is not None and \
             not is_full_range(np.asarray(grass_lower), np.asarray(grass_upper)):
         lo, hi = np.asarray(grass_lower), np.asarray(grass_upper)
         grass = np.all((hsv >= lo) & (hsv <= hi), axis=1)
@@ -157,7 +170,7 @@ class _Track:
 
 
 class TeamClassifier:
-    def __init__(self, grass_lower=None, grass_upper=None, swap_teams=False,
+    def __init__(self, grass_lower=None, grass_upper=None, swap_teams=False, grass_model=None,
                  fit_seconds=12.0, max_fit_samples=1500, min_fit_samples=60,
                  refit_step=150, sample_interval_sec=0.2, k=7,
                  merge_ratio=0.8, min_team_tracks=3.5, min_part_frac=0.04, outlier_z=4.0, spread_floor=0.04,
@@ -166,6 +179,7 @@ class TeamClassifier:
                  track_ttl_sec=10.0):
         self.grass_lower = grass_lower
         self.grass_upper = grass_upper
+        self.grass_model = grass_model     # adaptív fűmodell (ha van, a HSV tartomány helyett)
         self.swap_teams = bool(swap_teams)
         self.fit_seconds = fit_seconds
         self.max_fit_samples = max_fit_samples
@@ -359,9 +373,10 @@ class TeamClassifier:
             return None
         return 1 if s1 / n1 <= s2 / n2 else 2
 
-    def observe(self, track_id, crop_bgr, t, pitch_xy=None, model_keeper=False):
+    def observe(self, track_id, crop_bgr, t, pitch_xy=None, model_keeper=False, illum_gain=None):
         """
-        Egy detektálás feldolgozása. Visszatér:
+        Egy detektálás feldolgozása. illum_gain: megvilágítás-korrekció (BGR szorzó, lásd
+        pitch_filters.GrassModel.illumination_gain) – árnyékban álló játékosnál. Visszatér:
         {"team_id": 1/2/None, "role": "player"|"keeper"|"referee"|"other"|"unknown",
          "is_keeper": bool, "is_referee": bool, "color_team": 1/2/None, "fitted": bool}
         """
@@ -369,7 +384,8 @@ class TeamClassifier:
         if self._t0 is None:
             self._t0 = t
         self._prune(t)
-        desc, lab = jersey_descriptor(crop_bgr, self.grass_lower, self.grass_upper)
+        desc, lab = jersey_descriptor(crop_bgr, self.grass_lower, self.grass_upper,
+                                      grass_model=self.grass_model, gain=illum_gain)
         px = None if pitch_xy is None else float(pitch_xy[0])
 
         tr = None

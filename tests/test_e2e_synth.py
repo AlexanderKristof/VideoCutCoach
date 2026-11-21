@@ -37,7 +37,10 @@ Környezeti változók:
   E2E_DROP_UNTRACKED=0 (az ál-ByteTrack ne dobja el a meg nem erősített dobozokat – alapból eldobja,
   mint az ultralytics model.track()), E2E_MIN_H_PCT (min. játékosmagasság, alap a /cut-raw alapértéke),
   E2E_BALL_EXTRA_PASS=1 (külön labda-menet), E2E_FRAMES_DIR (annotált kimeneti képkockák JPG-be,
-  dinamikus módokban), E2E_COMPARE (egy korábbi e2e_summary.json: előtte -> utána összesítés)
+  dinamikus módokban), E2E_COMPARE (egy korábbi e2e_summary.json: előtte -> utána összesítés),
+  E2E_DEGRADE (képromlások a szintetikus videón, lásd tools/synth_match.py: pl. "rossz", "arnyek",
+  "nap", "esti", "tomorites=42", "arnyek=0.5,nap=0.8,zaj=6,elmosodas=1" – a ground truth nem változik),
+  E2E_AUTO_TEAMS=1 (nincs kézi csapat-HSV: az automatikus csapatba sorolás fut, mint a /cut-raw alapból)
 
 A teszt csak laza épség-küszöböket ellenőriz (mérőeszköz), a teljes táblázatot kiírja.
 Ha valamelyik előfeltétel hiányzik (cv2, numpy, ffmpeg), a teszt kihagyva (0-s kilépési kóddal) ér véget.
@@ -493,12 +496,35 @@ def _default_min_h_pct():
         return 0.022
 
 
+def parse_degrade(spec):
+    """E2E_DEGRADE -> synth_match rontás-szótár. "rossz" = az előre beállított csomag; "név" vagy "név=érték"."""
+    if not spec:
+        return None
+    kw = {"rossz": False}
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        name, _, val = part.partition("=")
+        name = name.strip().lower()
+        if name == "rossz":
+            kw["rossz"] = True
+        elif name == "esti":
+            kw["esti"] = True
+        elif name in ("arnyek", "nap", "tomorites", "zaj", "elmosodas"):
+            default = {"arnyek": 0.5, "nap": 1.0, "tomorites": 42, "zaj": 6.0, "elmosodas": 1.0}[name]
+            kw[name] = (int(val) if name == "tomorites" else float(val)) if val else default
+        else:
+            raise SystemExit(f"Ismeretlen rontás: {name}")
+    return synth_match.degrade_options(**kw)
+
+
 def base_config(gt, tracker_on, dynamic=True):
     period = (gt.get("periods") or [{}])[0]
     kits = synth_match.KITS
     t1, t2 = click_range(kits["team1"]["shirt"]), click_range(kits["team2"]["shirt"])
     k1, k2 = click_range(kits["keeper1"]["shirt"]), click_range(kits["keeper2"]["shirt"])
-    return {
+    cfg = {
         "team1_attacks_right": bool(period.get("team1_attacks_right", True)),
         "review_export": False,
         "roi_top_pct": 0.28, "roi_bottom_pct": 0.10, "min_player_height_pct": _default_min_h_pct(),
@@ -515,6 +541,12 @@ def base_config(gt, tracker_on, dynamic=True):
         "dynamic_homography": dynamic, "draw_pitch_overlay": True,
         "ball_extra_pass": os.environ.get("E2E_BALL_EXTRA_PASS") == "1",
     }
+    if os.environ.get("E2E_AUTO_TEAMS") == "1":
+        # nincs kézi csapat-/kapus-HSV: automatikus csapatba sorolás (a /cut-raw alapértéke)
+        for k in ("team1", "team2", "keeper1", "keeper2"):
+            cfg[f"{k}_lower"], cfg[f"{k}_upper"] = [0, 0, 0], [179, 255, 255]
+        cfg["auto_teams"] = True
+    return cfg
 
 
 def run_mode(main_mod, fake, gt, video, mode):
@@ -572,6 +604,7 @@ def run_mode(main_mod, fake, gt, video, mode):
     with open(events_path, encoding="utf-8") as f:
         payload = json.load(f)
     return {"records": Engine.records, "static_H": Engine.static_H, "events": payload["events"],
+            "video_quality": payload.get("video_quality"), "grass_model": payload.get("grass_model"),
             "elapsed": elapsed, "fake_stats": dict(fake.stats), "out_video": out_path,
             "pitch_tracking": payload.get("pitch_tracking"), "calib_names": calib_names,
             "min_h_pct": config["min_player_height_pct"], "own_backend_stats": own_stats}
@@ -774,13 +807,18 @@ def main():
     keep = os.environ.get("E2E_WORKDIR")
     workdir = os.path.abspath(keep) if keep else tempfile.mkdtemp(prefix="e2e_synth_")
     os.makedirs(workdir, exist_ok=True)
-    video = os.path.join(workdir, f"synth_{seed}_{int(duration)}s_{width}x{height}.mp4")
+    degrade = parse_degrade(os.environ.get("E2E_DEGRADE", ""))
+    tag = "" if not degrade else "_" + "_".join(f"{k}{v if v is not True else ''}" for k, v in sorted(degrade.items()))
+    video = os.path.join(workdir, f"synth_{seed}_{int(duration)}s_{width}x{height}{tag}.mp4")
     gt_path = os.path.splitext(video)[0] + "_gt.json"
     cwd = os.getcwd()
     try:
         if not (os.environ.get("E2E_REUSE") and os.path.exists(video) and os.path.exists(gt_path)):
             print(f"Szintetikus meccs generálása: {video}")
-            synth_match.generate(video, gt_path, duration=duration, width=width, height=height, fps=25, seed=seed)
+            synth_match.generate(video, gt_path, duration=duration, width=width, height=height, fps=25, seed=seed,
+                                 degrade=degrade)
+        if degrade:
+            print(f"Képromlások: {degrade}")
         with open(gt_path, encoding="utf-8") as f:
             gt = json.load(f)
         if not gt["calibration_first_frame"].get("all_in_front_of_camera", True):
@@ -804,7 +842,13 @@ def main():
                 "elapsed": r["elapsed"], "fake_stats": r["fake_stats"],
                 "detected_events": [{k: e.get(k) for k in ("type", "time", "team", "confirmed", "confirmation")} for e in r["events"]],
                 "pitch_tracking": r["pitch_tracking"], "calib_names": r["calib_names"],
+                "video_quality": r.get("video_quality"), "grass_model": r.get("grass_model"),
+                "event_reliability": [e.get("reliability") for e in r["events"]],
             }
+            if r.get("video_quality"):
+                print(r["video_quality"].get("summary_text"))
+            if r.get("grass_model"):
+                print(r["grass_model"])
             if frames_dir and r["out_video"] and not oracle_mode(mode) and MODES[mode][4]:
                 n = gt["n_frames"]
                 for path in save_annotated_frames(r["out_video"], frames_dir, mode, [int(n * 0.35), int(n * 0.7)]):

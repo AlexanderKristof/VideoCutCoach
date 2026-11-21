@@ -248,7 +248,27 @@ class ReviewExporter:
         ev['next_t'] = (pre[-1][0] if pre else t) + self.sample_step / self.fps
         self.pending.append(ev)
 
-    def close(self):
+    @staticmethod
+    def _quality_html(q):
+        """A videóminőség-összesítő (video_quality.VideoQualityMonitor.summary()) sávja az index.html tetején."""
+        if not q or not q.get("grade"):
+            return ""
+        colors = {"A": "#1f6f3a", "B": "#6f6a1f", "C": "#8a4d12", "D": "#7a1f1f"}
+        issues = [f"{html.escape(k)}: {v:.0f}%" for k, v in (q.get("issue_time_pct") or {}).items() if v > 0]
+        segs = []
+        for sg in (q.get("worst_segments") or [])[:5]:
+            segs.append(f"<li>{fmt_time(sg['start_sec'])}–{fmt_time(sg['end_sec'])}: {html.escape(sg['label'])} "
+                        f"(megbízhatóság {sg['min_reliability']:.2f})</li>")
+        return (f"<div class='q' style='background:{colors.get(q['grade'], '#333')}'>"
+                f"<b>Videóminőség: {html.escape(q['grade'])} – {html.escape(q.get('label', ''))}</b> · "
+                f"átlagos megbízhatóság {q.get('mean_reliability', 0):.2f}"
+                + (f"<br>A klip idejéből képhibás: {', '.join(issues)}" if issues else "<br>Jelentős képhiba nem volt.")
+                + (f"<ul>{''.join(segs)}</ul>" if segs else "")
+                + "<small>A gyenge minőségű szakaszokon az események megbízhatósága kisebb "
+                  "(lásd az események 'reliability' mezőjét).</small></div>")
+
+    def close(self, video_quality=None):
+        """Lezárás: index.json / index.html. video_quality: a minőség-összesítő (sáv az index tetején)."""
         for ev in self.pending:
             if ev['tiles']:
                 self._finish_event(ev)
@@ -257,7 +277,7 @@ class ReviewExporter:
         self.sheets.sort(key=lambda s: (s['kind'] != 'overview', s['time']))
 
         with open(os.path.join(self.out_dir, "index.json"), "w", encoding="utf-8") as f:
-            json.dump({"sheets": self.sheets}, f, ensure_ascii=False, indent=2)
+            json.dump({"sheets": self.sheets, "video_quality": video_quality}, f, ensure_ascii=False, indent=2)
 
         rows = []
         for s in self.sheets:
@@ -268,7 +288,9 @@ class ReviewExporter:
                 "<meta name='viewport' content='width=device-width,initial-scale=1'>"
                 "<title>Elemzés áttekintő</title><style>body{font-family:sans-serif;background:#111;color:#eee;"
                 "margin:0;padding:12px}img{width:100%;height:auto;border:1px solid #444}"
-                "h3{font-size:15px;margin:18px 0 6px}</style></head><body><h1>Elemzés áttekintő</h1>"
+                "h3{font-size:15px;margin:18px 0 6px}.q{padding:10px 14px;border-radius:6px;margin:8px 0 16px;"
+                "font-size:14px;line-height:1.5}.q ul{margin:6px 0 4px 18px;padding:0}</style></head><body>"
+                "<h1>Elemzés áttekintő</h1>" + self._quality_html(video_quality)
                 + "".join(rows) + "</body></html>")
         with open(os.path.join(self.out_dir, "index.html"), "w", encoding="utf-8") as f:
             f.write(page)
