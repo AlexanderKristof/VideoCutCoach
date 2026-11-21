@@ -115,7 +115,7 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    engine_instance = TacticalEngine()
+    engine_instance = TacticalEngine(team1_attacks_right=config.get("team1_attacks_right", True))
 
     H = None
     if calib_points_str:
@@ -239,6 +239,9 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
                         timeline_events.append({
                             "type": "gk_positioning_error",
                             "time": round(current_time_sec, 2),
+                            "team": engine_instance.keeper_team_near(gk_real_coords),
+                            "start_sec": round(max(0.0, current_time_sec - 4.0), 2),
+                            "end_sec": round(current_time_sec + 3.0, 2),
                             "desc": f"Kapus helyezkedési hiba: {gk_eval['bisector_offset_m']} m eltolódás"
                         })
 
@@ -253,9 +256,14 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
     if os.path.exists(temp_cut):
         os.remove(temp_cut)
 
+    # Lövés/gól/kapus események lezárása és összefésülése a helyezkedési hibákkal (idő szerint rendezve)
+    engine_instance.finalize(start_sec + frames_done / fps)
+    timeline_events = engine_instance.merge_timeline(timeline_events)
+
     analysis_payload = {
         "events": timeline_events,
-        "match_stats": engine_instance.stats
+        "match_stats": engine_instance.stats,
+        "source": {"video_path": video_path, "start_sec": start_sec, "end_sec": end_sec}
     }
     with open(events_path, 'w', encoding='utf-8') as f:
         json.dump(analysis_payload, f, ensure_ascii=False, indent=4)
@@ -278,9 +286,11 @@ async def cut_raw_endpoint(
     team1_hsv_lower: str = Form("0,0,0"), team1_hsv_upper: str = Form("179,255,255"),
     team2_hsv_lower: str = Form("0,0,0"), team2_hsv_upper: str = Form("179,255,255"),
     keeper1_hsv_lower: str = Form("0,0,0"), keeper1_hsv_upper: str = Form("179,255,255"),
-    keeper2_hsv_lower: str = Form("0,0,0"), keeper2_hsv_upper: str = Form("179,255,255")
+    keeper2_hsv_lower: str = Form("0,0,0"), keeper2_hsv_upper: str = Form("179,255,255"),
+    team1_attacks_right: bool = Form(True)
 ):
     config = {
+        "team1_attacks_right": team1_attacks_right,
         "roi_top_pct": roi_top_pct, "roi_bottom_pct": roi_bottom_pct, "min_player_height_pct": min_player_height_pct,
         "grass_lower": [int(x) for x in grass_hsv_lower.split(',')], "grass_upper": [int(x) for x in grass_hsv_upper.split(',')],
         "ref_lower": [int(x) for x in ref_hsv_lower.split(',')], "ref_upper": [int(x) for x in ref_hsv_upper.split(',')],
@@ -360,21 +370,88 @@ async def get_frame_time_endpoint(video_path: str = Form(...), time_sec: float =
         return {"status": "success", "frame_url": f"/clips/{filename}"}
     return {"status": "error"}
 
+GK_TIMELINE_TYPES = ("gk_save", "gk_claim_cross", "gk_goal_kick", "gk_long_ball", "gk_short_pass",
+                     "gk_conceded", "gk_sweeper", "gk_positioning_error")
+GK_TEAM_NAMES = {"team1": "Hazai Kapus", "team2": "Vendég Kapus"}
+
+def _find_events_file(video_path, start_sec, end_sec):
+    """A /cut-raw által készített legfrissebb, ugyanarra a videóra (és átfedő időszakra) vonatkozó events JSON."""
+    if not video_path:
+        return None
+    try:
+        candidates = [os.path.join(CLIPS_DIR, f) for f in os.listdir(CLIPS_DIR)
+                      if f.startswith("events_") and f.endswith(".json")]
+    except OSError:
+        return None
+    target = os.path.normcase(os.path.abspath(video_path))
+    for path in sorted(candidates, key=os.path.getmtime, reverse=True):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                src = json.load(f).get("source") or {}
+        except (OSError, ValueError):
+            continue
+        if not src.get("video_path"):
+            continue
+        if os.path.normcase(os.path.abspath(src["video_path"])) != target:
+            continue
+        if start_sec is not None and end_sec is not None:
+            if src.get("end_sec", end_sec) < start_sec or src.get("start_sec", start_sec) > end_sec:
+                continue
+        return path
+    return None
+
 @app.post("/detect-goalkeepers")
-async def detect_goalkeepers_endpoint(video_path: str = Form(...), start_sec: float = Form(0.0), end_sec: float = Form(30.0)):
-    return {
-        "status": "success",
-        "goalkeepers": [
-            {
-                "name": "Hazai Kapus (ID #1)",
-                "events": [{"start_sec": start_sec, "end_sec": min(start_sec + 60.0, end_sec)}]
-            },
-            {
-                "name": "Vendég Kapus (ID #2)",
-                "events": [{"start_sec": max(start_sec, end_sec - 60.0), "end_sec": end_sec}]
-            }
-        ]
-    }
+async def detect_goalkeepers_endpoint(
+    video_path: str = Form(""),
+    start_sec: Optional[float] = Form(None),
+    end_sec: Optional[float] = Form(None),
+    events_path: str = Form("")
+):
+    """A kapus eseményeket egy korábbi /cut-raw elemzés events JSON-jából adja vissza kapusonként (csapatonként) csoportosítva."""
+    path = events_path if events_path and os.path.exists(events_path) else _find_events_file(video_path, start_sec, end_sec)
+    if not path:
+        return {"status": "success", "goalkeepers": [],
+                "message": "Nem található elemzés ehhez a videóhoz. Előbb futtasd az elemzést (/cut-raw, fejlesztői módban)."}
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            events = json.load(f).get("events", [])
+    except (OSError, ValueError) as ex:
+        return {"status": "success", "goalkeepers": [], "message": f"Az eseményfájl nem olvasható: {ex}"}
+
+    groups = {}
+    for ev in events:
+        if ev.get("type") not in GK_TIMELINE_TYPES:
+            continue
+        t = float(ev.get("time", 0.0))
+        if start_sec is not None and t < start_sec:
+            continue
+        if end_sec is not None and t > end_sec:
+            continue
+        item = {
+            "start_sec": ev.get("start_sec", round(max(0.0, t - 4.0), 2)),
+            "end_sec": ev.get("end_sec", round(t + 3.0, 2)),
+            "type": ev.get("type"),
+            "time": t,
+            "desc": ev.get("desc", "")
+        }
+        if ev.get("keeper_track_id") is not None:
+            item["keeper_track_id"] = ev["keeper_track_id"]
+        groups.setdefault(ev.get("team") or "ismeretlen", []).append(item)
+
+    goalkeepers = [
+        {
+            "name": GK_TEAM_NAMES.get(team, "Ismeretlen kapus"),
+            "team": team,
+            "events": sorted(groups[team], key=lambda e: e["time"])
+        }
+        for team in sorted(groups.keys(), key=lambda k: (k not in GK_TEAM_NAMES, k))
+    ]
+
+    result = {"status": "success", "goalkeepers": goalkeepers, "events_path": os.path.abspath(path)}
+    if not goalkeepers:
+        result["message"] = "Az elemzésben nem található kapus esemény."
+    return result
 
 @app.post("/burn-drawings")
 async def burn_drawings_endpoint(
