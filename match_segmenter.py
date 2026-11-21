@@ -23,6 +23,8 @@ import cv2
 import numpy as np
 
 from pitch_filters import build_grass_mask
+import background
+import fast_cut
 
 # Az ffmpeg futtatható állomány neve – FFMPEG_PATH környezeti változóval felülírható.
 # Windows-on (a kliens gépén) alapból "ffmpeg.exe", máshol (pl. teszt) "ffmpeg".
@@ -252,7 +254,7 @@ def extract_audio_features(video_path, ffmpeg_bin=None, sr=AUDIO_SR, chunk_sec=3
     n = int(round(0.05 * sr))
     hop = int(round(0.025 * sr))
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        proc = background.popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except (FileNotFoundError, OSError) as ex:
         return None, f"ffmpeg nem indítható ({ffmpeg_bin}): {ex}"
 
@@ -363,7 +365,7 @@ def _iter_frames_ffmpeg(video_path, sample_fps, out_w, out_h, ffmpeg_bin):
     cmd = [ffmpeg_bin, "-v", "error", "-nostdin", "-i", video_path, "-an", "-sn",
            "-vf", f"fps={sample_fps},scale={out_w}:{out_h}",
            "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    proc = background.popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     size = out_w * out_h * 3
     try:
         while True:
@@ -805,49 +807,54 @@ def detect_match_halves(video_path, expected_half_min=45.0, person_counter: Opti
 
 
 # ============================================================
-# Vágás ffmpeg-gel (stream copy) + összefűzés szünet nélkül
+# Vágás (képkocka-pontos smart cut, fast_cut.py) + összefűzés szünet nélkül
 # ============================================================
 
 def cut_segment(video_path, start_sec, end_sec, out_path, ffmpeg_bin=None):
-    """Szakasz kivágása újrakódolás nélkül (-ss az -i előtt: gyors, kulcskockához igazodik)."""
-    ffmpeg_bin = ffmpeg_bin or FFMPEG_BIN
-    cmd = [ffmpeg_bin, "-y", "-v", "error", "-nostdin", "-ss", f"{start_sec:.3f}", "-i", video_path,
-           "-t", f"{max(0.1, end_sec - start_sec):.3f}", "-map", "0:v:0?", "-map", "0:a:0?",
-           "-c", "copy", "-avoid_negative_ts", "make_zero", out_path]
-    res = subprocess.run(cmd, capture_output=True)
-    if res.returncode != 0 or not os.path.exists(out_path):
-        raise RuntimeError(f"ffmpeg vágási hiba: {res.stderr.decode('utf-8', 'ignore')[:300]}")
-    return out_path
-
-
-def concat_segments(paths, out_path, work_dir, ffmpeg_bin=None):
-    """Több szakasz összefűzése (concat demuxer, ideiglenes listafájllal, újrakódolás nélkül)."""
-    ffmpeg_bin = ffmpeg_bin or FFMPEG_BIN
-    list_path = os.path.join(work_dir, f"concat_{uuid.uuid4().hex[:8]}.txt")
-    with open(list_path, "w", encoding="utf-8") as f:
-        for p in paths:
-            safe = os.path.abspath(p).replace("\\", "/").replace("'", "'\\''")
-            f.write(f"file '{safe}'\n")
-    try:
-        cmd = [ffmpeg_bin, "-y", "-v", "error", "-nostdin", "-f", "concat", "-safe", "0",
-               "-i", list_path, "-c", "copy", out_path]
-        res = subprocess.run(cmd, capture_output=True)
-        if res.returncode != 0 or not os.path.exists(out_path):
-            raise RuntimeError(f"ffmpeg összefűzési hiba: {res.stderr.decode('utf-8', 'ignore')[:300]}")
-    finally:
-        if os.path.exists(list_path):
-            os.remove(list_path)
-    return out_path
-
-
-def cut_match_halves(video_path, halves, out_dir, padding_sec=5.0, duration_sec=None, ffmpeg_bin=None):
     """
-    A félidők kivágása és a szünet nélküli teljes meccs elkészítése.
+    Szakasz kivágása képkocka-pontosan: csak a kezdő / záró kulcskockáig tartó rövid részt
+    kódolja újra, a többit stream copy-val másolja (fast_cut.smart_cut). Ha a forrás nem
+    alkalmas (VFR, szokatlan profil, ...), teljes újrakódolásra vált.
+    Visszatér: az útvonal; a vágás részletei a cut_segment.last_info-ban.
+    """
+    ffmpeg_bin = ffmpeg_bin or FFMPEG_BIN
+    try:
+        info = fast_cut.smart_cut(video_path, start_sec, end_sec, out_path, ffmpeg_bin=ffmpeg_bin)
+    except (RuntimeError, ValueError) as ex:
+        raise RuntimeError(f"ffmpeg vágási hiba: {str(ex)[:300]}")
+    cut_segment.last_info = info
+    if not os.path.exists(out_path):
+        raise RuntimeError("ffmpeg vágási hiba: a kimeneti fájl nem jött létre")
+    return out_path
+
+
+cut_segment.last_info = None
+
+
+def concat_segments(paths, out_path, work_dir=None, ffmpeg_bin=None):
+    """Több szakasz összefűzése (újrakódolás nélkül, ellenőrzéssel; hibánál újrakódolva)."""
+    ffmpeg_bin = ffmpeg_bin or FFMPEG_BIN
+    try:
+        fast_cut.concat_files(paths, out_path, ffmpeg_bin=ffmpeg_bin)
+    except (RuntimeError, OSError) as ex:
+        raise RuntimeError(f"ffmpeg összefűzési hiba: {str(ex)[:300]}")
+    if not os.path.exists(out_path):
+        raise RuntimeError("ffmpeg összefűzési hiba: a kimeneti fájl nem jött létre")
+    return out_path
+
+
+def cut_match_halves(video_path, halves, out_dir, padding_sec=5.0, duration_sec=None, ffmpeg_bin=None,
+                     on_part=None):
+    """
+    A félidők kivágása és a szünet nélküli teljes meccs elkészítése (képkocka-pontosan).
     halves: {"first_half": {"start_sec","end_sec"}, "second_half": {...} vagy None}
-    Visszatér: {"first_half": útvonal, "second_half": útvonal vagy None, "full_match": útvonal}
+    on_part(kulcs, útvonal): minden elkészült fájl után (pl. hogy a kliens már a kész félidőt
+    lejátszhassa, mielőtt a teljes meccs elkészül); a kulcs "first_half" / "second_half" / "full_match".
+    Visszatér: {"first_half": útvonal, "second_half": útvonal vagy None, "full_match": útvonal,
+                "cut_modes": {kulcs: "copy" / "smart" / "full"}}
     """
     clip_id = uuid.uuid4().hex[:8]
-    out = {"first_half": None, "second_half": None, "full_match": None}
+    out = {"first_half": None, "second_half": None, "full_match": None, "cut_modes": {}}
     parts = []
     for key, name in (("first_half", "half1"), ("second_half", "half2")):
         h = halves.get(key)
@@ -861,11 +868,20 @@ def cut_match_halves(video_path, halves, out_dir, padding_sec=5.0, duration_sec=
             continue
         path = os.path.abspath(os.path.join(out_dir, f"{name}_{clip_id}.mp4"))
         cut_segment(video_path, s, e, path, ffmpeg_bin)
+        out["cut_modes"][key] = (cut_segment.last_info or {}).get("mode")
         out[key] = path
         parts.append(path)
+        if on_part is not None:
+            on_part(key, path)
     if not parts:
         raise RuntimeError("Nincs kivágható szakasz.")
     full = os.path.abspath(os.path.join(out_dir, f"match_{clip_id}.mp4"))
-    concat_segments(parts, full, out_dir, ffmpeg_bin)
+    if len(parts) == 1:
+        import shutil
+        shutil.copyfile(parts[0], full)  # egy félidő: a meccsvideó maga a félidő
+    else:
+        concat_segments(parts, full, out_dir, ffmpeg_bin)
     out["full_match"] = full
+    if on_part is not None:
+        on_part("full_match", full)
     return out

@@ -55,6 +55,13 @@ Hasznos kapcsolók (`python elemzes.py --help`):
 - `--kalibracio "x,y;x,y;x,y;x,y"` és `--kalibracio-pontok "..."` – kézi pályakalibráció
   (nélküle a program a pályavonalakból kalibrál)
 - `--csapat1-balra` – ha a hazai csapat az 1. félidőben balra támad
+- `--hatterben` – laptopon: alacsony prioritás és kevés szál, hogy közben dolgozni lehessen
+  (`--szalak N` a szálszámot is megadja)
+
+**Gyors vágás:** a félidők, a meccsvideó és a klipek képkocka-pontosan, mégis percek alatt készülnek
+(csak a vágási pontoknál lévő rövid rész kódolódik újra, hardveres kódolóval, ha van). A szerveres
+háttérfeladatnál (`/jobs/analyze-match`) a vágott meccsvideó már az elemzés közben elérhető, a feladat
+szüneteltethető (`/jobs/{id}/pause`, `/resume`). Részletek: `docs/HATTERFELADATOK.md`.
 
 **Asztali alkalmazásként (MAUI-ból indítva, Python nélkül):** a motor PyInstallerrel önálló
 programmá csomagolható (`packaging\build_engine.ps1`); a MAUI a `tacanaly_engine.exe --port 0
@@ -76,7 +83,7 @@ Fejlesztéshez ugyanez: `python engine_launcher.py --port 0 --data-dir adat --co
 ## Dokumentáció
 
 - `docs/FEJLESZTESI_TERV.md` – a teljes felépítés, minden végpont mezőkkel
-- `docs/HATTERFELADATOK.md` – háttérfeladatok (haladásjelzés a MAUI-ban), parancssor
+- `docs/HATTERFELADATOK.md` – háttérfeladatok (haladásjelzés, szüneteltetés, háttér-mód), gyors vágás, parancssor
 - `docs/MODELL_BEALLITAS.md` – modell, gyors mód, osztálynevek
 - `packaging/README_CSOMAGOLAS.md` – telepítő, a motor indítása / leállítása a MAUI-ból, licencek
 
@@ -86,6 +93,7 @@ Videókártya és YOLO nélkül is futnak (szintetikus adatokon):
 ```powershell
 python tests\test_events.py
 python tests\test_pitch_tracker.py
+python tests\test_fast_cut.py      (ffmpeg + ffprobe kell; a vágás pontossága és sebessége)
 ```
 `tools/synth_match.py` valósághű, forgó kamerás tesztmeccset készít ismert eseményekkel;
 `tests/test_e2e_synth.py` ezen méri a teljes lánc pontosságát.
