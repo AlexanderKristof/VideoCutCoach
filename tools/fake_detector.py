@@ -11,10 +11,15 @@ A synth_match.py ground-truth JSON-jából állít elő "detektálásokat" való
   * a detektálás azonosító nélküli; a track() egy egyszerű, ByteTrack-szerű IoU követővel ad
     azonosítót – és az ultralytics-hez hasonlóan a nem követett (meg nem erősített) dobozokat
     a track() eredményéből elhagyja (ez a gyors, ritkán detektált labdát is érinti!).
+  * callback-mechanizmus az ultralytics mintájára (model.add_callback / model.callbacks): a
+    követést az első track() hívásnál regisztrált 'on_predict_postprocess_end' callback végzi,
+    a korábban regisztrált (saját) callbackek még a NYERS predictor.results-ot látják
+    (lásd main.py, NYERS LABDA-DETEKTÁLÁSOK, és docs/MODELL_BEALLITAS.md).
 
 Az interfész a main.py által használt részhalmaz:
     model.names, model.track(frame, persist=True, tracker=..., device=..., verbose=False),
-    model.predict(...), model(...), model.predictor.trackers[i].reset()
+    model.predict(...), model(...), model.predictor.trackers[i].reset(),
+    model.add_callback(event, func), model.callbacks, predictor.results (a callbackekben)
     results[i].boxes: iterálható; box.cls[0], box.conf[0], box.xyxy[0], box.id (None vagy [id]),
     valamint boxes.id (None, ha nincs követés), boxes.cls / .conf / .xyxy tömbök, len(boxes).
 
@@ -208,6 +213,8 @@ class SimpleByteTrack:
 class _Predictor:
     def __init__(self, owner):
         self.trackers = [_TrackerProxy(owner)]
+        self.results = []      # ultralytics: a postprocess utáni eredmények (a callbackek ezt látják)
+        self.callbacks = owner.callbacks   # ultralytics: a Model és a predictor ugyanazt a dict-et használja
 
 
 class _TrackerProxy:
@@ -232,6 +239,10 @@ class FakeYOLO:
         self.profile.update(profile or {})
         self.drop_untracked = drop_untracked
         self.tracker = SimpleByteTrack()
+        # ultralytics: Model.callbacks (esemény -> függvénylista, regisztrálási sorrendben fut)
+        self.callbacks = {"on_predict_start": [], "on_predict_postprocess_end": []}
+        self._tracker_registered = False
+        self._last_frame = None    # (képkocka objektum id, idx, dets) – az ugyanarra a képre hívott predict()-hez
         self.predictor = _Predictor(self)
         self.gt = None
         self.frame_offset = 0
@@ -255,6 +266,7 @@ class FakeYOLO:
     def reset(self):
         self.tracker.reset()
         self.calls = 0
+        self._last_frame = None
         self._miss_state = {}
         self._ball_missed = False
         for k in self.stats:
@@ -386,15 +398,25 @@ class FakeYOLO:
         self.calls += 1
         return idx
 
-    def track(self, frame=None, persist=True, **kwargs):
-        idx = self._next_idx()
-        shape = getattr(frame, "shape", None)
-        dets = self.detect_frame(idx, shape)
+    def add_callback(self, event, func):
+        """ultralytics Model.add_callback: a függvény a lista VÉGÉRE kerül (regisztrálási sorrend)."""
+        self.callbacks.setdefault(event, []).append(func)
+
+    def _run_callbacks(self, event):
+        for cb in list(self.callbacks.get(event, [])):
+            cb(self.predictor)
+
+    def _tracker_postprocess(self, predictor):
+        """
+        Az ultralytics trackers/track.py on_predict_postprocess_end megfelelője: a követő a
+        predictor.results dobozait frissíti, és az eredményt a követett dobozokra cseréli
+        (a meg nem erősített dobozok – köztük a legtöbb labda – kiesnek).
+        """
+        dets = predictor._dets
         pairs = self.tracker.update([(d[0], d[1], d[3]) for d in dets])
         if not pairs:
-            # ultralytics: ha egyetlen követés sincs, a detektálások azonosító nélkül maradnak
-            boxes = [FakeBox(d[2], d[1], d[0]) for d in dets]
-            return [FakeResult(boxes, False, self.names)]
+            # ultralytics: ha egyetlen követés sincs, az eredmény változatlan (azonosító nélkül)
+            return
         ids = dict(pairs)
         boxes = []
         for i, d in enumerate(dets):
@@ -404,11 +426,31 @@ class FakeYOLO:
                 boxes.append(FakeBox(d[2], d[1], d[0], -1))
             elif d[3] == "ball":
                 self.stats["ball_dropped_by_tracker"] += 1
-        return [FakeResult(boxes, True, self.names)]
+        predictor.results[0] = FakeResult(boxes, True, self.names)
 
-    def predict(self, frame=None, classes=None, conf=0.0, **kwargs):
+    def track(self, frame=None, persist=True, **kwargs):
+        if not self._tracker_registered:
+            # ultralytics Model.track(): register_tracker() az ELSŐ track() hívásnál fűzi a
+            # követő callbackjét a listához – az addig regisztrált callbackek előtte futnak
+            self.add_callback("on_predict_postprocess_end", self._tracker_postprocess)
+            self._tracker_registered = True
         idx = self._next_idx()
         dets = self.detect_frame(idx, getattr(frame, "shape", None))
+        self._last_frame = (id(frame), idx, dets)
+        self._run_callbacks("on_predict_start")
+        # nyers (követés előtti) eredmény: minden detektálás, azonosító nélkül
+        self.predictor._dets = dets
+        self.predictor.results = [FakeResult([FakeBox(d[2], d[1], d[0]) for d in dets], False, self.names)]
+        self._run_callbacks("on_predict_postprocess_end")
+        return self.predictor.results
+
+    def predict(self, frame=None, classes=None, conf=0.0, **kwargs):
+        # Ugyanarra a képkockára hívott predict() (pl. külön labda-menet) ugyanazt a GT képkockát kapja
+        if self._last_frame is not None and frame is not None and self._last_frame[0] == id(frame):
+            dets = self._last_frame[2]
+        else:
+            idx = self._next_idx()
+            dets = self.detect_frame(idx, getattr(frame, "shape", None))
         boxes = [FakeBox(d[2], d[1], d[0]) for d in dets
                  if d[1] >= conf and (classes is None or d[2] in classes)]
         return [FakeResult(boxes, False, self.names)]

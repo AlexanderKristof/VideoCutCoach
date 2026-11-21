@@ -915,6 +915,7 @@ class PitchTracker:
         self.source = None
         self.frame_idx = -1
         self.prev_gray = None
+        self.last_F = None       # utolsó képkockák közti mozgás (feldolgozási felbontás), lásd frame_motion()
         self.prev_mask = None
         self.lost = 0            # egymás utáni sikertelen mozgásbecslések / rossz illesztések
         self.since_refine = 0
@@ -935,6 +936,19 @@ class PitchTracker:
         self.lost = 0
         self.conf = max(self.conf, 0.5)
         self.since_refine = self.refine_every   # az első képkockán rögtön finomítunk
+
+    def frame_motion(self):
+        """
+        A legutóbbi update() képkockák közti mozgása teljes felbontásban: 3x3 homográfia, ami az
+        ELŐZŐ kép pixelét az AKTUÁLIS kép pixelébe viszi (a vonal-finomítás korrekciója nélkül –
+        tisztán a képtartalom mozgása; a forgó kameránál a levegőben lévő labdára is érvényes).
+        None, ha nincs előző kép vagy a mozgásbecslés sikertelen volt.
+        """
+        F = getattr(self, "last_F", None)
+        if F is None:
+            return None
+        Ff = np.linalg.inv(self.S) @ F @ self.S
+        return Ff / Ff[2, 2] if abs(Ff[2, 2]) > 1e-12 else Ff
 
     def current_H(self):
         """Teljes felbontású kép -> pálya homográfia (vagy None)."""
@@ -980,9 +994,11 @@ class PitchTracker:
 
         # 1) Terjesztés: G_t = F_t · G_{t-1}  (azaz H_t = H_{t-1} · inv(F_t))
         motion_failed = False
+        self.last_F = None     # a labdakövetőnek: képtér-mozgás (előző -> aktuális kép), lásd frame_motion()
         if self.prev_gray is not None:
             F, minfo = self.motion.estimate(self.prev_gray, gray, self.prev_mask)
             q["inliers"] = minfo.get("inliers", 0)
+            self.last_F = F
             if F is not None:
                 q["motion_ok"] = True
                 if self.G is not None:

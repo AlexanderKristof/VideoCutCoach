@@ -374,6 +374,26 @@ def test_auto_calibration_rejects_empty_grass():
     assert H is None and q["status"] == pt.STATUS_NEED_CALIB
 
 
+def test_frame_motion_maps_prev_to_current():
+    """frame_motion(): az ELŐZŐ kép pixelét az AKTUÁLIS kép pixelébe viszi (a labdakövető kamera-kompenzációja)."""
+    tex = make_texture(4)
+    w, h = 1280, 720
+    tracker = pt.PitchTracker((w, h), auto_init=False)
+    assert tracker.frame_motion() is None
+    poses = [(-10.0, 17.0, 1000.0), (-9.4, 17.1, 1004.0)]
+    Gs = []
+    for pan, tilt, f in poses:
+        frame, H_true, _ = render_frame(tex, pan, tilt, f, None, w, h, np.random.default_rng(1))
+        tracker.update(frame)
+        Gs.append(np.linalg.inv(H_true))
+    F = tracker.frame_motion()
+    assert F is not None
+    F_true = Gs[1] @ np.linalg.inv(Gs[0])
+    pts = np.array([[[300.0, 500.0], [900.0, 450.0], [640.0, 650.0]]])
+    d = np.linalg.norm(cv2.perspectiveTransform(pts, F)[0] - cv2.perspectiveTransform(pts, F_true)[0], axis=1)
+    assert d.max() < 1.5, d
+
+
 def test_overlay_draws_inside_frame():
     w, h = 1280, 720
     G = pt.camera_ground_homography(-20, 17, 1000, w, h, CAM)
