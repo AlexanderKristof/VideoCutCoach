@@ -25,8 +25,13 @@ def build_parser():
     p.add_argument("--felido-perc", type=float, default=45.0, metavar="PERC",
                    help="várt félidőhossz percben (alap: 45; amatőr meccsen pl. 40 vagy 35)")
     p.add_argument("--kalibracio", default="", metavar='"x,y;x,y;x,y;x,y"',
-                   help="4 pályapont a képen, 0..1 relatív koordinátákkal (mint a kliensben); "
-                        "nélküle nincs pályakoordináta, hőtérkép és a legtöbb esemény")
+                   help="kattintott pályapontok a képen, 0..1 relatív koordinátákkal (mint a kliensben); "
+                        "nélküle a program a pályavonalakból próbál automatikusan kalibrálni")
+    p.add_argument("--kalibracio-pontok", default="", metavar='"x,y;..."',
+                   help="a --kalibracio pontjainak pálya-koordinátái méterben (pl. a 16-os sarkai: "
+                        '"88.5,13.84;105,13.84;105,54.16;88.5,54.16"); üresen a 4 pályasarok sorrendje')
+    p.add_argument("--kalibracio-ido", type=float, default=None, metavar="MP",
+                   help="melyik videó-időpont képén készült a kalibráció (mp, az eredeti videóban)")
     p.add_argument("--kimenet", default="clips", metavar="MAPPA",
                    help="kimeneti mappa (alap: clips – ezt szolgálja ki a szerver /clips alatt)")
     p.add_argument("--nincs-vagas", action="store_true",
@@ -54,6 +59,8 @@ def options_from_args(args):
     opts = {
         "expected_half_min": args.felido_perc,
         "calib_points": args.kalibracio,
+        "calib_pitch_points": args.kalibracio_pontok,
+        "calib_time_sec": args.kalibracio_ido,
         "skip_cut": args.nincs_vagas,
         "team1_attacks_right": not args.csapat1_balra,
         "compilations": args.osszeallitasok,

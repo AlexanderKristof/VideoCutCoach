@@ -1,0 +1,15 @@
+# Focielemző – Python függőségek
+# A torch-ot (PyTorch) a videókártyához illő változatban KÜLÖN kell telepíteni, lásd README.md.
+
+fastapi>=0.110
+uvicorn>=0.29
+python-multipart>=0.0.9      # a Form(...) mezőkhöz
+pydantic[email]>=2.6         # EmailStr
+sqlalchemy>=2.0
+python-jose>=3.3
+passlib>=1.7.4
+bcrypt>=4.0,<5               # a passlib 1.7.4 a bcrypt 5-tel nem működik
+numpy>=1.26
+opencv-python>=4.9
+ultralytics>=8.2
+scikit-learn>=1.4            # csak a régi analyzer.py használja
