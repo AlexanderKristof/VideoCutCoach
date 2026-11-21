@@ -585,7 +585,9 @@ h3.sub { font: 600 12px var(--font-body); letter-spacing: .05em; text-transform:
   const DRAFT_KEY = "tt-draft-v2"; // v2: a régi, bemutató rajzos piszkozat nem töltődik vissza
   function demoMatch() {
     // Bemutató: kb. 70 mp valós tempójú, kitalált játék (4-3-3 hazai, 4-4-2 vendég), 10 Hz.
-    // Labdasebesség: passz 12–16 m/s, lövés 26 m/s; játékos legfeljebb 7 m/s, gyorsulás 4 m/s².
+    // TEMPO: a bemutató élénksége (1 = nyugodt amatőr tempó). 1,5-tel: passz 18–25 m/s, lövés ~32 m/s,
+    // játékos legfeljebb 9,5 m/s. Az 1× lejátszás továbbra is valós idő (a meccsóra a videóval egyezik).
+    const TEMPO = 1.5;
     const base = [...teamPlayers(1, "4-3-3"), ...teamPlayers(2, "4-4-2")];
     const P = base.map((p) => ({ ...p, ax: p.x, ay: p.y, vx: 0, vy: 0 }));
     const hz = 10, dt = 1 / hz;
@@ -617,10 +619,16 @@ h3.sub { font: 600 12px var(--font-body); letter-spacing: .05em; text-transform:
       { to: 18, v: 13, hold: 1.2 },
       { to: 14, v: 14, hold: 1.5 },
     ];
+    for (const sc of script) {
+      if (sc.v) sc.v = Math.min(sc.shot ? 32 : 25, sc.v * TEMPO);
+      if (sc.hold) sc.hold /= TEMPO;
+      if (sc.wait) sc.wait /= TEMPO;
+    }
     const ball = [], samples = P.map(() => []), events = [];
-    let bx = 52.5, by = 34, carrier = 9, flight = null, hold = 0.8, step = 1, t = 0, kicker = null, hideBallUntil = -1, loose = null;
-    const T = 72;
-    while (t <= T) {
+    let bx = 52.5, by = 34, carrier = 9, flight = null, hold = 0.8 / TEMPO, step = 1, t = 0, kicker = null, hideBallUntil = -1, loose = null;
+    let endAt = null; // a forgatókönyv vége után még 5 mp játék
+    while (t <= (endAt ?? 120)) {
+      if (endAt === null && step >= script.length && !flight && loose == null && hold <= 0) endAt = t + 5;
       // labda
       if (flight) {
         const k = Math.min(1, (t - flight.t0) / (flight.t1 - flight.t0));
@@ -700,9 +708,9 @@ h3.sub { font: 600 12px var(--font-body); letter-spacing: .05em; text-transform:
         else { tx = q.ax + (bx - 52.5) * 0.45; ty = q.ay + (by - q.ay) * 0.22; }
         tx = Math.max(0.5, Math.min(L - 0.5, tx)); ty = Math.max(0.5, Math.min(W - 0.5, ty));
         const dx = tx - q.x, dy = ty - q.y, dist = Math.hypot(dx, dy);
-        const vmax = q.gk ? 5 : 7, vdes = Math.min(vmax, dist * 1.3);
+        const vmax = Math.min(q.gk ? 7 : 9.5, (q.gk ? 5 : 7) * TEMPO), vdes = Math.min(vmax, dist * 1.3 * TEMPO);
         const dvx = (dist ? dx / dist * vdes : 0) - q.vx, dvy = (dist ? dy / dist * vdes : 0) - q.vy;
-        const dv = Math.hypot(dvx, dvy), amax = 4 * dt, k = dv > amax ? amax / dv : 1;
+        const dv = Math.hypot(dvx, dvy), amax = 4 * TEMPO * dt, k = dv > amax ? amax / dv : 1;
         q.vx += dvx * k; q.vy += dvy * k;
         q.x = Math.max(0.3, Math.min(L - 0.3, q.x + q.vx * dt)); q.y = Math.max(0.3, Math.min(W - 0.3, q.y + q.vy * dt));
         samples[i].push([+t.toFixed(2), +q.x.toFixed(2), +q.y.toFixed(2)]);
@@ -712,6 +720,7 @@ h3.sub { font: 600 12px var(--font-body); letter-spacing: .05em; text-transform:
     }
     const tracks = P.map((p, i) => ({ id: p.id, team: p.team, keeper: p.gk, label: p.num, samples: samples[i] }));
     events.sort((a, b) => a.time - b.time);
+    const T = samples[0].length ? samples[0][samples[0].length - 1][0] : 0;
     return { tracks, ball, events, t0: 0, t1: T, halves: [], kits: null, demo: true };
   }
   function mulberry(a) { return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
