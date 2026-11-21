@@ -32,6 +32,9 @@ DEFAULTS = {
     "class_names": None,      # opcionális: {"player": ["..."], "ball": ["..."], ...}
     "detect_every_n": 1,
     "ball_conf": 0.35,
+    # Külön labda-felismerő menet (második modellpéldány), ha a nyers labda-callback nem érhető el
+    # (lásd main.py NYERS LABDA-DETEKTÁLÁSOK, docs/MODELL_BEALLITAS.md) – drága, alapból KI
+    "ball_extra_pass": False,
 }
 
 DEFAULT_CONFIG_FILENAME = "model_config.json"
@@ -93,6 +96,8 @@ def load_model_config(config_path=None, env=None):
     except (TypeError, ValueError):
         print(f"⚠️ Érvénytelen ball_conf érték: {cfg['ball_conf']!r} – 0.35-öt használunk.")
         cfg["ball_conf"] = DEFAULTS["ball_conf"]
+    v = cfg["ball_extra_pass"]
+    cfg["ball_extra_pass"] = v if isinstance(v, bool) else str(v).strip().lower() in ("1", "true", "igen", "yes", "on")
     return cfg
 
 

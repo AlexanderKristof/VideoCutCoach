@@ -32,7 +32,7 @@ ANALYSIS_DEFAULTS = {
     "calib_points": "",
     "roi_top_pct": 0.28,
     "roi_bottom_pct": 0.10,
-    "min_player_height_pct": 0.048,
+    "min_player_height_pct": 0.022,  # a képmagasság arányában (720p: ~16 px, 1080p: ~24 px), fix px korlát nélkül
     "use_static_roi": False,
     "grass_min_ratio": 0.3,
     "stationary_window_sec": 4.0,

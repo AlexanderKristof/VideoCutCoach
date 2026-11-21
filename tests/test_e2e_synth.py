@@ -2,23 +2,35 @@
 Végponttól végpontig tartó kiértékelés szintetikus meccsen (valódi Veo felvétel és GPU nélkül).
 
 Lépések:
-  1. tools/synth_match.py: rövid szintetikus meccs (alap: 75 s, 1280x720) + ground truth JSON
+  1. tools/synth_match.py: rövid szintetikus meccs (alap: 40 s, 1280x720) + ground truth JSON
   2. main.cut_and_analyze_sync futtatása a tools/fake_detector.py ál-YOLO-val
      (a fastapi / pydantic / sqlalchemy / torch / ultralytics / database / models / auth modulok
-     csonkolva, 'ffmpeg.exe' a PATH-on egy szimbolikus linkkel), az első képkocka valós
-     kalibrációs pontjaival
-  3. pontozás: labda-találati arány és hiba labdakövetővel / nélküle, játékos-pozíció hiba
-     (a main.py statikus homográfiájával, összevetve a valós képkockánkénti homográfiával =
-     'orákulum'), esemény-detektálás pontosság / felidézés idő-tűréssel.
+     csonkolva, 'ffmpeg.exe' a PATH-on egy szimbolikus linkkel). Az ál-YOLO az ultralytics
+     callback-mechanizmusát is utánozza (a követő az első track()-nél regisztrált callback),
+     így a main.py nyers labda-callbackje a valódi kódúton fut.
+  3. pontozás: játékos-pozíció hiba és lefedés, csapat-pontosság, labda-találati arány, a motor
+     labdájának pálya-hibája, esemény-detektálás pontosság / felidézés idő-tűréssel.
+
+Módok (E2E_MODES, alap "dyn_manual,dyn_auto,oracle"):
+  dyn_manual – képkockánkénti homográfia (pitch_tracker) valószerű kézi kalibrációval: az első
+               képkockán LÁTHATÓ pályapontok (felezővonal vége, kezdőkör metszéspontjai, 16-os
+               sarkai ...) 1,5 px kattintási zajjal, calib_pitch_points-szal
+  dyn_auto   – képkockánkénti homográfia, kalibráció nélkül (automatikus kalibráció a vonalakból)
+  oracle     – a motor a valós képkockánkénti H-t kapja (referencia)
+  régi módok: static_off / static_on (statikus H a négy – akár képen kívüli – pályasarokból),
+              oracle_off / oracle_on (labdakövető nélkül / vele)
 
 Futtatás:  python3 tests/test_e2e_synth.py
 Környezeti változók:
-  E2E_DURATION (mp, alap 75), E2E_WIDTH / E2E_HEIGHT (alap 1280x720), E2E_SEED (alap 6),
-  E2E_MODES (alap "static_off,static_on,oracle_off,oracle_on"), E2E_WORKDIR (megtartott munkakönyvtár),
+  E2E_DURATION (mp, alap 40), E2E_WIDTH / E2E_HEIGHT (alap 1280x720), E2E_SEED (alap 6),
+  E2E_MODES (lásd fent), E2E_WORKDIR (megtartott munkakönyvtár),
   E2E_REUSE=1 (a meglévő videót újrahasznosítja a munkakönyvtárban), E2E_TOL (esemény-tűrés, mp, alap 2.5),
   E2E_DROP_UNTRACKED=0 (az ál-ByteTrack ne dobja el a meg nem erősített dobozokat – alapból eldobja,
-  mint az ultralytics model.track())
+  mint az ultralytics model.track()), E2E_MIN_H_PCT (min. játékosmagasság, alap a /cut-raw alapértéke),
+  E2E_BALL_EXTRA_PASS=1 (külön labda-menet), E2E_FRAMES_DIR (annotált kimeneti képkockák JPG-be,
+  dinamikus módokban), E2E_COMPARE (egy korábbi e2e_summary.json: előtte -> utána összesítés)
 
+A teszt csak laza épség-küszöböket ellenőriz (mérőeszköz), a teljes táblázatot kiírja.
 Ha valamelyik előfeltétel hiányzik (cv2, numpy, ffmpeg), a teszt kihagyva (0-s kilépési kóddal) ér véget.
 Az eredmények nem 'szépítettek': a cél a mérés, nem a zöld teszt.
 """
@@ -58,12 +70,64 @@ from fake_detector import FakeYOLO  # noqa: E402
 EVENT_TYPES = ("shot", "goal", "gk_save", "gk_conceded", "gk_goal_kick", "gk_long_ball", "gk_short_pass")
 EVENT_LABELS = {"shot": "lövés", "goal": "gól", "gk_save": "védés", "gk_conceded": "kapott gól",
                 "gk_goal_kick": "kirúgás", "gk_long_ball": "kapus ívelés", "gk_short_pass": "kapus rövid passz"}
-MODE_LABELS = {
-    "static_off": "statikus H, követő nélkül (mai állapot)",
-    "static_on": "statikus H + labdakövető",
-    "oracle_off": "valós H (orákulum), követő nélkül",
-    "oracle_on": "valós H (orákulum) + labdakövető",
+# Mód -> (felirat, kalibráció, orákulum H, labdakövető, dinamikus homográfia)
+#   kalibráció: "landmarks" = az első képkockán LÁTHATÓ pályapontok (felezővonal vége, kezdőkör
+#   metszéspontjai, 16-os sarkai ...) kattintási zajjal + calib_pitch_points; "corners" = a régi
+#   négy pályasarok (a képen kívül is lehetnek – a valóságban nem kattintható); "none" = automatikus
+MODES = {
+    "dyn_manual": ("dinamikus H, kézi kalibráció (látható pontok)", "landmarks", False, True, True),
+    "dyn_auto": ("dinamikus H, automatikus kalibráció", "none", False, True, True),
+    "oracle": ("valós H (orákulum) – referencia", "landmarks", True, True, True),
+    "static_off": ("statikus H (sarkok), követő nélkül", "corners", False, False, False),
+    "static_on": ("statikus H (sarkok) + labdakövető", "corners", False, True, False),
+    "oracle_off": ("valós H (orákulum), követő nélkül", "landmarks", True, False, True),
+    "oracle_on": ("valós H (orákulum) + labdakövető", "landmarks", True, True, True),
 }
+MODE_LABELS = {k: v[0] for k, v in MODES.items()}
+DEFAULT_MODES = "dyn_manual,dyn_auto,oracle"
+
+# Kattintható pályapontok (m): (név, x, y) – a 105x68-as pályán
+PITCH_LANDMARKS = [
+    ("felezővonal felső vége", 52.5, 0.0), ("felezővonal alsó vége", 52.5, 68.0),
+    ("kezdőkör felső metszéspont", 52.5, 34.0 - 9.15), ("kezdőkör alsó metszéspont", 52.5, 34.0 + 9.15),
+    ("kezdőkör bal széle", 52.5 - 9.15, 34.0), ("kezdőkör jobb széle", 52.5 + 9.15, 34.0),
+    ("bal 16-os felső sarka", 16.5, 13.84), ("bal 16-os alsó sarka", 16.5, 54.16),
+    ("bal 16-os felső alapvonal-pont", 0.0, 13.84), ("bal 16-os alsó alapvonal-pont", 0.0, 54.16),
+    ("jobb 16-os felső sarka", 88.5, 13.84), ("jobb 16-os alsó sarka", 88.5, 54.16),
+    ("jobb 16-os felső alapvonal-pont", 105.0, 13.84), ("jobb 16-os alsó alapvonal-pont", 105.0, 54.16),
+    ("bal felső szöglet", 0.0, 0.0), ("jobb felső szöglet", 105.0, 0.0),
+    ("bal alsó szöglet", 0.0, 68.0), ("jobb alsó szöglet", 105.0, 68.0),
+]
+
+
+def landmark_calibration(gt, click_sigma_px=1.5, margin_px=12, seed=0):
+    """
+    Valószerű kézi kalibráció: az első képkockán látható pályapontok (legalább 4) kattintási
+    zajjal (szórás 1,5 px 1280 széles képen). Visszatér: (calib_points, calib_pitch_points, nevek).
+    """
+    w, h = gt["width"], gt["height"]
+    H0 = np.array(gt["frames"][0]["H"], np.float64).reshape(3, 3)
+    G0 = np.linalg.inv(H0)
+    q = H0 @ np.array([w / 2.0, h * 0.9, 1.0])
+    ref = G0 @ (q / q[2])          # egy biztosan a kamera előtt lévő pálya-pont mélység-előjele
+    rng = np.random.default_rng(seed)
+    sig = click_sigma_px * w / 1280.0
+    img, pit, names = [], [], []
+    for name, x, y in PITCH_LANDMARKS:
+        p = G0 @ np.array([x, y, 1.0])
+        if np.sign(p[2]) != np.sign(ref[2]):
+            continue
+        u, v = p[0] / p[2], p[1] / p[2]
+        if not (margin_px <= u <= w - margin_px and margin_px <= v <= h - margin_px):
+            continue
+        img.append((u + rng.normal(0, sig), v + rng.normal(0, sig)))
+        pit.append((x, y))
+        names.append(name)
+    if len(img) < 4:
+        return None, None, names
+    calib = ";".join(f"{u / w:.6f},{v / h:.6f}" for u, v in img)
+    pitch = ";".join(f"{x:g},{y:g}" for x, y in pit)
+    return calib, pitch, names
 
 
 # ====================================================================== csonkok
@@ -95,7 +159,7 @@ def install_stubs(fake_model):
 
     status = types.SimpleNamespace(HTTP_400_BAD_REQUEST=400, HTTP_401_UNAUTHORIZED=401, HTTP_404_NOT_FOUND=404,
                                    HTTP_403_FORBIDDEN=403, HTTP_500_INTERNAL_SERVER_ERROR=500)
-    mod("fastapi", FastAPI=_App, Form=lambda default=None, *a, **k: default, Depends=lambda *a, **k: None,
+    mod("fastapi", FastAPI=_App, Form=lambda default=None, *a, **k: default, Depends=lambda *a, **k: None, Request=object,
         HTTPException=_HTTPException, status=status, File=lambda *a, **k: None, UploadFile=object)
     mod("fastapi.staticfiles", StaticFiles=lambda *a, **k: None)
     mod("fastapi.security", OAuth2PasswordRequestForm=object, OAuth2PasswordBearer=lambda *a, **k: None)
@@ -224,19 +288,20 @@ def score_ball(records, gt):
     }
 
 
-def score_players(records, gt):
+def score_players(records, gt, min_h_px=50.0):
     frames = gt["frames"]
     roles = {p["id"]: p["role"] for p in gt["people"]}
     teams = {p["id"]: p["team"] for p in gt["people"]}
     errs, tooth_small, gt_vis, matched = [], 0, 0, 0
     team_ok = team_n = specs_out = 0
+    seg_errs = [[] for _ in range(10)]   # a klip tizedeiként (hol romlik el a pályakövetés)
     for r in records:
         f = frames[r["frame"]]
         objs = f["objs"]
         cand = [o for o in objs if roles.get(o[0]) in ("player", "goalkeeper")]
         for o in cand:
             gt_vis += 1
-            if o[8] - o[6] < 50:
+            if o[8] - o[6] < min_h_px:
                 tooth_small += 1
         used = set()
         for p in r["players"]:
@@ -257,10 +322,12 @@ def score_players(records, gt):
             matched += 1
             if p["pitch"] is not None:
                 errs.append(math.hypot(p["pitch"][0] - bi[1], p["pitch"][1] - bi[2]))
+                seg_errs[min(9, int(10 * r["frame"] / max(1, len(frames))))].append(errs[-1])
             team_n += 1
             team_ok += int(p["team"] == teams.get(bi[0]))
     return {"pitch_err": _stats(errs), "gt_visible_player_boxes": gt_vis,
-            "gt_below_50px_ratio": tooth_small / max(1, gt_vis),
+            "pitch_err_by_tenth": [_stats(e)["median"] for e in seg_errs],
+            "gt_below_min_h_ratio": tooth_small / max(1, gt_vis), "min_h_px": min_h_px,
             "coverage": matched / max(1, gt_vis), "team_accuracy": team_ok / max(1, team_n),
             "non_player_outputs": specs_out}
 
@@ -335,7 +402,18 @@ def click_range(bgr):
     return lo, up
 
 
-def base_config(gt, tracker_on):
+def _default_min_h_pct():
+    """A /cut-raw alapértéke (pipeline.ANALYSIS_DEFAULTS) – E2E_MIN_H_PCT felülírja."""
+    if os.environ.get("E2E_MIN_H_PCT"):
+        return float(os.environ["E2E_MIN_H_PCT"])
+    try:
+        import pipeline
+        return float(pipeline.ANALYSIS_DEFAULTS["min_player_height_pct"])
+    except Exception:  # pragma: no cover
+        return 0.022
+
+
+def base_config(gt, tracker_on, dynamic=True):
     period = (gt.get("periods") or [{}])[0]
     kits = synth_match.KITS
     t1, t2 = click_range(kits["team1"]["shirt"]), click_range(kits["team2"]["shirt"])
@@ -343,7 +421,7 @@ def base_config(gt, tracker_on):
     return {
         "team1_attacks_right": bool(period.get("team1_attacks_right", True)),
         "review_export": False,
-        "roi_top_pct": 0.28, "roi_bottom_pct": 0.10, "min_player_height_pct": 0.048,
+        "roi_top_pct": 0.28, "roi_bottom_pct": 0.10, "min_player_height_pct": _default_min_h_pct(),
         "use_static_roi": False, "grass_min_ratio": 0.3,
         "stationary_window_sec": 4.0, "stationary_max_move": 0.5,
         "grass_lower": [30, 40, 40], "grass_upper": [85, 255, 255],
@@ -354,28 +432,63 @@ def base_config(gt, tracker_on):
         "keeper1_lower": k1[0], "keeper1_upper": k1[1],
         "keeper2_lower": k2[0], "keeper2_upper": k2[1],
         "ball_tracker": tracker_on,
+        "dynamic_homography": dynamic, "draw_pitch_overlay": True,
+        "ball_extra_pass": os.environ.get("E2E_BALL_EXTRA_PASS") == "1",
     }
 
 
 def run_mode(main_mod, fake, gt, video, mode):
-    oracle = mode.startswith("oracle")
-    tracker_on = mode.endswith("_on")
+    _label, calib_kind, oracle, tracker_on, dynamic = MODES[mode]
     Engine = make_recording_engine(main_mod, gt, oracle)
     original = main_mod.TacticalEngine
     main_mod.TacticalEngine = Engine
     fake.load_ground_truth(gt)
-    calib = gt["calibration_first_frame"]["calib_points"]
+    config = base_config(gt, tracker_on, dynamic)
+    calib, calib_names = "", []
+    if calib_kind == "corners":
+        calib = gt["calibration_first_frame"]["calib_points"]
+    elif calib_kind == "landmarks":
+        calib, pitch_pts, calib_names = landmark_calibration(gt, seed=gt["seed"])
+        if calib is None:
+            print(f"⚠️ Kevesebb mint 4 látható pályapont az első képkockán ({calib_names}) – automatikus kalibráció")
+            calib = ""
+        else:
+            config["calib_pitch_points"] = pitch_pts
+            print(f"Kézi kalibráció {len(calib_names)} látható ponttal: {', '.join(calib_names)}")
     t0 = time.time()
     try:
         _url, out_path, events_path = main_mod.cut_and_analyze_sync(
-            video, 0.0, gt["duration"], True, "team", calib, base_config(gt, tracker_on))
+            video, 0.0, gt["duration"], True, "team", calib, config)
     finally:
         main_mod.TacticalEngine = original
     elapsed = time.time() - t0
     with open(events_path, encoding="utf-8") as f:
         payload = json.load(f)
     return {"records": Engine.records, "static_H": Engine.static_H, "events": payload["events"],
-            "elapsed": elapsed, "fake_stats": dict(fake.stats), "out_video": out_path}
+            "elapsed": elapsed, "fake_stats": dict(fake.stats), "out_video": out_path,
+            "pitch_tracking": payload.get("pitch_tracking"), "calib_names": calib_names,
+            "min_h_pct": config["min_player_height_pct"]}
+
+
+def save_annotated_frames(video_path, out_dir, mode, frame_ids):
+    """A kimeneti (annotált, pályavonal-réteges) videó néhány képkockája JPG-be."""
+    os.makedirs(out_dir, exist_ok=True)
+    cap = cv2.VideoCapture(video_path)
+    saved = []
+    idx = 0
+    want = set(frame_ids)
+    while want:
+        ok, fr = cap.read()
+        if not ok:
+            break
+        if idx in want:
+            path = os.path.join(out_dir, f"e2e_{mode}_kepkocka_{idx:05d}.jpg")
+            cv2.imwrite(path, fr, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            saved.append(path)
+            want.discard(idx)
+        idx += 1
+    cap.release()
+    return saved
 
 
 def static_h_error(static_H, gt):
@@ -430,9 +543,12 @@ def print_report(results, gt, tol, h_err, ideal=None):
         e = p["pitch_err"]
         print(f"{MODE_LABELS[mode]:44s} {_f(e['median']) + ' m':>8s} {_f(e['mean']) + ' m':>8s} {_f(e['p90']) + ' m':>8s} "
               f"{100 * p['coverage']:9.1f} {100 * p['team_accuracy']:11.1f} {p['non_player_outputs']:12d}")
+    for mode, r in results.items():
+        segs = r["players"].get("pitch_err_by_tenth") or []
+        print(f"  {mode:12s} medián hiba a klip tizedeiben: " + " ".join(_f(v, "{:.1f}") for v in segs))
     p0 = next(iter(results.values()))["players"]
-    print(f"  (a látható valós játékos-dobozok {100 * p0['gt_below_50px_ratio']:.0f}%-a 50 px-nél alacsonyabb – "
-          f"a main.py min. 50 px-es magasságszűrője ezeket eldobja)")
+    print(f"  (a látható valós játékos-dobozok {100 * p0['gt_below_min_h_ratio']:.0f}%-a alacsonyabb a main.py "
+          f"magasságszűrőjénél ({p0['min_h_px']:.1f} px) – ezeket eldobja)")
 
     print(f"\nESEMÉNYEK (±{tol:.1f} s tűrés)")
     header = f"{'esemény':18s} {'valós':>6s} " + " ".join(f"{m:>16s}" for m in results)
@@ -463,17 +579,68 @@ def print_report(results, gt, tol, h_err, ideal=None):
     print(f"Ál-detektor: labda látható {fs['ball_gt_visible']} képkockán, detektálva {fs['ball_detected']}, "
           f"téves labda-jelölt {fs['ball_fp']}, a követő által eldobott labda-doboz {fs['ball_dropped_by_tracker']}, "
           f"néző 'player'-ként {fs['spectator_fp']}")
+    for m, r in results.items():
+        if r.get("pitch_tracking"):
+            print(f"Pályakövetés [{m}]: {r['pitch_tracking'].get('setup')} – {r['pitch_tracking'].get('frames')}")
     print("=" * 96)
 
 
+SUMMARY_COLS = [("játékos hiba med (m)", "player_err_med", "{:.2f}"), ("lefedés %", "coverage", "{:.1f}"),
+                ("labda találat %", "ball_hit", "{:.1f}"), ("labda pálya hiba med (m)", "ball_pitch_err_med", "{:.2f}"),
+                ("csapat ok %", "team_acc", "{:.1f}"), ("esemény pontosság", "ev_precision", "{:.2f}"),
+                ("esemény felidézés", "ev_recall", "{:.2f}")]
+
+
+def summary_row(r):
+    """Módonként egy sor a fő mutatókkal (a labda pálya hibája: a motor labdapontja vs. valós, földön)."""
+    return {"player_err_med": r["players"]["pitch_err"]["median"], "coverage": 100 * r["players"]["coverage"],
+            "ball_hit": 100 * r["ball"]["detection_rate"], "ball_pitch_err_med": r["ball"]["engine_ball_err"]["median"],
+            "team_acc": 100 * r["players"]["team_accuracy"],
+            "ev_precision": r["events"]["_total"]["precision"], "ev_recall": r["events"]["_total"]["recall"]}
+
+
+def print_summary(results, before=None):
+    """Összesítő táblázat; before: egy korábbi e2e_summary.json 'summary' része (E2E_COMPARE) – előtte -> utána."""
+    print("\nÖSSZESÍTÉS" + (" (előtte -> utána)" if before else ""))
+    print(f"{'mód':12s} " + " ".join(f"{c[0]:>24s}" for c in SUMMARY_COLS))
+    for m, r in results.items():
+        row = summary_row(r)
+        cells = []
+        for _name, key, fmt in SUMMARY_COLS:
+            now = _f(row[key], fmt)
+            if before and m in before:
+                now = f"{_f(before[m].get(key), fmt)} -> {now}"
+            cells.append(f"{now:>24s}")
+        print(f"{m:12s} " + " ".join(cells))
+
+
+def oracle_mode(mode):
+    return MODES[mode][2]
+
+
+def sanity_check(results):
+    """
+    Csak laza épség-ellenőrzés (ez mérőeszköz, nem minőségi kapu): a futás eredményt ad,
+    a játékosok egy része átjut, a labda néha megvan, a csapat nem véletlen.
+    """
+    for m, r in results.items():
+        p, b = r["players"], r["ball"]
+        assert p["coverage"] > 0.2, f"{m}: túl kicsi játékos-lefedés ({p['coverage']:.2f})"
+        assert b["detection_rate"] > 0.15, f"{m}: túl kicsi labda-találati arány ({b['detection_rate']:.2f})"
+        assert p["team_accuracy"] > 0.6, f"{m}: csapatbesorolás közel véletlen ({p['team_accuracy']:.2f})"
+        if oracle_mode(m) or MODES[m][1] == "landmarks":
+            med = p["pitch_err"]["median"]
+            assert med is not None and med < 5.0, f"{m}: túl nagy játékos-pozíció hiba ({med})"
+    print("Épség-ellenőrzés: OK")
+
+
 def main():
-    duration = float(os.environ.get("E2E_DURATION", "75"))
+    duration = float(os.environ.get("E2E_DURATION", "40"))
     width = int(os.environ.get("E2E_WIDTH", "1280"))
     height = int(os.environ.get("E2E_HEIGHT", "720"))
     seed = int(os.environ.get("E2E_SEED", "6"))
     tol = float(os.environ.get("E2E_TOL", "2.5"))
-    modes = [m.strip() for m in os.environ.get("E2E_MODES", "static_off,static_on,oracle_off,oracle_on").split(",")
-             if m.strip()]
+    modes = [m.strip() for m in os.environ.get("E2E_MODES", DEFAULT_MODES).split(",") if m.strip()]
     for m in modes:
         if m not in MODE_LABELS:
             raise SystemExit(f"Ismeretlen mód: {m} (lehet: {', '.join(MODE_LABELS)})")
@@ -492,6 +659,7 @@ def main():
         if not gt["calibration_first_frame"].get("all_in_front_of_camera", True):
             print("⚠️ Az első képkockán nem minden pályasarok van a kamera előtt – a kalibráció torz lehet")
 
+        frames_dir = os.environ.get("E2E_FRAMES_DIR")
         fake = FakeYOLO(seed=seed + 100, drop_untracked=os.environ.get("E2E_DROP_UNTRACKED", "1") != "0")
         main_mod = import_main(workdir, fake)
         results = {}
@@ -503,18 +671,30 @@ def main():
                 h_err = static_h_error(r["static_H"], gt)
             results[mode] = {
                 "ball": score_ball(r["records"], gt),
-                "players": score_players(r["records"], gt),
+                "players": score_players(r["records"], gt, r["min_h_pct"] * gt["height"]),
                 "events": score_events(r["events"], gt["events"], tol),
                 "elapsed": r["elapsed"], "fake_stats": r["fake_stats"],
                 "detected_events": [{k: e.get(k) for k in ("type", "time", "team")} for e in r["events"]],
+                "pitch_tracking": r["pitch_tracking"], "calib_names": r["calib_names"],
             }
+            if frames_dir and r["out_video"] and not oracle_mode(mode) and MODES[mode][4]:
+                n = gt["n_frames"]
+                for path in save_annotated_frames(r["out_video"], frames_dir, mode, [int(n * 0.35), int(n * 0.7)]):
+                    print(f"Annotált képkocka: {path}")
         ideal = score_events(ideal_events(gt), gt["events"], tol)
         print_report(results, gt, tol, h_err, ideal)
+        before = None
+        if os.environ.get("E2E_COMPARE") and os.path.exists(os.environ["E2E_COMPARE"]):
+            with open(os.environ["E2E_COMPARE"], encoding="utf-8") as f:
+                before = json.load(f).get("summary")
+        print_summary(results, before)
         summary_path = os.path.join(workdir, "e2e_summary.json")
         with open(summary_path, "w", encoding="utf-8") as f:
-            json.dump({"gt_events": gt["events"], "ideal_events": ideal, "results": results}, f,
+            json.dump({"gt_events": gt["events"], "ideal_events": ideal, "results": results,
+                       "summary": {m: summary_row(r) for m, r in results.items()}}, f,
                       ensure_ascii=False, indent=1, default=str)
         print(f"Részletes eredmény: {summary_path}")
+        sanity_check(results)
     finally:
         os.chdir(cwd)
         if not keep:

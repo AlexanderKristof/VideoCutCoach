@@ -42,6 +42,7 @@ Másold le a `model_config.example.json` fájlt `model_config.json` néven, és 
 | `class_names` | szerepkör → a modell osztálynevei (lásd lent) | automatikus |
 | `ball_conf` | a labda minimális megbízhatósága | `0.35` |
 | `detect_every_n` | gyors mód: csak minden N. képkockán fut felismerés | `1` |
+| `ball_extra_pass` | külön labda-felismerő menet, ha a nyers labda-callback nem érhető el (lásd 6. pont) | `false` |
 
 A fájl máshol is lehet: a `TACTICAL_MODEL_CONFIG` környezeti változóban add meg az útvonalát.
 
@@ -92,3 +93,41 @@ N. képkockán fut, a köztes képkockákon az előző eredményt rajzoljuk ki �
 A modell egy példányban van betöltve, ezért egyszerre csak egy klip elemzése használja: ha a kliens
 egyszerre több elemzést indít, azok sorban futnak le. Minden elemzés elején a követő (ByteTrack)
 állapota törlődik, így a játékosazonosítók nem keverednek két klip között.
+
+## 6. Labda-detektálások a követő előtt (ultralytics callback)
+
+A `model.track()` (ByteTrack) a kimenetből **elhagyja a meg nem erősített dobozokat**. A labdát a
+modell ritkán és szaggatottan látja, ezért a követő a labda-detektálások nagy részét eldobja
+(a szintetikus mérésen ~70%-át). Második futtatás nélkül így nyerjük vissza őket:
+
+**Ultralytics-feltételezés (8.x – `ultralytics/engine/model.py`, `ultralytics/trackers/track.py`):**
+
+1. A követést a `register_tracker()` végzi, amit a `Model.track()` az **első** hívásnál futtat
+   (`if not hasattr(self.predictor, "trackers")`): ez a `model.callbacks["on_predict_postprocess_end"]`
+   lista **végére** fűzi a követő callbackjét, amely a `predictor.results[i]` elemeit a követett
+   dobozokra cseréli (`predictor.results[i] = result[idx]`).
+2. A callbackek regisztrálási sorrendben futnak, és a predictor ugyanazt a `callbacks` dict-et
+   kapja, mint a modell (`_callbacks=self.callbacks`).
+
+Ezért a `main.py` a modell betöltése után, **az első `track()` előtt** saját
+`on_predict_postprocess_end` callbacket regisztrál (`model.add_callback(...)`): ez még a nyers
+`predictor.results`-ot látja, és képkockánként kimásolja a labda-osztályú dobozokat
+(`xyxy` / `conf` / `cls`, numpy másolatként). Ezek mennek a labdakövetőbe; a játékosok és bírók
+továbbra is a követett (azonosítós) dobozokból jönnek. Ugyanazt a képet nem futtatjuk kétszer.
+
+Védőkorlátok:
+- ha a modellnek nincs `add_callback` metódusa, vagy a callback az adott képkockán nem futott le,
+  a követett labda-dobozokat használjuk (a régi működés);
+- ha a callback már azonosítós (követett) dobozokat lát, vagyis egy másik ultralytics-verzióban a
+  követő előtte futott, a napló (`analysis_debug_*.log`) figyelmeztet;
+- `ball_extra_pass: true`: ha nincs nyers callback, képkockánként külön labda-menet fut
+  (`predict(classes=<labda>, conf=alacsony)`) egy **második modellpéldánnyal**, mert ugyanazon a
+  modellen a `predict()` a `track()` után a követő callbackjét is lefuttatná, és összekeverné a
+  játékos-azonosítókat. Ez lassú (kétszeres felismerés) és több GPU-memóriát kér – csak végső
+  esetre.
+
+Ultralytics-frissítés után érdemes megnézni a naplóban a „Labda-jelöltek forrása” sort: ha a
+`nyers` érték 0, a callback-mechanizmus megváltozott. A `tools/fake_detector.py` ál-YOLO ugyanezt
+a mechanizmust utánozza (a követő az első `track()`-nél regisztrált callback), így a
+`tests/test_e2e_synth.py` a valódi kódutat méri.
+

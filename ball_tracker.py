@@ -152,7 +152,12 @@ class BallTracker:
             self.x[1] += dy
             if self.last_meas is not None:
                 self.last_meas = (self.last_meas[0], self.last_meas[1] + dx, self.last_meas[2] + dy)
-        if self.challenger is not None and camera_shift is not None and camera_H is None:
+        if self.challenger is not None and camera_H is not None and cv2 is not None:
+            # a kapun kívüli jelöltet is a kamera-homográfiával toljuk (eddig csak eltolásnál mozdult)
+            c = cv2.perspectiveTransform(np.array([[[self.challenger["x"], self.challenger["y"]]]], np.float64),
+                                         np.asarray(camera_H, np.float64))[0][0]
+            self.challenger["x"], self.challenger["y"] = float(c[0]), float(c[1])
+        elif self.challenger is not None and camera_shift is not None:
             self.challenger["x"] += float(camera_shift[0])
             self.challenger["y"] += float(camera_shift[1])
 
@@ -223,7 +228,7 @@ class BallTracker:
         self._compensate(camera_shift, camera_H)
 
         if self.x is None:
-            return self._try_init(cands, grass_mask, grass_scale, camera_shift)
+            return self._try_init(cands, grass_mask, grass_scale, camera_shift, camera_H)
 
         self._predict(float(dt_frames))
         gap_after = self.gap + dt_frames
@@ -319,10 +324,14 @@ class BallTracker:
         self.stats["detected"] += 1
         return BallState(self.frame_idx, STATUS_DETECTED, cx, cy, 0.0, 0.0, conf, box, conf, 0, n_cands)
 
-    def _try_init(self, cands, grass_mask, grass_scale, camera_shift):
+    def _try_init(self, cands, grass_mask, grass_scale, camera_shift, camera_H=None):
         """Elveszett állapot: erős jelöltből azonnal, gyengébből két egymást követő, közeli jelöltből indulunk."""
         pending = self.pending
-        if pending is not None and camera_shift is not None:
+        if pending and camera_H is not None and cv2 is not None:
+            q = cv2.perspectiveTransform(np.array([[(c[0], c[1]) for c in pending]], np.float64),
+                                         np.asarray(camera_H, np.float64))[0]
+            pending = [(float(q[k][0]), float(q[k][1])) + tuple(c[2:]) for k, c in enumerate(pending)]
+        elif pending is not None and camera_shift is not None:
             pending = [(c[0] + camera_shift[0], c[1] + camera_shift[1]) + tuple(c[2:]) for c in pending]
         best, best_score = None, -1.0
         for c in cands:
