@@ -226,3 +226,79 @@ Válasz:
 - Egyetlen klipnél a `merged_url` maga a klip; `merge=false` esetén `null`.
 - Az ffmpeg útvonala az `FFMPEG_PATH` környezeti változóval állítható (alapértelmezett: `ffmpeg.exe`).
 - Hiba esetén (üres lista, hibás időablak, hiányzó videó / ffmpeg): `{"status": "error", "message": "..."}`.
+
+---
+
+## Pályakalibráció mozgó (Veo) kamerához – `pitch_tracker.py`
+
+### A probléma
+A Veo virtuális kamerája követi a labdát: pásztáz, néha zoomol, egyszerre kb. fél pályát mutat.
+Korábban a homográfia (kép → pálya méter, 105 × 68, x a hossz mentén) a klip elején,
+egyszer készült a 4 kattintott pontból – az első pásztázás után már rossz volt, így a pályák,
+a hőtérkép és az események (lövés, kapus) is hibásak lettek. Kalibráció nélkül semmi sem számolódott.
+
+### Hogyan működik most
+Minden képkockára saját homográfia készül (`PitchTracker.update(frame, boxes)` → `(H_t, minőség)`):
+
+1. **Terjesztés képkockáról képkockára.** A kamera elmozdulását a statikus háttérből becsüljük:
+   fűmaszk (tágítva) + pályavonalak, a játékos-/labda-dobozok kitakarva. GFTT sarokpontok +
+   Lucas–Kanade optikai áramlás 640 px széles szürke képen, előre-hátra ellenőrzéssel, majd
+   RANSAC homográfia. Ha `F_t` az előző kép pixeleit viszi az aktuálisra, akkor
+   `H_t = H_{t-1} · inv(F_t)` (belül a fordítottját tároljuk: `G_t = F_t · G_{t-1}`).
+   Rossz becslést (kevés inlier, nagy skála-/nyírásugrás, nagy visszavetítési hiba) eldobunk:
+   ilyenkor marad az előző H, és nő az „elveszett” számláló; 15 egymás utáni hiba után a H `None`.
+2. **Sodródás-javítás a pályavonalakkal** (10 képkockánként, illetve hiba / alacsony bizalom esetén):
+   fehér vonalpixelek keresése 960 px-es képen (a színcsatornák minimuma + top-hat, alacsony
+   telítettség, csak füvön, dobozok nélkül, irány-koherencia szűrő a lelátó/reklám zajára, vékony
+   és elég hosszú darabok). A szabványos vonalak (oldal- és alapvonalak, felezővonal, kezdőkör,
+   16-osok, 5-ösök, 16-os ívek) mintapontjait a képre vetítjük, és a vonalmaszk
+   távolság-transzformáltján Levenberg–Marquardt lépésekkel finomítjuk a homográfiát (csak numpy).
+   A pontok súlya: képbeli sűrűség × a vonal látható szélessége (a távoli, rövidülő vonal alig
+   látszik, kis súlyt kap). Csak a mérésekkel jól meghatározott irányokban lépünk, és csak akkor
+   fogadjuk el, ha a költség javul; az elfogadott korrekció felét alkalmazzuk (komplementer szűrő).
+3. **Automatikus kalibráció** (ha nincs kézi): kamera-hipotézisek rácsa (pásztázás ±60°, dőlés,
+   látószög, kamera távolsága/magassága; a kamera a felezővonal vonalában, a közeli oldalvonal
+   mögött), pontozás ugyanazon a távolság-transzformálton, a legjobb 12 jelölt fizikai
+   kameramodellel (7 paraméter) és utána 8 paraméteres homográfiával finomítva. Csak akkor
+   fogadjuk el, ha a vonalegyezés elég jó (pontosság ≥ 0.6, lefedettség ≥ 0.45); különben a
+   státusz **„kalibráció szükséges”**, és 50 → 250 képkockánként újra próbálkozik.
+
+### Kalibráció a kliensből (`POST /cut-raw` új mezői)
+| Mező | Alapértelmezett | Leírás |
+|---|---|---|
+| `dynamic_homography` | true | false: a régi viselkedés (egyetlen, statikus H a klip elejéről) |
+| `draw_pitch_overlay` | true | a vetített pályavonalak halvány cián rajza a kimeneti videón és az áttekintő lapokon – ha a cián vonal a fehéren fut, jó a kalibráció |
+| `calib_points` | "" | mint eddig: `"rx,ry;..."` normalizált (0..1) képpontok |
+| `calib_pitch_points` | "" | a kattintott pontok pálya-koordinátái méterben (`"x,y;..."`, ugyanannyi, legalább 4). Üresen a régi négysarkos sorrend (bal-felső, bal-alsó, jobb-alsó, jobb-felső = (0,0), (0,68), (105,68), (105,0)). Fél pályás képhez ajánlott: pl. a 16-os 4 sarka `0,13.84;16.5,13.84;16.5,54.16;0,54.16` (jobb oldalon x = 105 és 88.5), a felezővonal végei `52.5,0;52.5,68` |
+| `calib_time_sec` | – | a videó melyik időpontjának képén kattintott a felhasználó (ugyanabban az időskálában, mint `start_sec`). Ha a klip közepére esik, egy gyors előfuttatás a kalibrált képtől a klip elejéig visszaszámolja a kamera mozgását (`H_0 = H_k · F_k · … · F_1`); a klipen kívüli időt a klip elejére vonatkoztatjuk |
+
+Kalibráció nélkül is elindul az elemzés: a pályavonalakból próbál kalibrálni; ha nem sikerül,
+a játékos-pozíciók és események addig nem számolódnak (mint eddig a kalibráció nélküli futásnál).
+
+### Napló és eredmény
+- Az `analysis_debug_<id>.log` elején a pályakövetés módja, utána 25 képkockánként egy sor:
+  `F#… PÁLYA: ok, bizalom=0.91, inlier=430, elveszett=0, forrás=kézi`.
+- Az `events_<id>.json` új mezője: `"pitch_tracking": {"setup": "...", "frames": {"ok": …, "elveszett": …,
+  "kalibráció szükséges": …, "finomítás": …}}` – a kliens ebből jelezheti, ha kalibrálni kell.
+
+### Mért pontosság / sebesség (szintetikus teszt, `python3 tests/test_pitch_tracker.py`)
+Szintetikus jelenet: csíkos, zajos fű, valós méretű vonalak, lelátó, mozgó (köztük fehér mezes)
+játékosok, kamera 7 m magas árbocon 6 m-re az oldalvonal mögött, ±25° pásztázás, dőlés- és zoomváltozás, 300 képkocka.
+- Kézi kalibráció (±4 px kattintási hibával): csak terjesztéssel átlag ~0.6 m (a végén ~0.8 m, nő),
+  vonal-finomítással átlag ~0.25 m, max ~0.4 m (a látható pályaterület rácspontjain mérve).
+- Automatikus kalibráció: a vizsgált nézetek többségén 0.3–2.5 m hibával indul (egy nézetben
+  „kalibráció szükséges”), a követés közben a vonal-finomítás 0.2–0.4 m-re pontosítja.
+- Sebesség 1280×720-on (4 szál): átlag ~17 ms/képkocka, a finomító képkockákon ~50 ms;
+  egy automatikus kalibrációs próbálkozás ~2 mp.
+
+### Korlátok
+- A terjesztés tiszta forgást + zoomot feltételez (Veo: rögzített kamera); szélsőséges
+  bemozdulás, gyors pásztázás okozta elmosódás vagy vágás (visszajátszás) után az „elveszett”
+  állapotból a vonalakból próbál visszatalálni.
+- Az automatikus kalibráció a kamera helyére feltevést tesz (felezővonal vonala, közeli
+  oldalvonal mögött, 2.5–15 m magasan); máshol álló kameránál kézi kalibráció kell.
+- Csak egy vonalat (pl. az oldalvonalat) mutató képen a vonalak nem határozzák meg a helyzetet –
+  ilyenkor a terjesztés viszi tovább a becslést.
+- A teszt szintetikus; valódi Veo-felvételen a fűszín-beállítás (`grass_hsv_*`) és a
+  vonalak láthatósága (árnyék, kopott festés) befolyásolja a pontosságot – az áttekintő
+  lapokon a cián vonalakkal ellenőrizhető.
