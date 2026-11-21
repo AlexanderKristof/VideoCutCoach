@@ -1,0 +1,836 @@
+<title>Taktikai tábla</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=Inter:wght@400;500;600&display=swap">
+<style>
+/* Elrendezés: fejléc módváltóval; balra a pálya (vászon) eszköztárral, jobbra az oldalpanel – keskeny kijelzőn egymás alatt */
+:root {
+  --bg: #eef2ee;
+  --panel: #ffffff;
+  --fg: #16201a;
+  --muted: #5a6a5f;
+  --line: #d3dcd5;
+  --accent: #d9530b;
+  --accent-fg: #ffffff;
+  --chip: #e4ebe5;
+  --font-display: "Barlow Condensed", "Arial Narrow", "Roboto Condensed", sans-serif;
+  --font-body: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0e1411; --panel: #17201b; --fg: #e5ece7; --muted: #92a198; --line: #2a362f;
+    --accent: #ff7a2f; --accent-fg: #1a0d04; --chip: #222d27; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0e1411; --panel: #17201b; --fg: #e5ece7; --muted: #92a198; --line: #2a362f;
+  --accent: #ff7a2f; --accent-fg: #1a0d04; --chip: #222d27; color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--bg); color: var(--fg); font-family: var(--font-body);
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 12px 24px;
+}
+header.top { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 16px; margin-bottom: 12px; }
+h1 { font-family: var(--font-display); font-weight: 700; font-size: 28px; letter-spacing: .02em; margin: 0; text-transform: uppercase; }
+h1 span { color: var(--accent); }
+h2 { font-family: var(--font-display); font-weight: 600; font-size: 17px; letter-spacing: .06em; text-transform: uppercase; margin: 0 0 8px; color: var(--muted); }
+.tabs { display: flex; gap: 4px; background: var(--chip); padding: 4px; border-radius: 10px; }
+.tabs button { border: 0; background: transparent; color: var(--fg); font: 600 14px var(--font-body); padding: 8px 14px; border-radius: 7px; cursor: pointer; }
+.tabs button[aria-selected="true"] { background: var(--panel); box-shadow: 0 1px 3px rgba(0,0,0,.15); }
+.layout { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 16px; align-items: start; }
+@media (max-width: 900px) { .layout { grid-template-columns: minmax(0, 1fr); } }
+.stage { min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+.toolbar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.tool, .btn { border: 1px solid var(--line); background: var(--panel); color: var(--fg); font: 500 13px var(--font-body); padding: 7px 10px; border-radius: 8px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; min-height: 36px; }
+.tool[aria-pressed="true"] { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+.btn.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+.tool:focus-visible, .btn:focus-visible, .tabs button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.swatches { display: flex; gap: 4px; padding-left: 4px; }
+.swatch { width: 26px; height: 26px; border-radius: 50%; border: 2px solid var(--line); cursor: pointer; padding: 0; }
+.swatch[aria-pressed="true"] { border-color: var(--accent); box-shadow: 0 0 0 2px var(--panel) inset; }
+.sep { width: 1px; height: 26px; background: var(--line); margin: 0 2px; }
+#txt { width: 110px; }
+input[type="text"], input[type="number"], select, textarea { font: 14px var(--font-body); color: var(--fg); background: var(--bg); border: 1px solid var(--line); border-radius: 7px; padding: 6px 8px; min-height: 34px; }
+textarea { width: 100%; min-height: 90px; resize: vertical; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
+.canvas-wrap { position: relative; width: 100%; border-radius: 10px; overflow: hidden; background: #2f6b39; }
+canvas#pitch { display: block; width: 100%; touch-action: none; cursor: crosshair; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px; display: flex; flex-direction: column; gap: 18px; min-width: 0; }
+.row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+.hint { font-size: 12.5px; color: var(--muted); line-height: 1.45; margin: 0; }
+.list { display: flex; flex-direction: column; gap: 4px; max-height: 240px; overflow-y: auto; }
+.list .item { display: flex; align-items: center; gap: 8px; justify-content: space-between; padding: 6px 8px; border-radius: 7px; background: var(--chip); font-size: 13px; }
+.list .item button { border: 0; background: transparent; color: var(--fg); cursor: pointer; font: 500 12.5px var(--font-body); padding: 4px 6px; border-radius: 5px; }
+.list .item button:hover { background: var(--panel); }
+.ev-time { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 12px; min-width: 42px; }
+.timeline { display: flex; flex-direction: column; gap: 6px; }
+.timebar { position: relative; height: 34px; }
+#seek { width: 100%; position: absolute; inset: 8px 0 auto 0; accent-color: var(--accent); }
+.marks { position: absolute; left: 8px; right: 8px; top: 0; height: 8px; pointer-events: none; }
+.marks i { position: absolute; top: 0; width: 3px; height: 8px; border-radius: 2px; transform: translateX(-1px); }
+.clock { font: 700 22px var(--font-display); font-variant-numeric: tabular-nums; letter-spacing: .04em; }
+.legend { display: flex; flex-wrap: wrap; gap: 10px; font-size: 12px; color: var(--muted); }
+.legend b { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; vertical-align: -1px; }
+.badge { font-size: 11px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; padding: 2px 7px; border-radius: 99px; background: var(--chip); color: var(--muted); }
+.status { font-size: 12.5px; color: var(--muted); min-height: 1.2em; }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<header class="top">
+  <h1>Taktikai <span>tábla</span></h1>
+  <div class="tabs" role="tablist" aria-label="Mód">
+    <button id="tab-board" role="tab" aria-selected="true">Felállás és rajz</button>
+    <button id="tab-replay" role="tab" aria-selected="false">Meccs visszajátszás</button>
+  </div>
+</header>
+
+<div class="layout">
+  <section class="stage">
+    <div class="toolbar" id="toolbar" aria-label="Rajzeszközök">
+      <button class="tool" data-tool="move" aria-pressed="true" title="Játékosok és labda mozgatása">✥ Mozgatás</button>
+      <button class="tool" data-tool="arrow" aria-pressed="false" title="Passz / labda útja">➝ Nyíl</button>
+      <button class="tool" data-tool="run" aria-pressed="false" title="Futás labda nélkül">⇢ Futás</button>
+      <button class="tool" data-tool="line" aria-pressed="false" title="Egyenes vonal (pl. védelmi vonal)">— Vonal</button>
+      <button class="tool" data-tool="circle" aria-pressed="false" title="Karika">◯ Karika</button>
+      <button class="tool" data-tool="zone" aria-pressed="false" title="Terület kijelölése">▭ Zóna</button>
+      <button class="tool" data-tool="free" aria-pressed="false" title="Szabadkézi rajz">✎ Toll</button>
+      <button class="tool" data-tool="text" aria-pressed="false" title="Felirat a pályára">T Szöveg</button>
+      <input type="text" id="txt" value="Presszing!" aria-label="Felirat szövege">
+      <button class="tool" data-tool="erase" aria-pressed="false" title="Rajzelem törlése koppintással">⌫ Radír</button>
+      <span class="sep"></span>
+      <div class="swatches" id="swatches" aria-label="Szín"></div>
+      <span class="sep"></span>
+      <button class="btn" id="undo">↶ Vissza</button>
+      <button class="btn" id="clear">Rajzok törlése</button>
+    </div>
+    <div class="canvas-wrap"><canvas id="pitch" aria-label="Felülnézeti pálya"></canvas></div>
+
+    <div class="timeline" id="timeline" hidden>
+      <div class="row" style="justify-content: space-between;">
+        <div class="row">
+          <button class="btn primary" id="play">▶ Lejátszás</button>
+          <button class="btn" id="back5">−5 mp</button>
+          <button class="btn" id="fwd5">+5 mp</button>
+          <select id="speed" aria-label="Sebesség">
+            <option value="0.5">0,5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option><option value="8">8×</option>
+          </select>
+          <label class="row" style="font-size:13px;"><input type="checkbox" id="trails" checked> nyomvonal</label>
+        </div>
+        <div class="clock" id="clock">00:00</div>
+      </div>
+      <div class="timebar">
+        <div class="marks" id="marks"></div>
+        <input type="range" id="seek" min="0" max="100" step="0.1" value="0" aria-label="Idő">
+      </div>
+      <div class="legend">
+        <span><b style="background:#d93636"></b>Hazai</span><span><b style="background:#2f6fd6"></b>Vendég</span>
+        <span><b style="background:#f2c230"></b>Hazai kapus</span><span><b style="background:#9b5de5"></b>Vendég kapus</span>
+        <span><b style="background:#ffffff;border:1px solid #333"></b>Labda</span>
+      </div>
+    </div>
+  </section>
+
+  <aside class="panel" id="panel-board">
+    <div>
+      <h2>Felállás</h2>
+      <div class="row">
+        <label class="field">Hazai
+          <select id="form1"></select></label>
+        <label class="field">Vendég
+          <select id="form2"></select></label>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <label class="row" style="font-size:13px;"><input type="checkbox" id="show2" checked> vendég csapat látszik</label>
+        <button class="btn" id="reset-pos">Alapállás</button>
+      </div>
+    </div>
+    <div>
+      <h2>Kijelölt játékos</h2>
+      <p class="hint" id="sel-hint">Koppints egy játékosra a Mozgatás eszközzel, és itt átírhatod a mezszámát és a nevét.</p>
+      <div class="row" id="sel-edit" hidden>
+        <label class="field">Mez <input type="number" id="sel-num" min="1" max="99" style="width:70px"></label>
+        <label class="field" style="flex:1">Név <input type="text" id="sel-name" placeholder="pl. Kovács"></label>
+      </div>
+    </div>
+    <div>
+      <h2>Mentett táblák</h2>
+      <div class="row">
+        <input type="text" id="save-name" placeholder="pl. Szöglet – védekezés" style="flex:1; min-width:0">
+        <button class="btn primary" id="save">Mentés</button>
+      </div>
+      <div class="list" id="saved" style="margin-top:8px;"></div>
+      <p class="hint" style="margin-top:6px;">A mentés ebben a böngészőben marad. Másik eszközre a JSON-másolással vihető át.</p>
+      <div class="row" style="margin-top:8px;">
+        <button class="btn" id="copy-json">JSON másolása</button>
+        <button class="btn" id="paste-toggle">JSON beillesztése</button>
+      </div>
+      <div id="paste-box" hidden style="margin-top:8px;">
+        <textarea id="paste-area" placeholder="Illeszd be ide a másolt táblát…"></textarea>
+        <button class="btn primary" id="paste-load" style="margin-top:6px;">Betöltés</button>
+      </div>
+      <div class="status" id="board-status"></div>
+    </div>
+  </aside>
+
+  <aside class="panel" id="panel-replay" hidden>
+    <div>
+      <h2>Meccsadat</h2>
+      <p class="hint">Az elemző program <b>events_*.json</b> fájlját töltsd be. Addig egy bemutató meccs fut.</p>
+      <div class="row" style="margin-top:8px;">
+        <input type="file" id="file" accept=".json,application/json" aria-label="Meccsadat fájl">
+      </div>
+      <div class="row" style="margin-top:6px;">
+        <button class="btn" id="demo">Bemutató meccs</button>
+        <span class="badge" id="data-badge">bemutató</span>
+      </div>
+      <div class="status" id="replay-status"></div>
+    </div>
+    <div>
+      <h2>Események</h2>
+      <div class="list" id="events"></div>
+    </div>
+    <div>
+      <h2>Rajz-megállók</h2>
+      <p class="hint">Állítsd meg a lejátszást, és rajzolj. A rajz ahhoz a pillanathoz tapad: lejátszáskor ott megáll és megmutatja. Így építhetsz fel egy elemzést az edzői megbeszélésre.</p>
+      <div class="list" id="stops" style="margin-top:8px;"></div>
+    </div>
+  </aside>
+</div>
+
+<script>
+(() => {
+  "use strict";
+  // ---------- Alapadatok ----------
+  const L = 105, W = 68;                       // pályaméret méterben
+  const TEAM = { 1: "#d93636", 2: "#2f6fd6" };
+  const GK = { 1: "#f2c230", 2: "#9b5de5" };
+  const COLORS = ["#ffffff", "#ffd400", "#ff4d4d", "#4da3ff", "#111111"];
+  // Felállások: [x, y] a saját kaputól (x=0) jobbra támadó csapatra, méterben. Az első elem a kapus.
+  const FORMATIONS = {
+    "4-4-2":   [[4,34],[20,10],[18,26],[18,42],[20,58],[36,10],[34,27],[34,41],[36,58],[48,27],[48,41]],
+    "4-3-3":   [[4,34],[20,10],[18,26],[18,42],[20,58],[32,22],[30,34],[32,46],[46,12],[49,34],[46,56]],
+    "4-2-3-1": [[4,34],[20,10],[18,26],[18,42],[20,58],[29,27],[29,41],[39,14],[40,34],[39,54],[49,34]],
+    "3-5-2":   [[4,34],[18,20],[17,34],[18,48],[33,6],[30,24],[29,34],[30,44],[33,62],[47,27],[47,41]],
+    "5-3-2":   [[4,34],[22,6],[18,20],[17,34],[18,48],[22,62],[32,22],[30,34],[32,46],[46,27],[46,41]],
+    "3-4-3":   [[4,34],[18,20],[17,34],[18,48],[32,10],[30,27],[30,41],[32,58],[46,14],[49,34],[46,54]],
+  };
+  const NUMS = {
+    "4-4-2": [1,2,4,5,3,7,6,8,11,9,10], "4-3-3": [1,2,4,5,3,6,8,10,7,9,11], "4-2-3-1": [1,2,4,5,3,6,8,7,10,11,9],
+    "3-5-2": [1,4,5,6,2,8,10,7,3,9,11], "5-3-2": [1,2,4,5,6,3,8,10,7,9,11], "3-4-3": [1,4,5,6,2,8,10,3,7,9,11],
+  };
+  const EVENT_NAMES = {
+    shot: "Lövés", goal: "Gól", gk_save: "Védés", gk_claim_cross: "Beadás elfogása", gk_goal_kick: "Kirúgás",
+    gk_long_ball: "Ívelés", gk_short_pass: "Rövid passz", gk_conceded: "Kapott gól", gk_sweeper: "Kifutás",
+    gk_positioning_error: "Helyezkedési hiba",
+  };
+  const EVENT_COLORS = { goal: "#22c55e", shot: "#ff7a2f", gk_save: "#f2c230", gk_conceded: "#ef4444" };
+
+  const $ = (id) => document.getElementById(id);
+  const canvas = $("pitch"), ctx = canvas.getContext("2d");
+  const store = {
+    get(k, d) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch { return d; } },
+    set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); return true; } catch { return false; } },
+  };
+
+  // ---------- Állapot ----------
+  const state = {
+    mode: "board",
+    tool: "move",
+    color: COLORS[1],
+    board: { form1: "4-3-3", form2: "4-4-2", show2: true, players: [], ball: { x: 52.5, y: 34 }, drawings: [] },
+    replay: { data: null, t: 0, playing: false, speed: 1, stops: [], trails: true },
+    selected: null,
+    undo: [],
+  };
+
+  function teamPlayers(team, form) {
+    const pos = FORMATIONS[form], nums = NUMS[form];
+    return pos.map(([x, y], i) => ({
+      id: `${team}-${i}`, team, gk: i === 0, num: nums[i], name: "",
+      x: team === 1 ? x : L - x, y: team === 1 ? y : W - y,
+    }));
+  }
+  function resetPlayers() {
+    state.board.players = [...teamPlayers(1, state.board.form1), ...teamPlayers(2, state.board.form2)];
+    state.board.ball = { x: 52.5, y: 34 };
+  }
+
+  // ---------- Geometria: méter <-> képpont ----------
+  let view = { vertical: false, s: 1, ox: 0, oy: 0, cw: 0, ch: 0, dpr: 1 };
+  const MARGIN = 3; // méter a pálya körül
+  function layout() {
+    const wrap = canvas.parentElement;
+    const cw = wrap.clientWidth;
+    const vertical = cw < 560 && window.innerHeight > window.innerWidth;
+    const worldW = (vertical ? W : L) + MARGIN * 2, worldH = (vertical ? L : W) + MARGIN * 2;
+    const s = cw / worldW;
+    const ch = Math.round(worldH * s);
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.round(cw * dpr); canvas.height = Math.round(ch * dpr);
+    canvas.style.height = ch + "px";
+    view = { vertical, s, ox: MARGIN * s, oy: MARGIN * s, cw, ch, dpr };
+    draw();
+  }
+  function toScreen(x, y) {
+    return view.vertical ? [view.ox + y * view.s, view.oy + (L - x) * view.s] : [view.ox + x * view.s, view.oy + y * view.s];
+  }
+  function toWorld(px, py) {
+    return view.vertical ? [L - (py - view.oy) / view.s, (px - view.ox) / view.s] : [(px - view.ox) / view.s, (py - view.oy) / view.s];
+  }
+  const m = (meters) => meters * view.s;
+
+  // ---------- Rajzolás ----------
+  function drawPitch() {
+    const { cw, ch } = view;
+    ctx.fillStyle = "#2f6b39"; ctx.fillRect(0, 0, cw, ch);
+    // csíkos fű
+    for (let i = 0; i < 12; i++) {
+      if (i % 2) continue;
+      const x0 = (L / 12) * i, x1 = (L / 12) * (i + 1);
+      const [ax, ay] = toScreen(x0, 0), [bx, by] = toScreen(x1, W);
+      ctx.fillStyle = "#357540";
+      ctx.fillRect(Math.min(ax, bx), Math.min(ay, by), Math.abs(bx - ax), Math.abs(by - ay));
+    }
+    ctx.strokeStyle = "rgba(255,255,255,.9)"; ctx.lineWidth = Math.max(1.5, m(0.12));
+    const line = (pts) => { ctx.beginPath(); pts.forEach(([x, y], i) => { const [sx, sy] = toScreen(x, y); i ? ctx.lineTo(sx, sy) : ctx.moveTo(sx, sy); }); ctx.stroke(); };
+    const rect = (x0, y0, x1, y1) => line([[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]]);
+    const arc = (cx, cy, r, a0, a1) => {
+      const pts = []; for (let i = 0; i <= 40; i++) { const a = a0 + (a1 - a0) * i / 40; pts.push([cx + r * Math.cos(a), cy + r * Math.sin(a)]); } line(pts);
+    };
+    rect(0, 0, L, W); line([[L / 2, 0], [L / 2, W]]);
+    arc(L / 2, W / 2, 9.15, 0, Math.PI * 2);
+    for (const [g, dir] of [[0, 1], [L, -1]]) {
+      rect(g, 13.84, g + dir * 16.5, 54.16); rect(g, 24.84, g + dir * 5.5, 43.16);
+      const spot = g + dir * 11;
+      const a = Math.acos(5.5 / 9.15);
+      arc(spot, W / 2, 9.15, dir > 0 ? -a : Math.PI - a, dir > 0 ? a : Math.PI + a);
+      const [sx, sy] = toScreen(spot, W / 2); ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(sx, sy, Math.max(1.5, m(0.2)), 0, 7); ctx.fill();
+      ctx.save(); ctx.lineWidth = Math.max(3, m(0.5)); line([[g, 30.34], [g, 37.66]]); ctx.restore();
+    }
+    for (const [cx, cy, a0] of [[0, 0, 0], [L, 0, Math.PI / 2], [L, W, Math.PI], [0, W, -Math.PI / 2]]) arc(cx, cy, 1, a0, a0 + Math.PI / 2);
+    const [cx, cy] = toScreen(L / 2, W / 2); ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(cx, cy, Math.max(1.5, m(0.2)), 0, 7); ctx.fill();
+  }
+
+  function playerRadius() { return Math.max(9, m(1.5)); }
+
+  function drawPlayer(p, alpha = 1) {
+    const [sx, sy] = toScreen(p.x, p.y), r = playerRadius();
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = p.gk ? GK[p.team] : TEAM[p.team];
+    ctx.beginPath(); ctx.arc(sx, sy, r, 0, 7); ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = state.selected === p.id ? "#ffffff" : "rgba(0,0,0,.55)"; ctx.stroke();
+    if (p.num != null) {
+      ctx.fillStyle = p.gk && p.team === 1 ? "#1a1a1a" : "#ffffff";
+      ctx.font = `700 ${Math.round(r * 1.05)}px "Barlow Condensed", "Arial Narrow", sans-serif`;
+      ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillText(String(p.num), sx, sy + 1);
+    }
+    if (p.name) {
+      ctx.font = `600 ${Math.max(10, Math.round(r * 0.8))}px Inter, system-ui, sans-serif`;
+      ctx.textAlign = "center"; ctx.textBaseline = "top";
+      ctx.lineWidth = 3; ctx.strokeStyle = "rgba(0,0,0,.6)"; ctx.strokeText(p.name, sx, sy + r + 2);
+      ctx.fillStyle = "#fff"; ctx.fillText(p.name, sx, sy + r + 2);
+    }
+    ctx.globalAlpha = 1;
+  }
+  function drawBall(b) {
+    if (!b) return;
+    const [sx, sy] = toScreen(b.x, b.y), r = Math.max(5, m(0.7));
+    ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(sx, sy, r, 0, 7); ctx.fill();
+    ctx.lineWidth = 1.5; ctx.strokeStyle = "#111"; ctx.stroke();
+  }
+
+  function arrowHead(x1, y1, x2, y2, size) {
+    const a = Math.atan2(y2 - y1, x2 - x1);
+    ctx.beginPath(); ctx.moveTo(x2, y2);
+    ctx.lineTo(x2 - size * Math.cos(a - 0.45), y2 - size * Math.sin(a - 0.45));
+    ctx.lineTo(x2 - size * Math.cos(a + 0.45), y2 - size * Math.sin(a + 0.45));
+    ctx.closePath(); ctx.fill();
+  }
+  function drawItem(d, preview = false) {
+    ctx.strokeStyle = d.color; ctx.fillStyle = d.color;
+    ctx.lineWidth = Math.max(2.5, m(0.35)); ctx.lineCap = "round"; ctx.lineJoin = "round";
+    ctx.globalAlpha = preview ? 0.75 : 1;
+    const P = d.pts.map(([x, y]) => toScreen(x, y));
+    if (d.type === "arrow" || d.type === "run" || d.type === "line") {
+      if (P.length < 2) { ctx.globalAlpha = 1; return; }
+      const [[x1, y1], [x2, y2]] = [P[0], P[P.length - 1]];
+      ctx.setLineDash(d.type === "run" ? [m(1.2), m(0.9)] : []);
+      const head = d.type === "line" ? 0 : Math.max(10, m(1.6));
+      const a = Math.atan2(y2 - y1, x2 - x1);
+      ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2 - head * 0.7 * Math.cos(a), y2 - head * 0.7 * Math.sin(a)); ctx.stroke();
+      ctx.setLineDash([]);
+      if (head) arrowHead(x1, y1, x2, y2, head);
+    } else if (d.type === "circle") {
+      if (P.length < 2) { ctx.globalAlpha = 1; return; }
+      const r = Math.hypot(P[1][0] - P[0][0], P[1][1] - P[0][1]);
+      ctx.beginPath(); ctx.arc(P[0][0], P[0][1], r, 0, 7); ctx.stroke();
+    } else if (d.type === "zone") {
+      if (P.length < 2) { ctx.globalAlpha = 1; return; }
+      const x = Math.min(P[0][0], P[1][0]), y = Math.min(P[0][1], P[1][1]);
+      const w = Math.abs(P[1][0] - P[0][0]), h = Math.abs(P[1][1] - P[0][1]);
+      ctx.globalAlpha = (preview ? 0.75 : 1) * 0.22; ctx.fillRect(x, y, w, h);
+      ctx.globalAlpha = preview ? 0.75 : 1; ctx.setLineDash([m(0.8), m(0.6)]); ctx.strokeRect(x, y, w, h); ctx.setLineDash([]);
+    } else if (d.type === "free") {
+      ctx.beginPath(); P.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)); ctx.stroke();
+    } else if (d.type === "text") {
+      const size = Math.max(14, m(2.6));
+      ctx.font = `700 ${size}px "Barlow Condensed", "Arial Narrow", sans-serif`;
+      ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.lineWidth = 4; ctx.strokeStyle = "rgba(0,0,0,.65)"; ctx.strokeText(d.text, P[0][0], P[0][1]);
+      ctx.fillStyle = d.color; ctx.fillText(d.text, P[0][0], P[0][1]);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  let drawing = null; // folyamatban lévő rajzelem
+  function currentDrawings() {
+    if (state.mode === "board") return state.board.drawings;
+    const st = activeStop();
+    return st ? st.items : [];
+  }
+  function draw() {
+    ctx.setTransform(view.dpr, 0, 0, view.dpr, 0, 0);
+    drawPitch();
+    if (state.mode === "board") {
+      currentDrawings().forEach((d) => drawItem(d));
+      state.board.players.filter((p) => p.team === 1 || state.board.show2).forEach((p) => drawPlayer(p));
+      drawBall(state.board.ball);
+    } else {
+      drawReplayFrame();
+      currentDrawings().forEach((d) => drawItem(d));
+    }
+    if (drawing) drawItem(drawing, true);
+  }
+
+  // ---------- Visszajátszás ----------
+  function sampleAt(samples, t, maxGap = 1.2) {
+    // samples: [[t, x, y], ...] idő szerint rendezve; lineáris interpoláció
+    if (!samples.length || t < samples[0][0] - 0.3 || t > samples[samples.length - 1][0] + 0.3) return null;
+    let lo = 0, hi = samples.length - 1;
+    while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (samples[mid][0] <= t) lo = mid; else hi = mid; }
+    const a = samples[lo], b = samples[hi];
+    if (t <= a[0]) return { x: a[1], y: a[2] };
+    if (t >= b[0]) return { x: b[1], y: b[2] };
+    if (b[0] - a[0] > maxGap) return t - a[0] < 0.3 ? { x: a[1], y: a[2] } : null;
+    const k = (t - a[0]) / (b[0] - a[0]);
+    return { x: a[1] + (b[1] - a[1]) * k, y: a[2] + (b[2] - a[2]) * k };
+  }
+  function drawReplayFrame() {
+    const d = state.replay.data; if (!d) return;
+    const t = state.replay.t;
+    if (state.replay.trails) {
+      for (const tr of d.tracks) {
+        const pts = [];
+        for (let dt = -3; dt <= 0.001; dt += 0.25) { const p = sampleAt(tr.samples, t + dt); if (p) pts.push(toScreen(p.x, p.y)); }
+        if (pts.length > 1) {
+          ctx.strokeStyle = (tr.keeper ? GK : TEAM)[tr.team] || "#ccc"; ctx.globalAlpha = 0.35; ctx.lineWidth = 2;
+          ctx.beginPath(); pts.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)); ctx.stroke(); ctx.globalAlpha = 1;
+        }
+      }
+    }
+    for (const tr of d.tracks) {
+      const p = sampleAt(tr.samples, t);
+      if (p) drawPlayer({ id: "r" + tr.id, team: tr.team, gk: tr.keeper, num: tr.label, x: p.x, y: p.y });
+    }
+    if (d.ball.length) { const b = sampleAt(d.ball, t, 0.8); if (b) drawBall(b); }
+  }
+
+  function normalizeMatch(raw) {
+    // Elfogadott formák: events JSON 'trajectories' mezővel (objektum vagy lista), opcionális 'ball' / 'ball_trajectory'.
+    // Az elemző program formája: trajectories = {hz, tracks: {id: {team, keeper, points: [[x, y, t], ...]}}}
+    const tracks = [];
+    let tr = raw.trajectories || raw.tracks || {};
+    const xyt = !!(tr && tr.tracks);
+    if (xyt) tr = tr.tracks;
+    const list = Array.isArray(tr) ? tr : Object.entries(tr).map(([id, v]) => ({ id, ...(Array.isArray(v) ? { points: v } : v) }));
+    for (const v of list) {
+      const pts = v.points || v.samples || v.p || v.positions || [];
+      const samples = pts.map((q) => Array.isArray(q) ? (xyt ? [+q[2], +q[0], +q[1]] : [+q[0], +q[1], +q[2]]) : [+q.t, +q.x, +q.y])
+        .filter((q) => q.every(Number.isFinite)).sort((a, b) => a[0] - b[0]);
+      if (samples.length < 2) continue;
+      let team = v.team ?? v.team_id ?? 1; if (typeof team === "string") team = team.endsWith("2") ? 2 : 1;
+      tracks.push({ id: v.id ?? v.track_id, team, keeper: !!(v.keeper ?? v.is_keeper), label: v.num ?? v.track_id ?? v.id, samples });
+    }
+    const ballRaw = raw.ball || raw.ball_trajectory || (raw.trajectories && raw.trajectories.ball) || [];
+    const ball = (Array.isArray(ballRaw) ? ballRaw : ballRaw.points || []).map((q) => Array.isArray(q) ? [+q[0], +q[1], +q[2]] : [+q.t, +q.x, +q.y])
+      .filter((q) => q.every(Number.isFinite)).sort((a, b) => a[0] - b[0]);
+    const events = (raw.events || []).filter((e) => Number.isFinite(+e.time)).map((e) => ({ ...e, time: +e.time }));
+    let t0 = Infinity, t1 = -Infinity;
+    for (const t of tracks) { t0 = Math.min(t0, t.samples[0][0]); t1 = Math.max(t1, t.samples[t.samples.length - 1][0]); }
+    if (!tracks.length) return null;
+    return { tracks, ball, events, t0, t1 };
+  }
+
+  function demoMatch() {
+    // Bemutató: 90 mp kitalált játék két 4-3-3 / 4-4-2 csapattal, 5 Hz-es mintavétellel.
+    const rnd = mulberry(7);
+    const base = [...teamPlayers(1, "4-3-3"), ...teamPlayers(2, "4-4-2")];
+    const T = 90, hz = 5, tracks = [], ball = [];
+    // labda útvonala kulcspontokon át
+    const keys = [[0, 52.5, 34], [6, 40, 20], [12, 55, 12], [18, 70, 22], [24, 62, 40], [30, 78, 50], [34, 88, 38], [36, 101, 35.5], [38, 92, 30],
+      [44, 70, 30], [50, 50, 48], [56, 35, 55], [60, 22, 40], [64, 14, 30], [66, 3, 33], [70, 20, 20], [76, 45, 14], [82, 60, 30], [90, 52, 34]];
+    const ballAt = (t) => { for (let i = 1; i < keys.length; i++) if (t <= keys[i][0]) { const a = keys[i - 1], b = keys[i], k = (t - a[0]) / (b[0] - a[0]); return [a[1] + (b[1] - a[1]) * k, a[2] + (b[2] - a[2]) * k]; } return [52.5, 34]; };
+    for (const p of base) {
+      const samples = [], ph = rnd() * 6, amp = 2 + rnd() * 3;
+      for (let i = 0; i <= T * hz; i++) {
+        const t = i / hz, [bx, by] = ballAt(t);
+        const pull = p.gk ? 0.08 : 0.28;
+        const x = p.x + (bx - 52.5) * pull + Math.sin(t / 3 + ph) * amp;
+        const y = p.y + (by - p.y) * (p.gk ? 0.15 : 0.18) + Math.cos(t / 4 + ph) * amp * 0.6;
+        samples.push([t, Math.max(0.5, Math.min(L - 0.5, x)), Math.max(0.5, Math.min(W - 0.5, y))]);
+      }
+      tracks.push({ id: p.id, team: p.team, keeper: p.gk, label: p.num, samples });
+    }
+    for (let i = 0; i <= T * hz; i++) { const t = i / hz, [x, y] = ballAt(t); ball.push([t, x, y]); }
+    const events = [
+      { time: 34, type: "shot", team: "team1", desc: "Lövés kapura – hazai", on_target: true },
+      { time: 36.2, type: "gk_save", team: "team2", desc: "Kapus védés – vendég" },
+      { time: 39, type: "gk_long_ball", team: "team2", desc: "Ívelés (45 m)" },
+      { time: 64, type: "shot", team: "team2", desc: "Lövés kapura – vendég", on_target: true },
+      { time: 66, type: "goal", team: "team2", desc: "Valószínű gól – vendég" },
+      { time: 70, type: "gk_conceded", team: "team1", desc: "Kapott gól – hazai kapus" },
+    ];
+    return { tracks, ball, events, t0: 0, t1: T };
+  }
+  function mulberry(a) { return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+
+  function fmt(t) { t = Math.max(0, t); const mm = Math.floor(t / 60), ss = Math.floor(t % 60); return `${String(mm).padStart(2, "0")}:${String(ss).padStart(2, "0")}`; }
+
+  function loadMatch(d, label) {
+    state.replay.data = d; state.replay.t = d.t0; state.replay.playing = false; state.replay.stops = [];
+    $("seek").min = d.t0; $("seek").max = d.t1; $("seek").value = d.t0;
+    $("data-badge").textContent = label;
+    renderMarks(); renderEvents(); renderStops(); updatePlay(); draw(); updateClock();
+  }
+  function renderMarks() {
+    const d = state.replay.data, box = $("marks"); box.innerHTML = "";
+    if (!d) return;
+    for (const e of d.events) {
+      const i = document.createElement("i");
+      i.style.left = `${((e.time - d.t0) / Math.max(1e-6, d.t1 - d.t0)) * 100}%`;
+      i.style.background = EVENT_COLORS[e.type] || "#cbd5d0";
+      box.appendChild(i);
+    }
+    for (const s of state.replay.stops) {
+      const i = document.createElement("i");
+      i.style.left = `${((s.t - d.t0) / Math.max(1e-6, d.t1 - d.t0)) * 100}%`;
+      i.style.background = "var(--accent)"; i.style.height = "12px"; i.style.top = "-2px";
+      box.appendChild(i);
+    }
+  }
+  function renderEvents() {
+    const d = state.replay.data, box = $("events"); box.innerHTML = "";
+    if (!d || !d.events.length) { box.innerHTML = '<p class="hint">Ebben az adatban nincs esemény.</p>'; return; }
+    for (const e of d.events) {
+      const row = document.createElement("div"); row.className = "item";
+      const name = EVENT_NAMES[e.type] || e.type;
+      row.innerHTML = `<span class="ev-time">${fmt(e.time)}</span><span style="flex:1;min-width:0">${escapeHtml(name)}${e.team ? ` · ${e.team === "team1" ? "hazai" : "vendég"}` : ""}</span>`;
+      const b = document.createElement("button"); b.textContent = "Ugrás";
+      b.onclick = () => { seek(e.time - 3); };
+      row.appendChild(b); box.appendChild(row);
+    }
+  }
+  function renderStops() {
+    const box = $("stops"); box.innerHTML = "";
+    if (!state.replay.stops.length) { box.innerHTML = '<p class="hint">Még nincs rajz-megálló.</p>'; renderMarks(); return; }
+    state.replay.stops.sort((a, b) => a.t - b.t).forEach((s) => {
+      const row = document.createElement("div"); row.className = "item";
+      row.innerHTML = `<span class="ev-time">${fmt(s.t)}</span><span style="flex:1">${s.items.length} rajzelem</span>`;
+      const go = document.createElement("button"); go.textContent = "Ugrás"; go.onclick = () => { state.replay.playing = false; updatePlay(); seek(s.t, true); };
+      const del = document.createElement("button"); del.textContent = "Törlés"; del.onclick = () => { state.replay.stops = state.replay.stops.filter((x) => x !== s); renderStops(); draw(); };
+      row.append(go, del); box.appendChild(row);
+    });
+    renderMarks();
+  }
+  function activeStop() {
+    const t = state.replay.t;
+    return state.replay.stops.find((s) => Math.abs(s.t - t) < 0.12) || null;
+  }
+  function seek(t, exact = false) {
+    const d = state.replay.data; if (!d) return;
+    state.replay.t = Math.max(d.t0, Math.min(d.t1, t));
+    if (!exact) lastPassed = state.replay.t;
+    $("seek").value = state.replay.t; updateClock(); draw();
+  }
+  function updateClock() { $("clock").textContent = fmt(state.replay.t); }
+  function updatePlay() { $("play").textContent = state.replay.playing ? "❚❚ Szünet" : "▶ Lejátszás"; }
+
+  let lastTs = null, lastPassed = 0;
+  function tick(ts) {
+    if (state.mode === "replay" && state.replay.playing && state.replay.data) {
+      if (lastTs != null) {
+        const d = state.replay.data, prev = state.replay.t;
+        let next = prev + ((ts - lastTs) / 1000) * state.replay.speed;
+        // rajz-megállónál automatikus szünet
+        const stop = state.replay.stops.find((s) => s.t > prev + 1e-3 && s.t <= next && s.t > lastPassed + 1e-3);
+        if (stop) { next = stop.t; state.replay.playing = false; lastPassed = stop.t; updatePlay(); }
+        if (next >= d.t1) { next = d.t1; state.replay.playing = false; updatePlay(); }
+        state.replay.t = next; $("seek").value = next; updateClock(); draw();
+      }
+      lastTs = ts;
+    } else lastTs = null;
+    requestAnimationFrame(tick);
+  }
+
+  // ---------- Bevitel ----------
+  function pointerPos(e) {
+    const r = canvas.getBoundingClientRect();
+    return [e.clientX - r.left, e.clientY - r.top];
+  }
+  function hitPlayer(px, py) {
+    if (state.mode !== "board") return null;
+    const r = playerRadius() * 1.3;
+    const b = state.board.ball, [bx, by] = toScreen(b.x, b.y);
+    if (Math.hypot(px - bx, py - by) < Math.max(12, m(1.2))) return { ball: true };
+    let best = null, bd = r;
+    for (const p of state.board.players) {
+      if (p.team === 2 && !state.board.show2) continue;
+      const [sx, sy] = toScreen(p.x, p.y), dd = Math.hypot(px - sx, py - sy);
+      if (dd < bd) { bd = dd; best = p; }
+    }
+    return best;
+  }
+  function distToSeg(px, py, ax, ay, bx, by) {
+    const dx = bx - ax, dy = by - ay, l2 = dx * dx + dy * dy || 1;
+    const k = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / l2));
+    return Math.hypot(px - (ax + k * dx), py - (ay + k * dy));
+  }
+  function hitDrawing(px, py) {
+    const list = currentDrawings(); let best = -1, bd = 14;
+    list.forEach((d, i) => {
+      const P = d.pts.map(([x, y]) => toScreen(x, y)); let dd = Infinity;
+      if (d.type === "circle" && P.length > 1) { const r = Math.hypot(P[1][0] - P[0][0], P[1][1] - P[0][1]); dd = Math.abs(Math.hypot(px - P[0][0], py - P[0][1]) - r); }
+      else if (d.type === "zone" && P.length > 1) { const x0 = Math.min(P[0][0], P[1][0]), x1 = Math.max(P[0][0], P[1][0]), y0 = Math.min(P[0][1], P[1][1]), y1 = Math.max(P[0][1], P[1][1]); dd = px >= x0 && px <= x1 && py >= y0 && py <= y1 ? 0 : Infinity; }
+      else if (d.type === "text") dd = Math.hypot(px - P[0][0], py - P[0][1]) - 10;
+      else if (d.type === "free") { for (let j = 1; j < P.length; j++) dd = Math.min(dd, distToSeg(px, py, ...P[j - 1], ...P[j])); }
+      else if (P.length > 1) dd = distToSeg(px, py, ...P[0], ...P[P.length - 1]);
+      if (dd < bd) { bd = dd; best = i; }
+    });
+    return best;
+  }
+  function pushUndo() {
+    state.undo.push(JSON.stringify({ mode: state.mode, board: state.board, stops: state.replay.stops }));
+    if (state.undo.length > 60) state.undo.shift();
+  }
+  function ensureStop() {
+    // Visszajátszás módban a rajz az aktuális pillanathoz tartozó megállóra kerül
+    if (state.replay.playing) { state.replay.playing = false; updatePlay(); }
+    let st = activeStop();
+    if (!st) { st = { t: state.replay.t, items: [] }; state.replay.stops.push(st); }
+    return st;
+  }
+
+  let dragging = null;
+  canvas.addEventListener("pointerdown", (e) => {
+    canvas.setPointerCapture(e.pointerId);
+    const [px, py] = pointerPos(e), [wx, wy] = toWorld(px, py);
+    if (state.tool === "move") {
+      const hit = hitPlayer(px, py);
+      if (hit) {
+        pushUndo(); dragging = hit;
+        state.selected = hit.ball ? null : hit.id; renderSelected(); draw();
+      } else if (state.mode === "replay" && state.replay.data) {
+        state.replay.playing = !state.replay.playing; updatePlay();
+      }
+      return;
+    }
+    if (state.mode === "replay" && !state.replay.data) return;
+    if (state.tool === "erase") {
+      const i = hitDrawing(px, py);
+      if (i >= 0) {
+        pushUndo();
+        if (state.mode === "board") state.board.drawings.splice(i, 1);
+        else { const st = activeStop(); st.items.splice(i, 1); if (!st.items.length) state.replay.stops = state.replay.stops.filter((s) => s !== st); renderStops(); }
+        draw(); persistDraft();
+      }
+      return;
+    }
+    if (state.tool === "text") {
+      const text = $("txt").value.trim(); if (!text) return;
+      pushUndo();
+      const item = { type: "text", pts: [[wx, wy]], color: state.color, text };
+      (state.mode === "board" ? state.board.drawings : ensureStop().items).push(item);
+      if (state.mode === "replay") renderStops();
+      draw(); persistDraft(); return;
+    }
+    drawing = { type: state.tool, pts: [[wx, wy], [wx, wy]], color: state.color };
+    if (state.tool === "free") drawing.pts = [[wx, wy]];
+  });
+  canvas.addEventListener("pointermove", (e) => {
+    const [px, py] = pointerPos(e), [wx, wy] = toWorld(px, py);
+    if (dragging) {
+      const x = Math.max(-2, Math.min(L + 2, wx)), y = Math.max(-2, Math.min(W + 2, wy));
+      if (dragging.ball) { state.board.ball.x = x; state.board.ball.y = y; } else { dragging.x = x; dragging.y = y; }
+      draw(); return;
+    }
+    if (!drawing) return;
+    if (drawing.type === "free") { const last = drawing.pts[drawing.pts.length - 1]; if (Math.hypot(wx - last[0], wy - last[1]) > 0.4) drawing.pts.push([wx, wy]); }
+    else drawing.pts[1] = [wx, wy];
+    draw();
+  });
+  const endPointer = () => {
+    if (dragging) { dragging = null; persistDraft(); return; }
+    if (!drawing) return;
+    const d = drawing; drawing = null;
+    const len = d.type === "free" ? d.pts.length : Math.hypot(d.pts[1][0] - d.pts[0][0], d.pts[1][1] - d.pts[0][1]);
+    if ((d.type === "free" && len < 3) || (d.type !== "free" && len < 0.8)) { draw(); return; }
+    pushUndo();
+    if (state.mode === "board") state.board.drawings.push(d);
+    else { ensureStop().items.push(d); renderStops(); }
+    draw(); persistDraft();
+  };
+  canvas.addEventListener("pointerup", endPointer);
+  canvas.addEventListener("pointercancel", () => { drawing = null; dragging = null; draw(); });
+
+  // ---------- UI kötések ----------
+  function setTool(t) {
+    state.tool = t;
+    document.querySelectorAll("[data-tool]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.tool === t)));
+    canvas.style.cursor = t === "move" ? "grab" : t === "erase" ? "not-allowed" : "crosshair";
+  }
+  document.querySelectorAll("[data-tool]").forEach((b) => b.addEventListener("click", () => setTool(b.dataset.tool)));
+  COLORS.forEach((c, i) => {
+    const b = document.createElement("button"); b.className = "swatch"; b.style.background = c;
+    b.setAttribute("aria-label", ["fehér", "sárga", "piros", "kék", "fekete"][i]);
+    b.setAttribute("aria-pressed", String(c === state.color));
+    b.onclick = () => { state.color = c; document.querySelectorAll(".swatch").forEach((s) => s.setAttribute("aria-pressed", String(s === b))); };
+    $("swatches").appendChild(b);
+  });
+  $("undo").onclick = () => {
+    const s = state.undo.pop(); if (!s) return;
+    const o = JSON.parse(s); state.board = o.board; state.replay.stops = o.stops;
+    syncBoardInputs(); renderStops(); renderSelected(); draw(); persistDraft();
+  };
+  $("clear").onclick = () => {
+    pushUndo();
+    if (state.mode === "board") state.board.drawings = [];
+    else { const st = activeStop(); if (st) state.replay.stops = state.replay.stops.filter((s) => s !== st); renderStops(); }
+    draw(); persistDraft();
+  };
+
+  for (const id of ["form1", "form2"]) {
+    const sel = $(id);
+    Object.keys(FORMATIONS).forEach((f) => { const o = document.createElement("option"); o.value = f; o.textContent = f; sel.appendChild(o); });
+    sel.onchange = () => {
+      pushUndo(); const team = id === "form1" ? 1 : 2; state.board[id] = sel.value;
+      const fresh = teamPlayers(team, sel.value);
+      state.board.players = state.board.players.filter((p) => p.team !== team).concat(fresh);
+      draw(); persistDraft();
+    };
+  }
+  $("show2").onchange = (e) => { state.board.show2 = e.target.checked; draw(); persistDraft(); };
+  $("reset-pos").onclick = () => { pushUndo(); resetPlayers(); state.selected = null; renderSelected(); draw(); persistDraft(); };
+  function syncBoardInputs() { $("form1").value = state.board.form1; $("form2").value = state.board.form2; $("show2").checked = state.board.show2; }
+
+  function renderSelected() {
+    const p = state.board.players.find((q) => q.id === state.selected);
+    $("sel-edit").hidden = !p; $("sel-hint").hidden = !!p;
+    if (p) { $("sel-num").value = p.num ?? ""; $("sel-name").value = p.name || ""; }
+  }
+  $("sel-num").oninput = (e) => { const p = state.board.players.find((q) => q.id === state.selected); if (p) { p.num = e.target.value === "" ? null : +e.target.value; draw(); persistDraft(); } };
+  $("sel-name").oninput = (e) => { const p = state.board.players.find((q) => q.id === state.selected); if (p) { p.name = e.target.value.slice(0, 16); draw(); persistDraft(); } };
+
+  // Mentések (böngészőben)
+  function persistDraft() { if (state.mode === "board") store.set("tt-draft", state.board); }
+  function renderSaved() {
+    const list = store.get("tt-saved", []), box = $("saved"); box.innerHTML = "";
+    if (!list.length) { box.innerHTML = '<p class="hint">Még nincs mentett tábla.</p>'; return; }
+    list.forEach((s, i) => {
+      const row = document.createElement("div"); row.className = "item";
+      const name = document.createElement("span"); name.style.flex = "1"; name.style.minWidth = "0"; name.textContent = s.name;
+      const load = document.createElement("button"); load.textContent = "Betöltés";
+      load.onclick = () => { pushUndo(); state.board = JSON.parse(JSON.stringify(s.board)); syncBoardInputs(); draw(); persistDraft(); status("board-status", `Betöltve: ${s.name}`); };
+      const del = document.createElement("button"); del.textContent = "Törlés";
+      del.onclick = () => { const l = store.get("tt-saved", []); l.splice(i, 1); store.set("tt-saved", l); renderSaved(); };
+      row.append(name, load, del); box.appendChild(row);
+    });
+  }
+  $("save").onclick = () => {
+    const name = $("save-name").value.trim() || `Tábla ${new Date().toLocaleString("hu-HU")}`;
+    const list = store.get("tt-saved", []); list.unshift({ name, board: state.board });
+    status("board-status", store.set("tt-saved", list) ? `Elmentve: ${name}` : "A böngésző nem engedi a mentést. Használd a JSON másolást.");
+    $("save-name").value = ""; renderSaved();
+  };
+  $("copy-json").onclick = async () => {
+    const text = JSON.stringify({ taktikai_tabla: 1, board: state.board });
+    try { await navigator.clipboard.writeText(text); status("board-status", "A tábla JSON-ja a vágólapon van."); }
+    catch { $("paste-box").hidden = false; $("paste-area").value = text; $("paste-area").select(); status("board-status", "Másold ki a kijelölt szöveget."); }
+  };
+  $("paste-toggle").onclick = () => { $("paste-box").hidden = !$("paste-box").hidden; };
+  $("paste-load").onclick = () => {
+    try {
+      const o = JSON.parse($("paste-area").value);
+      if (!o.board || !Array.isArray(o.board.players)) throw new Error();
+      pushUndo(); state.board = o.board; syncBoardInputs(); draw(); persistDraft(); status("board-status", "Tábla betöltve.");
+    } catch { status("board-status", "Ez nem taktikai tábla JSON. Másold be újra a teljes szöveget."); }
+  };
+  function status(id, msg) { $(id).textContent = msg; }
+
+  // Mód váltás
+  function setMode(mode) {
+    state.mode = mode; drawing = null; dragging = null;
+    $("tab-board").setAttribute("aria-selected", String(mode === "board"));
+    $("tab-replay").setAttribute("aria-selected", String(mode === "replay"));
+    $("panel-board").hidden = mode !== "board"; $("panel-replay").hidden = mode !== "replay"; $("timeline").hidden = mode !== "replay";
+    if (mode === "replay" && !state.replay.data) loadMatch(demoMatch(), "bemutató");
+    try { history.replaceState(null, "", mode === "replay" ? "#visszajatszas" : "#tabla"); } catch {}
+    draw();
+  }
+  $("tab-board").onclick = () => setMode("board");
+  $("tab-replay").onclick = () => setMode("replay");
+
+  $("play").onclick = () => { if (!state.replay.data) return; if (state.replay.t >= state.replay.data.t1) seek(state.replay.data.t0); state.replay.playing = !state.replay.playing; updatePlay(); };
+  $("back5").onclick = () => seek(state.replay.t - 5);
+  $("fwd5").onclick = () => seek(state.replay.t + 5);
+  $("speed").onchange = (e) => { state.replay.speed = +e.target.value; };
+  $("trails").onchange = (e) => { state.replay.trails = e.target.checked; draw(); };
+  $("seek").oninput = (e) => seek(+e.target.value);
+  $("demo").onclick = () => { loadMatch(demoMatch(), "bemutató"); status("replay-status", ""); };
+  $("file").onchange = (e) => {
+    const f = e.target.files[0]; if (!f) return;
+    const r = new FileReader();
+    r.onload = () => {
+      try {
+        const d = normalizeMatch(JSON.parse(r.result));
+        if (!d) { status("replay-status", "A fájlban nincs játékos-útvonal (trajectories). Az elemzést az új programverzióval futtasd újra."); return; }
+        loadMatch(d, "saját meccs"); status("replay-status", `Betöltve: ${f.name} – ${d.tracks.length} játékos-útvonal, ${d.events.length} esemény.`);
+      } catch { status("replay-status", "Ez a fájl nem olvasható JSON. Az elemző program events_*.json fájlját válaszd."); }
+    };
+    r.readAsText(f);
+  };
+  function escapeHtml(s) { return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+
+  // Szerverről betöltés (ha a program szervere szolgálja ki: /tabla?events=/clips/events_xxx.json)
+  async function loadFromQuery() {
+    let url = null; try { url = new URLSearchParams(location.search).get("events"); } catch {}
+    if (!url) return false;
+    try {
+      const d = normalizeMatch(await (await fetch(url)).json());
+      if (d) { setMode("replay"); loadMatch(d, "saját meccs"); return true; }
+    } catch {}
+    return false;
+  }
+
+  // ---------- Indítás ----------
+  const draft = store.get("tt-draft", null);
+  if (draft && Array.isArray(draft.players) && draft.players.length) state.board = draft; else resetPlayers();
+  // bemutató rajzok, hogy az első kép mutassa, mire való
+  if (!draft) state.board.drawings = [
+    { type: "arrow", pts: [[30, 34], [47, 14]], color: COLORS[1] },
+    { type: "run", pts: [[46, 56], [66, 60]], color: COLORS[0] },
+    { type: "circle", pts: [[62, 34], [66, 34]], color: COLORS[2] },
+    { type: "text", pts: [[62, 25], [62, 25]], color: COLORS[0], text: "Presszing" },
+  ];
+  syncBoardInputs(); renderSaved(); renderSelected(); setTool("move");
+  window.addEventListener("resize", layout);
+  layout();
+  setMode(location.hash === "#visszajatszas" ? "replay" : "board");
+  loadFromQuery();
+  requestAnimationFrame(tick);
+})();
+</script>

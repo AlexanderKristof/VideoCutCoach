@@ -14,6 +14,7 @@ from typing import Optional, List
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, Form, Depends, HTTPException, status
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
@@ -31,6 +32,8 @@ from review_export import ReviewExporter
 from match_segmenter import (detect_match_halves, cut_match_halves,
                              parse_time_value, format_hms)
 from auth import hash_password, verify_password, create_access_token, get_current_user
+from heatmap import TrackMetaCollector, compact_trajectories, generate_heatmaps_from_file
+from clip_export import export_clips, DEFAULT_PRE_SEC, DEFAULT_POST_SEC
 
 Base.metadata.create_all(bind=engine)
 
@@ -172,6 +175,8 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
         for ev in timeline_events[fed_timeline_events:]:
             review.add_event(ev)
         fed_timeline_events = len(timeline_events)
+
+    track_meta = TrackMetaCollector()  # követésenkénti csapat / kapus (a mentett pályákhoz)
     # Gyors mód: a kihagyott képkockákon az utolsó felismerés eredményét rajzoljuk ki újra,
     # így a kimeneti videóban minden képkocka megmarad
     last_valid_players = []
@@ -297,6 +302,7 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
                     real_ball = None
 
                 last_valid_players, last_referee_boxes, last_ball_pixels = valid_players, referee_boxes, ball_pixels
+                track_meta.add(valid_players)
             else:
                 # Kihagyott képkocka (gyors mód): az előző felismerés újrarajzolása,
                 # statisztika és esemény nem keletkezik belőle (különben duplán számolnánk)
@@ -361,7 +367,9 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
         "events": timeline_events,
         "review_url": f"/clips/review_{clip_id}/index.html" if review is not None else None,
         "match_stats": engine_instance.stats,
-        "source": {"video_path": video_path, "start_sec": start_sec, "end_sec": end_sec}
+        "source": {"video_path": video_path, "start_sec": start_sec, "end_sec": end_sec},
+        # Tömörített pályák (5 Hz, 0.1 m) a hőtérképhez / statisztikához – lásd heatmap.py
+        "trajectories": compact_trajectories(engine_instance.player_trajectories, track_meta.summary())
     }
     with open(events_path, 'w', encoding='utf-8') as f:
         json.dump(analysis_payload, f, ensure_ascii=False, indent=4)
@@ -728,6 +736,69 @@ async def cut_match_endpoint(
         "full_match_url": to_url(paths["full_match"]),
         "local_paths": paths,
     }
+
+
+# ============================================================
+# HŐTÉRKÉP ÉS KLIPEXPORT
+# ============================================================
+
+@app.post("/heatmap")
+async def heatmap_endpoint(
+    events_path: str = Form(...),
+    team: str = Form("all"),
+    player_id: Optional[int] = Form(None),
+    flip_second_half_at_sec: Optional[float] = Form(None)
+):
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(
+            executor, lambda: generate_heatmaps_from_file(
+                events_path, CLIPS_DIR, team=team, player_id=player_id, flip_at_sec=flip_second_half_at_sec))
+    except Exception as ex:
+        traceback.print_exc()
+        return {"status": "error", "message": f"Hőtérkép hiba: {ex}"}
+
+@app.post("/export-clips")
+async def export_clips_endpoint(
+    video_path: str = Form(...),
+    events_json: str = Form(...),
+    pre_sec: float = Form(DEFAULT_PRE_SEC),
+    post_sec: float = Form(DEFAULT_POST_SEC),
+    merge: bool = Form(True),
+    accurate: bool = Form(True),
+    title: Optional[str] = Form(None)
+):
+    try:
+        items = json.loads(events_json) if events_json else []
+    except ValueError:
+        return {"status": "error", "message": "Az events_json nem érvényes JSON."}
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(
+            executor, lambda: export_clips(video_path, items, CLIPS_DIR, pre_sec=pre_sec, post_sec=post_sec,
+                                           merge=merge, accurate=accurate, title=title))
+    except Exception as ex:
+        traceback.print_exc()
+        return {"status": "error", "message": f"Klipexport hiba: {ex}"}
+
+# ============================================================
+# TAKTIKAI TÁBLA — böngészős felület (felállás, rajzolás, felülnézeti visszajátszás)
+# Megnyitás: http://localhost:8000/tabla  vagy  /tabla?events=/clips/events_<id>.json
+# ============================================================
+
+TACTICS_BOARD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "taktikai_tabla.html")
+
+@app.get("/tabla", response_class=HTMLResponse)
+async def tactics_board_page():
+    with open(TACTICS_BOARD_PATH, encoding="utf-8") as f:
+        body = f.read()
+    return HTMLResponse(
+        "<!doctype html><html lang=\"hu\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">"
+        "<style>[hidden]{display:none!important}body{margin:0}</style></head><body>"
+        + body + "</body></html>"
+    )
+
 
 # ============================================================
 # AUTH VÉGPONTOK — eddig hiányoztak, pedig az AuthService.cs
