@@ -7,7 +7,11 @@ from sqlalchemy.orm import Session
 from database import get_db
 from models import User
 
-SECRET_KEY = "IDE_EGY_ERŐS_RANDOM_TITKOS_KULCS_KELL"  # pl. openssl rand -hex 32
+import app_paths
+
+# A JWT aláírókulcs: TACTICAL_SECRET_KEY környezeti változó, különben az első induláskor generált,
+# az adatmappában tárolt véletlen kulcs (secret.key; fejlesztői módban ./.tacanaly_secret.key).
+SECRET_KEY = app_paths.load_or_create_secret_key()
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 1 hétig érvényes token
 

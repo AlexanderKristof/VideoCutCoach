@@ -4,6 +4,8 @@ A teljes meccs elemzése parancssorból (szerver és MAUI kliens nélkül).
     python elemzes.py MECCS.mp4
     python elemzes.py MECCS.mp4 --felido-perc 40 --kalibracio "0.1,0.4;0.9,0.4;1.0,0.9;0.0,0.9" --kimenet eredmeny
     python elemzes.py MECCS.mp4 --nincs-vagas --gyors 3
+    python elemzes.py MECCS.mp4 --hatterben            (laptopon: alacsony prioritás, kevés szál)
+    python elemzes.py MECCS.mp4 --hatterben --szalak 2
 
 Ugyanazt a folyamatot futtatja, mint a POST /jobs/analyze-match végpont (pipeline.py).
 A --help torch nélkül is működik: a modell csak az elemzés indításakor töltődik be.
@@ -25,8 +27,13 @@ def build_parser():
     p.add_argument("--felido-perc", type=float, default=45.0, metavar="PERC",
                    help="várt félidőhossz percben (alap: 45; amatőr meccsen pl. 40 vagy 35)")
     p.add_argument("--kalibracio", default="", metavar='"x,y;x,y;x,y;x,y"',
-                   help="4 pályapont a képen, 0..1 relatív koordinátákkal (mint a kliensben); "
-                        "nélküle nincs pályakoordináta, hőtérkép és a legtöbb esemény")
+                   help="kattintott pályapontok a képen, 0..1 relatív koordinátákkal (mint a kliensben); "
+                        "nélküle a program a pályavonalakból próbál automatikusan kalibrálni")
+    p.add_argument("--kalibracio-pontok", default="", metavar='"x,y;..."',
+                   help="a --kalibracio pontjainak pálya-koordinátái méterben (pl. a 16-os sarkai: "
+                        '"88.5,13.84;105,13.84;105,54.16;88.5,54.16"); üresen a 4 pályasarok sorrendje')
+    p.add_argument("--kalibracio-ido", type=float, default=None, metavar="MP",
+                   help="melyik videó-időpont képén készült a kalibráció (mp, az eredeti videóban)")
     p.add_argument("--kimenet", default="clips", metavar="MAPPA",
                    help="kimeneti mappa (alap: clips – ezt szolgálja ki a szerver /clips alatt)")
     p.add_argument("--nincs-vagas", action="store_true",
@@ -45,6 +52,12 @@ def build_parser():
                    help="a félidő-felismerés YOLO létszámszámlálással (pontosabb, lassabb)")
     p.add_argument("--nincs-hoterkep", action="store_true", help="ne készüljenek hőtérképek")
     p.add_argument("--nincs-attekinto", action="store_true", help="ne készüljenek áttekintő lapok (review)")
+    p.add_argument("--hatterben", action="store_true",
+                   help="háttér-mód: alacsony prioritás (az ffmpeg is) és kevés szál, hogy közben a gép "
+                        "használható maradjon (laptopon ajánlott); a szálszám alapból a magok fele, "
+                        "akkumulátorról a negyede")
+    p.add_argument("--szalak", type=int, default=None, metavar="N",
+                   help="legfeljebb N szál a torch / OpenCV / ffmpeg számára (háttér-mód nélkül is használható)")
     p.add_argument("--reszletes", action="store_true",
                    help="az elemző motor saját kiírásai is a képernyőre kerüljenek (alap: naplófájlba)")
     return p
@@ -54,6 +67,8 @@ def options_from_args(args):
     opts = {
         "expected_half_min": args.felido_perc,
         "calib_points": args.kalibracio,
+        "calib_pitch_points": args.kalibracio_pontok,
+        "calib_time_sec": args.kalibracio_ido,
         "skip_cut": args.nincs_vagas,
         "team1_attacks_right": not args.csapat1_balra,
         "compilations": args.osszeallitasok,
@@ -97,6 +112,27 @@ class ProgressBar:
         self.stream.flush()
 
 
+def apply_background(args):
+    """
+    Háttér-mód / szálkorlát beállítása a nehéz könyvtárak (torch, OpenCV) betöltése ELŐTT
+    (az OMP_NUM_THREADS stb. csak így hat). Visszatér: tájékoztató szöveg vagy None.
+    """
+    if not args.hatterben and not args.szalak:
+        return None
+    import background
+    threads = args.szalak or background.default_threads()
+    background.set_default(background.BackgroundConfig(enabled=args.hatterben, threads=threads))
+    background.limit_library_threads(threads)  # környezeti változók (OMP / MKL / OpenBLAS)
+    text = f"Szálkorlát: {threads}"
+    if args.hatterben:
+        ok = background.lower_process_priority()
+        text = ("Háttér-mód: alacsony prioritás" + ("" if ok else " (nem sikerült beállítani)") +
+                f", {threads} szál")
+        if background.on_battery():
+            text += " (akkumulátoros üzem)"
+    return text
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
     if not os.path.exists(args.video):
@@ -108,6 +144,10 @@ def main(argv=None):
             return 2
         # a model_config.py ezt a környezeti változót olvassa (a main.py importja előtt kell beállítani)
         os.environ["TACTICAL_DETECT_EVERY_N"] = str(args.gyors)
+    if args.szalak is not None and args.szalak < 1:
+        print("Hiba: a --szalak értéke legalább 1.")
+        return 2
+    bg_info = apply_background(args)
 
     import pipeline
     from jobs import ProgressReporter, JobCancelled
@@ -127,6 +167,8 @@ def main(argv=None):
     reporter = ProgressReporter(on_update=bar)
     log_path = os.path.join(out_dir, f"elemzes_{time.strftime('%Y%m%d_%H%M%S')}.log")
     print(f"Elemzés indul: {args.video}")
+    if bg_info:
+        print(bg_info)
     print(f"Kimenet: {out_dir}" + ("" if args.reszletes else f"  (a motor kiírásai: {log_path})"))
 
     with open(log_path, "w", encoding="utf-8") as log:
@@ -134,6 +176,9 @@ def main(argv=None):
         try:
             with redirect:
                 import main as engine  # itt töltődik be a YOLO modell (torch)
+                if args.hatterben or args.szalak:
+                    import background
+                    background.limit_library_threads(background.current().threads)  # torch / cv2 már betöltve
                 # az elemzés (cut_and_analyze_sync) a main.CLIPS_DIR-be ír – ide irányítjuk
                 engine.CLIPS_DIR = out_dir
                 result = pipeline.run_match_pipeline(args.video, opts, progress=reporter,

@@ -18,8 +18,8 @@ from fastapi.responses import HTMLResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
-import torch
-from ultralytics import YOLO
+import app_paths  # adat- és erőforrás-útvonalak (fejlesztői módban a régi relatív utak)
+import model_manager  # súlyfájlok keresése / letöltése a models mappába
 
 from database import get_db, engine
 from models import Base, User, Match
@@ -28,7 +28,7 @@ from pitch_filters import (build_grass_mask, foot_on_grass, CameraMotion,
                            StationaryFilter, extract_dominant_color,
                            PitchBoundary, PitchTrackSanity, KeeperGate, pitch_h_trusted)  # PÁLYAHATÁR
 from model_config import (load_model_config, resolve_weights, build_role_class_map,
-                          describe_role_map, should_detect, reset_tracker)
+                          describe_role_map, should_detect, reset_tracker, ROLES)
 from review_export import ReviewExporter
 from match_segmenter import (detect_match_halves, cut_match_halves,
                              parse_time_value, format_hms)
@@ -42,22 +42,35 @@ from ball_tracker import BallTracker, draw_ball_state  # labdakövetés (Kálmá
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Tactical Analyzer Pro Engine")
-CLIPS_DIR = "clips"
+CLIPS_DIR = app_paths.clips_dir()  # fejlesztői módban "clips" (mint eddig), alkalmazás-módban az adatmappában
 os.makedirs(CLIPS_DIR, exist_ok=True)
 app.mount("/clips", StaticFiles(directory=CLIPS_DIR), name="clips")
 executor = ThreadPoolExecutor(max_workers=4)
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+# --- LUSTA MODELLBETÖLTÉS ---
+# A torch / ultralytics importja és a YOLO modell betöltése (esetleg a súly letöltése) lassú: a szerver
+# indulását nem várakoztatjuk vele (a GET /health azonnal válaszol). A modell az első elemzéskor
+# (ensure_model) vagy a POST /models/load hívásra töltődik be, szálbiztosan, egyszer.
+def YOLO(*args, **kwargs):
+    from ultralytics import YOLO as _YOLO  # lusta import (torch-ot is betölt)
+    if app_paths.app_mode():
+        try:  # telepített alkalmazás: ne küldjön használati statisztikát az ultralytics
+            from ultralytics.utils import SETTINGS
+            if SETTINGS.get("sync"):
+                SETTINGS.update({"sync": False})
+        except Exception:
+            pass
+    return _YOLO(*args, **kwargs)
+
+
+device = None          # 'cuda' / 'cpu' – detect_device() tölti ki
+model = None           # a megosztott YOLO modell – ensure_model() tölti be
+model_weights = None   # a betöltött súlyfájl útvonala
 model_cfg = load_model_config()
-model_weights = resolve_weights(model_cfg, device)
-if model_cfg.get("weights") and not os.path.exists(model_weights):
-    print(f"⚠️ A beállított súlyfájl nem található: {model_weights} (lásd docs/MODELL_BEALLITAS.md)")
-model = YOLO(model_weights)
-# Szerepkör -> osztály id-k a modell osztálynevei alapján (COCO: person / sports ball,
-# focis modell: player / goalkeeper / referee / ball)
-role_classes = build_role_class_map(model.names, model_cfg.get("class_names"))
-if not role_classes["player"] and not role_classes["goalkeeper"]:
-    print("⚠️ A modellben nincs játékos osztály (player / person) – állítsd be a class_names kulcsot!")
+role_classes = {r: set() for r in ROLES}
+model_state = {"loading": False, "error": None, "loaded_at": None}
+_model_init_lock = threading.Lock()
 DETECT_EVERY_N = model_cfg["detect_every_n"]
 BALL_CONF = model_cfg["ball_conf"]
 # A megosztott modellt (és a benne tárolt ByteTrack állapotot) egyszerre csak egy elemzés
@@ -65,10 +78,17 @@ BALL_CONF = model_cfg["ball_conf"]
 # elemzésenként külön modellt betölteni (a yolov8x több száz MB GPU memória és lassú betöltés),
 # és a követő azonosítói nem keverednek két klip között.
 model_lock = threading.Lock()
-print(f"🔥 Tactical AI Motor aktív: {device.upper()}, modell: {model_weights}")
-print(f"   Osztályok: {describe_role_map(role_classes, model.names)}")
 if DETECT_EVERY_N > 1:
     print(f"   Gyors mód: felismerés minden {DETECT_EVERY_N}. képkockán")
+
+
+def detect_device():
+    """'cuda', ha van használható GPU, különben 'cpu' (az első híváskor importálja a torch-ot)."""
+    global device
+    if device is None:
+        import torch
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    return device
 
 # --- NYERS LABDA-DETEKTÁLÁSOK (a követő előtti állapot, második futtatás nélkül) ---
 # A model.track() eredményéből a ByteTrack kihagyja a meg nem erősített dobozokat – a gyors, ritkán
@@ -115,13 +135,7 @@ def _stash_raw_ball_boxes(predictor):
         _raw_ball_buf["boxes"] = None
 
 
-RAW_BALL_HOOK = False
-if role_classes["ball"] and callable(getattr(model, "add_callback", None)):
-    try:
-        model.add_callback("on_predict_postprocess_end", _stash_raw_ball_boxes)
-        RAW_BALL_HOOK = True
-    except Exception as ex:
-        print(f"⚠️ A nyers labda-callback nem regisztrálható: {ex} – a követett labda-dobozokat használjuk")
+RAW_BALL_HOOK = False  # az ensure_model() állítja be (a callback a modell betöltésekor regisztrálódik)
 BALL_EXTRA_PASS = bool(model_cfg.get("ball_extra_pass", False))
 _ball_pass_model = None
 
@@ -145,6 +159,58 @@ def _extra_ball_pass(frame, conf):
                 out.append((tuple(float(v) for v in b.xyxy[0][:4]), float(b.conf[0])))
     return out
 # --- /NYERS LABDA-DETEKTÁLÁSOK ---
+
+
+def ensure_model(progress=None):
+    """
+    A megosztott YOLO modell betöltése az első használatkor (szálbiztos, egyszer fut le).
+    A súlyfájlt a model_manager keresi meg (models mappa ...); alkalmazás-módban a hiányzó hivatalos
+    súlyt előbb letölti a models mappába (progress: jobs.ProgressReporter-szerű haladásjelző).
+    """
+    global model, model_weights, role_classes, RAW_BALL_HOOK
+    if model is not None:
+        return model
+    with _model_init_lock:
+        if model is not None:
+            return model
+        model_state["loading"] = True
+        model_state["error"] = None
+        try:
+            dev = detect_device()
+            spec = resolve_weights(model_cfg, dev)
+            weights = model_manager.resolve_for_load(spec, progress=progress)
+            if model_cfg.get("weights") and not os.path.exists(weights):
+                print(f"⚠️ A beállított súlyfájl nem található: {weights} (lásd docs/MODELL_BEALLITAS.md)")
+            if progress is not None:
+                progress(None, f"Modell betöltése: {os.path.basename(str(weights))}")
+            m = YOLO(weights)
+            # Szerepkör -> osztály id-k a modell osztálynevei alapján (COCO: person / sports ball,
+            # focis modell: player / goalkeeper / referee / ball)
+            roles = build_role_class_map(m.names, model_cfg.get("class_names"))
+            if not roles["player"] and not roles["goalkeeper"]:
+                print("⚠️ A modellben nincs játékos osztály (player / person) – állítsd be a class_names kulcsot!")
+            role_classes = roles
+            # A nyers labda-callbacket az első track() ELŐTT kell regisztrálni (lásd fent)
+            hook = False
+            if roles["ball"] and callable(getattr(m, "add_callback", None)):
+                try:
+                    m.add_callback("on_predict_postprocess_end", _stash_raw_ball_boxes)
+                    hook = True
+                except Exception as ex:
+                    print(f"⚠️ A nyers labda-callback nem regisztrálható: {ex} – a követett labda-dobozokat használjuk")
+            RAW_BALL_HOOK = hook
+            model_weights = weights
+            model = m
+            model_state["loaded_at"] = datetime.now().isoformat(timespec="seconds")
+            print(f"🔥 Tactical AI Motor aktív: {dev.upper()}, modell: {model_weights}")
+            print(f"   Osztályok: {describe_role_map(role_classes, model.names)}")
+        except BaseException as ex:
+            model_state["error"] = f"{type(ex).__name__}: {ex}"
+            raise
+        finally:
+            model_state["loading"] = False
+    return model
+# --- /LUSTA MODELLBETÖLTÉS ---
 
 def check_color_match(hsv_frame, x1, y1, x2, y2, lower, upper):
     if np.array_equal(lower, np.array([0, 0, 0])) and np.array_equal(upper, np.array([179, 255, 255])):
@@ -231,6 +297,7 @@ def create_pitch_tracker(video_file, width, height, fps, start_sec, calib_points
 
 
 def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, calib_points_str, config, progress=None):
+    ensure_model()  # lusta betöltés (első elemzéskor)
     clip_id = str(uuid.uuid4())[:8]
     output_filename = f"raw_{clip_id}.mp4"
     output_path = os.path.abspath(os.path.join(CLIPS_DIR, output_filename))
@@ -277,7 +344,7 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
     # --- Pályakövetés: képkockánkénti homográfia mozgó (Veo) kamerához (pitch_tracker.py) ---
     pitch_tracker, pitch_setup_msg = create_pitch_tracker(temp_cut, width, height, fps, start_sec,
                                                           calib_points_str, H, config)
-    pitch_stats = {"ok": 0, "elveszett": 0, "kalibráció szükséges": 0, "finomítás": 0}
+    pitch_stats = {"ok": 0, "bizonytalan": 0, "elveszett": 0, "kalibráció szükséges": 0, "finomítás": 0}
     pitch_boxes = []   # az előző felismerés dobozai (a követés ezeket kitakarja)
     H_cur = H
     # --- /Pályakövetés ---
@@ -998,8 +1065,8 @@ def _segmenter_person_counter(frame):
     global _segmenter_person_model
     with _segmenter_person_lock:
         if _segmenter_person_model is None:
-            _segmenter_person_model = YOLO('yolov8n.pt')
-        results = _segmenter_person_model.predict(frame, classes=[0], conf=0.3, device=device, verbose=False)
+            _segmenter_person_model = YOLO(model_manager.resolve_for_load('yolov8n.pt'))
+        results = _segmenter_person_model.predict(frame, classes=[0], conf=0.3, device=detect_device(), verbose=False)
     return int(len(results[0].boxes)) if results else 0
 
 def _detect_halves_sync(video_path, expected_half_min, use_person_count):
@@ -1076,6 +1143,8 @@ async def cut_match_endpoint(
     except Exception as ex:
         traceback.print_exc()
         return {"status": "error", "message": f"Meccs vágási hiba: {ex}"}
+    paths = dict(paths)
+    cut_modes = paths.pop("cut_modes", None)  # képkocka-pontos smart cut: copy / smart / full
 
     def to_url(p):
         return f"/clips/{os.path.basename(p)}" if p else None
@@ -1089,6 +1158,7 @@ async def cut_match_endpoint(
         "second_half_url": to_url(paths["second_half"]),
         "full_match_url": to_url(paths["full_match"]),
         "local_paths": paths,
+        "cut_modes": cut_modes,
     }
 
 
@@ -1140,7 +1210,7 @@ async def export_clips_endpoint(
 # Megnyitás: http://localhost:8000/tabla  vagy  /tabla?events=/clips/events_<id>.json
 # ============================================================
 
-TACTICS_BOARD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "taktikai_tabla.html")
+TACTICS_BOARD_PATH = app_paths.resource_path("static", "taktikai_tabla.html")  # csomagolva: sys._MEIPASS
 
 @app.get("/tabla", response_class=HTMLResponse)
 async def tactics_board_page():
@@ -1159,7 +1229,7 @@ from fastapi import Request as _BoardRequest
 from fastapi.responses import JSONResponse as _BoardJSON
 from boards import BoardStore, BoardError, parse_request_body
 
-board_store = BoardStore(os.path.join(CLIPS_DIR, "boards"))
+board_store = BoardStore(app_paths.boards_dir())  # fejlesztői módban clips/boards
 
 
 def _board_error(ex):
@@ -1199,6 +1269,64 @@ async def delete_board_endpoint(board_id: str):
         return _board_error(ex)
 
 
+# Videó elemzés (a tábla 3. módja): a szerveren lévő videók listája és a rajzos export. Lásd video_annotate.py
+import video_annotate
+from boards import slugify as _board_slugify
+
+
+@app.get("/videos")
+async def list_videos_endpoint():
+    """{videos: [{name, url, size, mtime, kind, fps?, duration_sec?, events_url?}], events: [{name, url, ...}]}"""
+    loop = asyncio.get_running_loop()
+    listing = await loop.run_in_executor(None, video_annotate.list_videos, CLIPS_DIR)
+    return {"status": "success", **listing}
+
+
+def _job_burn_stops(progress, video_path, stops, opts):
+    name = _board_slugify(opts.get("title") or os.path.splitext(os.path.basename(video_path))[0])
+    out_name = f"rajzos_{name}_{uuid.uuid4().hex[:6]}.mp4"
+    out_path = os.path.abspath(os.path.join(CLIPS_DIR, out_name))
+    try:
+        res = video_annotate.burn_stops(
+            video_path, stops, out_path, default_hold=opts["default_hold_sec"],
+            start_sec=opts.get("start_sec"), end_sec=opts.get("end_sec"),
+            progress_cb=lambda done, total, label: progress(100.0 * done / max(1, total), label))
+    except (ValueError, RuntimeError) as ex:
+        return {"status": "error", "message": str(ex)}
+    return {**res, "url": f"/clips/{out_name}", "name": out_name}
+
+
+@app.post("/burn-stops")
+async def burn_stops_endpoint(request: _BoardRequest):
+    """
+    Rajzos videóexport háttérfeladatként. Törzs (JSON):
+      {"video_url": "/clips/x.mp4", "stops": [{t, items, hold_sec?, note?}], "title"?,
+       "default_hold_sec"?: 3, "start_sec"?, "end_sec"?: csak a részlet}
+    Válasz: {"status": "success", "job_id", "status_url"}; a kész job eredménye: {url, duration_sec, ...}.
+    """
+    try:
+        body = json.loads((await request.body()).decode("utf-8") or "null")
+    except (UnicodeDecodeError, ValueError):
+        return _form_error("A kérés törzse nem érvényes JSON.")
+    if not isinstance(body, dict):
+        return _form_error("A kérés törzse JSON objektum legyen.")
+    try:
+        video_path = video_annotate.resolve_clip_url(body.get("video_url"), CLIPS_DIR)
+        num = lambda k: (None if body.get(k) in (None, "") else float(body.get(k)))
+        opts = {"title": str(body.get("title") or "")[:80], "default_hold_sec": num("default_hold_sec") or 3.0,
+                "start_sec": num("start_sec"), "end_sec": num("end_sec")}
+        stops = body.get("stops") or []
+        info = video_annotate.probe_video(video_path) or {}
+        ranged = opts["start_sec"] is not None or opts["end_sec"] is not None
+        video_annotate.normalize_stops(stops, info.get("fps") or 25.0, info.get("frames"),
+                                       allow_empty=ranged)  # gyors ellenőrzés a job indítása előtt
+    except (ValueError, TypeError) as ex:
+        return _form_error(str(ex))
+    params = {"video_url": body.get("video_url"), "stops": len(stops), **opts}
+    job_id = job_manager.submit("burn-stops", _job_burn_stops, video_path, stops, opts, params=params)
+    return {"status": "success", "job_id": job_id, "status_url": f"/jobs/{job_id}"}
+
+
 # ============================================================
 # HÁTTÉRFELADATOK (jobok) — a hosszú munkák nem blokkolják a kérést.
 # A kliens job azonosítót kap, és a GET /jobs/{id} végponton 1–2 mp-enként
@@ -1211,7 +1339,7 @@ from fastapi.responses import JSONResponse
 import pipeline
 from jobs import JobManager
 
-job_manager = JobManager(os.path.join(CLIPS_DIR, "jobs"), max_workers=2)
+job_manager = JobManager(app_paths.jobs_dir(), max_workers=2)  # fejlesztői módban clips/jobs
 
 
 def _job_funcs():
@@ -1226,6 +1354,26 @@ async def _form_dict(request: Request):
 
 def _form_error(message, code=400):
     return JSONResponse(status_code=code, content={"status": "error", "message": message})
+
+
+def _background_opts(raw):
+    """
+    Háttér-mód a form mezőkből: background (vagy hatter) = true → alacsony prioritás + kevés szál,
+    threads (vagy szalak) = N → szálkorlát (háttér-módban alapból a magok fele, akkun a negyede).
+    Hibás értéknél ValueError.
+    """
+    bg_raw = raw.get("background", raw.get("hatter", ""))
+    bg = pipeline._to_bool(bg_raw) if str(bg_raw).strip() else False
+    th_raw = str(raw.get("threads", raw.get("szalak", "")) or "").strip()
+    threads = None
+    if th_raw:
+        try:
+            threads = int(th_raw)
+        except ValueError:
+            raise ValueError(f"Érvénytelen szálszám: {th_raw!r}")
+        if threads < 1:
+            raise ValueError("A szálszám legalább 1.")
+    return {"background": bg, "threads": threads}
 
 
 def _run_match_job(progress, video_path, opts):
@@ -1243,11 +1391,12 @@ async def analyze_match_job_endpoint(request: Request):
         opts = pipeline.coerce_options(raw)
         pipeline.parse_compilations(opts["compilations"])
         pipeline.build_analysis_config(opts)  # a HSV mezők ellenőrzése még a job indítása előtt
+        bg = _background_opts(raw)
     except ValueError as ex:
         return _form_error(str(ex))
     params = {"video_path": video_path, **{k: opts[k] for k in pipeline.PIPELINE_DEFAULTS},
               "calib_points": opts["calib_points"], "team1_attacks_right": opts["team1_attacks_right"]}
-    job_id = job_manager.submit("analyze-match", _run_match_job, video_path, opts, params=params)
+    job_id = job_manager.submit("analyze-match", _run_match_job, video_path, opts, params=params, **bg)
     return {"status": "success", "job_id": job_id, "status_url": f"/jobs/{job_id}"}
 
 
@@ -1274,12 +1423,24 @@ def _job_cut_match(progress, raw):
                                                 progress.sub(0, 90, "Félidők felismerése"), notes)
     progress(90.0, "Vágás")
     duration = (detection or {}).get("duration_sec")
-    paths = cut_match_halves(raw["video_path"], halves, CLIPS_DIR, padding_sec=opts["padding_sec"], duration_sec=duration)
     to_url = lambda p: f"/clips/{os.path.basename(p)}" if p else None
+    done = {}
+
+    def on_part(key, path):
+        # a kész félidő már a job futása közben elérhető (részeredmény)
+        done[f"{key}_url"] = to_url(path)
+        progress.publish({"status": "success", "reszleges": True, "halves": halves, **done,
+                          "kesz_reszek": [k[:-4] for k in done]})
+        progress.check_cancel()
+        progress.check_pause()  # szüneteltetés / megszakítás a következő fájl előtt
+
+    paths = dict(cut_match_halves(raw["video_path"], halves, CLIPS_DIR, padding_sec=opts["padding_sec"],
+                                  duration_sec=duration, on_part=on_part))
+    cut_modes = paths.pop("cut_modes", None)
     return {"status": "success", "halves": halves, "confidence": (detection or {}).get("confidence"),
             "notes": notes, "first_half_url": to_url(paths["first_half"]),
             "second_half_url": to_url(paths["second_half"]), "full_match_url": to_url(paths["full_match"]),
-            "local_paths": paths}
+            "local_paths": paths, "cut_modes": cut_modes}
 
 
 def _job_heatmap(progress, raw):
@@ -1327,10 +1488,11 @@ async def run_job_endpoint(request: Request):
             pipeline.build_analysis_config(raw)
         elif kind == "cut-match":
             pipeline.coerce_options(raw)
+        bg = _background_opts(raw)
     except ValueError as ex:
         return _form_error(str(ex))
     params = {k: v for k, v in raw.items() if k != "events_json"}
-    job_id = job_manager.submit(kind, JOB_KINDS[kind], raw, params=params)
+    job_id = job_manager.submit(kind, JOB_KINDS[kind], raw, params=params, **bg)
     return {"status": "success", "job_id": job_id, "status_url": f"/jobs/{job_id}"}
 
 
@@ -1353,6 +1515,33 @@ async def cancel_job_endpoint(job_id: str):
     if job is None:
         return _form_error("Nincs ilyen feladat.", 404)
     return {"status": "success", "job": job}
+
+
+@app.post("/jobs/{job_id}/pause")
+async def pause_job_endpoint(job_id: str):
+    """Szüneteltetés (kooperatív: a feladat a következő haladásjelzésnél áll meg, állapot: paused)."""
+    job = job_manager.pause(job_id)
+    if job is None:
+        return _form_error("Nincs ilyen feladat.", 404)
+    return {"status": "success", "job": job}
+
+
+@app.post("/jobs/{job_id}/resume")
+async def resume_job_endpoint(job_id: str):
+    """A szüneteltetett feladat folytatása."""
+    job = job_manager.resume(job_id)
+    if job is None:
+        return _form_error("Nincs ilyen feladat.", 404)
+    return {"status": "success", "job": job}
+
+
+# ============================================================
+# MOTOR-VEZÉRLÉS az asztali alkalmazásnak: GET /health, GET /version, POST /shutdown (csak helyi
+# gépről), GET /models/status, POST /models/download, POST /models/load. Lásd engine_control.py,
+# packaging/README_CSOMAGOLAS.md
+# ============================================================
+import engine_control
+engine_control.install_endpoints(app, sys.modules[__name__])
 
 
 # ============================================================
@@ -1450,5 +1639,6 @@ async def get_match(
 
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Fejlesztői indítás (mint eddig: minden hálózati címen, 8000-es port). Az asztali alkalmazás
+    # az engine_launcher.py-t használja (csak 127.0.0.1, szabad port, READY sor, naplófájl).
+    engine_control.serve(app, host="0.0.0.0", port=8000)

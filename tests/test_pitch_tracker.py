@@ -287,6 +287,96 @@ def test_tracking_with_drift_correction(n=300):
     assert np.mean(e_ref[-50:]) < 0.8 * np.mean(e_prop[-50:]) or np.mean(e_prop[-50:]) < 0.3
 
 
+def fast_camera_path(n, w=1280):
+    """
+    Nehéz (Veo-szerű, gyors) kamerapálya: két gyors pásztázás ±45°-ig (csúcson ~2°/képkocka),
+    közben erős zoom (hfov ~ 70° -> 40°) és dőlésváltozás – a régi követő ezen elsodródott.
+    """
+    out = []
+    for i in range(n):
+        t = i / max(1, n - 1)
+        # sima "lépcsős" pásztázás: -10° -> +45° -> -45° -> 0°
+        def ease(a, b, t0, t1):
+            s = min(1.0, max(0.0, (t - t0) / (t1 - t0)))
+            return a + (b - a) * (3 * s * s - 2 * s * s * s)
+        pan = ease(-10, 45, 0.05, 0.3) + ease(0, -90, 0.4, 0.7) + ease(0, 45, 0.8, 0.95)
+        zoom = 1.0 + 0.9 * math.sin(math.pi * min(1.0, max(0.0, (t - 0.25) / 0.5))) ** 2
+        f = 0.85 * w * zoom
+        tilt = 13.0 + 3.0 * math.sin(2 * math.pi * t * 1.3) + 0.25 * (zoom - 1.0) * 4.0
+        out.append((pan, tilt, f))
+    return out
+
+
+def landmark_H(H_true, rng, sigma=1.5, w=1280, h=720, max_points=6):
+    """Valószerű kézi kalibráció: a képen látható pályapontok (16-os sarkai, kezdőkör, felezővonal ...) zajjal."""
+    marks = [(52.5, 0.0), (52.5, 68.0), (52.5, 24.85), (52.5, 43.15), (43.35, 34.0), (61.65, 34.0),
+             (16.5, 13.84), (16.5, 54.16), (0.0, 13.84), (0.0, 54.16), (88.5, 13.84), (88.5, 54.16),
+             (105.0, 13.84), (105.0, 54.16), (0.0, 0.0), (105.0, 0.0), (0.0, 68.0), (105.0, 68.0)]
+    G = pt.orient_G(np.linalg.inv(H_true), w, h)
+    uv, wz = pt.project_points(G, np.array(marks))
+    ok = (wz > 0) & (uv[:, 0] > 12) & (uv[:, 0] < w - 12) & (uv[:, 1] > 12) & (uv[:, 1] < h - 12)
+    idx = np.nonzero(ok)[0][:max_points]
+    assert len(idx) >= 4, idx
+    img = uv[idx] + rng.normal(0, sigma, (len(idx), 2))
+    return pt.homography_from_points(img, np.array(marks)[idx])
+
+
+def _run_fast(path, H_init, tex, seed=3, w=1280, h=720):
+    rng = np.random.default_rng(seed)
+    players = Players(n=20, seed=seed)
+    tracker = pt.PitchTracker((w, h), H0=H_init, auto_init=False)
+    errs, status = [], []
+    for pan, tilt, f in path:
+        players.step()
+        frame, H_true, boxes = render_frame(tex, pan, tilt, f, players, w, h, rng)
+        _, q = tracker.update(frame, boxes)
+        errs.append(reprojection_error_m(tracker.current_H(), H_true)[1])
+        status.append(q["status"])
+    return np.array(errs), status
+
+
+def test_fast_pan_zoom_regression(n=240):
+    """
+    Gyors pásztázás + erős zoom, valószerű kézi kalibrációval (látható pontok, 1,5 px zaj):
+    a hiba minden szakaszban kicsi marad, és a nagy hibájú képkockákat a követő nem jelzi 'ok'-nak.
+    (A régi, 8 paraméteres homográfia-követő itt 5–30 m-re sodródott, végig 'ok' státusszal.)
+    """
+    tex = make_texture(2)
+    w, h = 1280, 720
+    path = fast_camera_path(n, w)
+    pan, tilt, f = path[0]
+    _, H_true0, _ = render_frame(tex, pan, tilt, f, None, w, h)
+    H_init = landmark_H(H_true0, np.random.default_rng(1))
+    errs, status = _run_fast(path, H_init, tex)
+    seg = [float(np.median(errs[k * n // 5:(k + 1) * n // 5])) for k in range(5)]
+    ok = np.array([s == pt.STATUS_OK for s in status])
+    bad = errs > 5.0
+    print(f"  szakasz-mediánok (m): {', '.join(f'{v:.2f}' for v in seg)}; 'ok': {ok.mean() * 100:.0f}%, "
+          f"> 5 m: {bad.sum()} (ebből 'ok': {(bad & ok).sum()})")
+    assert max(seg) < 1.5, seg
+    assert (bad & ok).sum() <= max(2, 0.2 * bad.sum()), (bad.sum(), (bad & ok).sum())
+    assert ok.mean() > 0.7, ok.mean()
+
+
+def test_wrong_calibration_is_flagged_or_fixed(n=90):
+    """
+    Rossz kézi kalibráció (a pálya 8 m-rel eltolva): a követő vagy kijavítja (vonalak alapján
+    újrapozicionál), vagy nem jelzi 'ok'-nak – rossz homográfiát nem ad vissza csendben.
+    """
+    tex = make_texture(3)
+    w, h = 1280, 720
+    path = fast_camera_path(n * 2, w)[:n]
+    pan, tilt, f = path[0]
+    _, H_true0, _ = render_frame(tex, pan, tilt, f, None, w, h)
+    T = np.array([[1, 0, 8.0], [0, 1, 0], [0, 0, 1]])        # 8 m eltolás a pálya hossza mentén
+    errs, status = _run_fast(path, T @ H_true0, tex, seed=5)
+    ok = np.array([s == pt.STATUS_OK for s in status])
+    bad = errs > 3.0
+    print(f"  rossz kalibráció: 'ok' és > 3 m hibás: {(ok & bad).sum()} / {n}, utolsó 30 medián hiba "
+          f"{np.median(errs[-30:]):.2f} m, utolsó státusz: {status[-1]}")
+    assert (ok & bad).sum() <= 0.1 * n, (ok & bad).sum()
+
+
 def test_backpropagate():
     """Kalibráció a klip közepén: visszafelé terjesztés a klip elejére."""
     tex = make_texture()

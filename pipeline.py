@@ -4,6 +4,8 @@ A teljes meccs elemzése egy lépésben (HTTP nélkül is futtatható folyamat).
 Lépések (zárójelben a haladásból kapott súly):
   a) félidők felismerése – match_segmenter.detect_match_halves          (10)
   b) a meccs kivágása a szünet nélkül – cut_match_halves (kihagyható)    (5)
+     képkocka-pontos smart cut (fast_cut.py): percek alatt kész, a kész fájlok azonnal
+     megjelennek a job részeredményében (result.kesz_reszek, result.reszleges = true)
   c) mindkét félidő elemzése – main.cut_and_analyze_sync                 (68)
      (a 2. félidőben a team1_attacks_right megfordítva – térfélcsere)
   d) a két félidő eseményeinek összefésülése egy meccs-JSON-ba            (1)
@@ -238,6 +240,24 @@ def _sub(progress, start, end, label):
 def _check(progress):
     if hasattr(progress, "check_cancel"):
         progress.check_cancel()
+
+
+def _publish(progress, result):
+    """Részeredmény közzététele (jobs.ProgressReporter.publish): a kliens a kész részeket
+    (pl. a vágott meccsvideót) már a teljes folyamat vége előtt megkapja."""
+    pub = getattr(progress, "publish", None)
+    if callable(pub):
+        pub(json.loads(json.dumps(dict(result, reszleges=True), default=str)))
+
+
+def _accepts(func, name):
+    """Elfogad-e a függvény ilyen nevű kulcsszavas paramétert (a tesztek hamis függvényeinél nem)."""
+    import inspect
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in params or any(p.kind == p.VAR_KEYWORD for p in params.values())
 
 
 def _url(path, clips_dir, url_prefix="/clips"):
@@ -477,14 +497,35 @@ def run_match_pipeline(video_path, options=None, progress=None, funcs=None, out_
                            "manual": detection is None}
     _check(progress)
 
-    # b) vágás (szünet nélküli meccsvideó)
+    result["kesz_reszek"] = ["felidok"]
+    _publish(progress, result)
+
+    # b) vágás (szünet nélküli meccsvideó) – a gyors (smart cut) vágás az elemzés ELŐTT fut,
+    #    így a kliens percek alatt megkapja a vágott félidőket / meccsvideót (részeredmény),
+    #    miközben a nehéz elemzés még órákig tarthat.
     cut_offsets = None
     result["cut"] = None
     if not opts["skip_cut"]:
         progress(bounds["cut"][0], "A meccs kivágása (szünet nélkül)")
         duration = (detection or {}).get("duration_sec")
-        paths = funcs["cut_match"](video_path, halves, out_dir, padding_sec=opts["padding_sec"],
-                                   duration_sec=duration)
+        live = {"local_paths": {}}
+
+        def on_part(key, path):
+            # minden kész félidő / a meccsvideó azonnal megjelenik a job eredményében
+            live["local_paths"][key] = path
+            live[f"{key}_url"] = _url(path, out_dir)
+            result["cut"] = dict(live, local_paths=dict(live["local_paths"]))
+            result["kesz_reszek"] = ["felidok"] + [f"vagas_{k}" for k in live["local_paths"]]
+            _publish(progress, result)
+            _check(progress)
+            if hasattr(progress, "check_pause"):
+                progress.check_pause()  # szüneteltetés a következő fájl előtt
+
+        kwargs = {"padding_sec": opts["padding_sec"], "duration_sec": duration}
+        if _accepts(funcs["cut_match"], "on_part"):
+            kwargs["on_part"] = on_part
+        paths = dict(funcs["cut_match"](video_path, halves, out_dir, **kwargs))
+        cut_modes = paths.pop("cut_modes", None)
         cut_offsets = _cut_offsets(halves, opts["padding_sec"], duration)
         result["cut"] = {
             "local_paths": paths,
@@ -492,6 +533,10 @@ def run_match_pipeline(video_path, options=None, progress=None, funcs=None, out_
             "second_half_url": _url(paths.get("second_half"), out_dir),
             "full_match_url": _url(paths.get("full_match"), out_dir),
         }
+        if cut_modes:
+            result["cut"]["cut_modes"] = cut_modes
+        result["kesz_reszek"] = ["felidok", "vagas"]
+        _publish(progress, result)
         progress(bounds["cut"][1], "A meccs kivágva")
     _check(progress)
 
@@ -536,6 +581,9 @@ def run_match_pipeline(video_path, options=None, progress=None, funcs=None, out_
                          "events_url": _url(events_path, clips_root), "review_url": data.get("review_url"),
                          "event_count": len(data.get("events") or []),
                          "team1_attacks_right": cfg["team1_attacks_right"]}
+        result["analysis"] = analysis
+        result["kesz_reszek"].append(f"elemzes_{key}")
+        _publish(progress, result)
         _check(progress)
     result["analysis"] = analysis
 
@@ -565,6 +613,8 @@ def run_match_pipeline(video_path, options=None, progress=None, funcs=None, out_
     result["event_counts"] = {}
     for ev in events:
         result["event_counts"][ev.get("type", "?")] = result["event_counts"].get(ev.get("type", "?"), 0) + 1
+    result["kesz_reszek"].append("esemenyek")
+    _publish(progress, result)
     progress(bounds["merge"][1], "Események összefésülve")
     _check(progress)
 
@@ -634,6 +684,8 @@ def run_match_pipeline(video_path, options=None, progress=None, funcs=None, out_
     result["notes"] = notes
     result["warnings"] = warnings
     result["elapsed_sec"] = round(time.monotonic() - t0, 1)
+    result["kesz_reszek"].append("kesz")
+    result.pop("reszleges", None)
     progress(100.0, "Kész")
     return result
 
