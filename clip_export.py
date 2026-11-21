@@ -5,10 +5,14 @@ Klipek kivágása az EREDETI videóból ffmpeg-gel, opcionális összefűzéssel
   ablak time - pre_sec .. time + post_sec).
 - Az egymást átfedő vagy egymáshoz közeli (< 1 mp rés) ablakokat előbb összevonjuk,
   hogy ugyanaz a jelenet ne kerüljön kétszer a kész videóba.
-- Pontos vágás (accurate=True, alapértelmezett): újrakódolás (libx264 veryfast +
-  aac), így a vágás képkocka-pontos, és a darabok kódolási paraméterei egyeznek –
-  a concat demuxer újrakódolás nélkül összefűzi őket.
-- Gyors vágás (accurate=False): stream copy – nagyon gyors, de csak kulcskockánál
+- Pontos vágás (accurate=True, alapértelmezett): "smart cut" (fast_cut.py) – csak a klip
+  elején / végén lévő, kulcskockáig tartó rövid részt kódolja újra (a forrással egyező
+  paraméterekkel, hardveres kódolóval, ha van), a többit stream copy-val másolja; a vágás
+  így is képkocka-pontos. Ha a forrás nem alkalmas erre (VFR, szokatlan profil, ...), vagy az
+  ellenőrzés hibát talál, teljes újrakódolásra vált (H.264 + AAC).
+- Az összefűzés (merge) újrakódolás nélkül történik, ha a klipek paraméterei egyeznek
+  (ellenőrzéssel), különben újrakódolva.
+- Gyors vágás (accurate=False): sima stream copy – nagyon gyors, de csak kulcskockánál
   tud vágni, ezért a klip eleje néhány másodperccel eltolódhat.
 """
 import os
@@ -17,6 +21,9 @@ import uuid
 import subprocess
 
 import cv2
+
+import background
+import fast_cut
 
 FFMPEG = os.environ.get("FFMPEG_PATH", "ffmpeg.exe")
 
@@ -91,7 +98,7 @@ def video_duration_sec(video_path):
 
 def _run(cmd):
     try:
-        res = subprocess.run(cmd, capture_output=True)
+        res = background.run(cmd, capture_output=True)
     except FileNotFoundError:
         raise RuntimeError(f"Az ffmpeg nem található ({FFMPEG}). Állítsd be az FFMPEG_PATH környezeti változót.")
     if res.returncode != 0:
@@ -100,35 +107,33 @@ def _run(cmd):
 
 
 def cut_clip(video_path, start_sec, end_sec, out_path, accurate=True):
-    """Egy klip kivágása. accurate=True: újrakódolás (képkocka-pontos), False: stream copy."""
+    """
+    Egy klip kivágása. accurate=True: képkocka-pontos smart cut (fast_cut), False: stream copy.
+    Visszatér: a vágás módja ("copy" / "smart" / "full" / "stream_copy").
+    """
+    if accurate:
+        info = fast_cut.smart_cut(video_path, start_sec, end_sec, out_path, ffmpeg_bin=FFMPEG)
+        return info["mode"]
     duration = max(0.05, end_sec - start_sec)
     cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
            "-ss", f"{start_sec:.3f}", "-i", video_path, "-t", f"{duration:.3f}",
-           "-map", "0:v:0", "-map", "0:a:0?"]
-    if accurate:
-        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2"]
-    else:
-        cmd += ["-c", "copy", "-avoid_negative_ts", "make_zero"]
-    cmd += ["-movflags", "+faststart", out_path]
+           "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-avoid_negative_ts", "make_zero",
+           "-movflags", "+faststart", out_path]
     _run(cmd)
     if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
         raise RuntimeError("Az ffmpeg nem hozta létre a klipet.")
+    return "stream_copy"
 
 
-def concat_clips(paths, out_path):
-    """Összefűzés a concat demuxerrel, újrakódolás nélkül."""
-    list_path = out_path + ".txt"
-    with open(list_path, "w", encoding="utf-8") as f:
-        for p in paths:
-            safe = os.path.abspath(p).replace("\\", "/").replace("'", "'\\''")
-            f.write(f"file '{safe}'\n")
+def concat_clips(paths, out_path, verify=True):
+    """
+    Összefűzés: azonos paraméterű részeknél újrakódolás nélkül (concat demuxer, ellenőrzéssel),
+    eltérőknél vagy hibánál újrakódolva. Visszatér: "copy" vagy "reencode".
+    """
     try:
-        _run([FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0",
-              "-i", list_path, "-c", "copy", "-movflags", "+faststart", out_path])
-    finally:
-        if os.path.exists(list_path):
-            os.remove(list_path)
+        return fast_cut.concat_files(paths, out_path, ffmpeg_bin=FFMPEG, verify=verify)["mode"]
+    except FileNotFoundError:
+        raise RuntimeError(f"Az ffmpeg nem található ({FFMPEG}). Állítsd be az FFMPEG_PATH környezeti változót.")
 
 
 def _slug(text, max_len=40):
@@ -169,9 +174,9 @@ def export_clips(video_path, items, out_dir, pre_sec=DEFAULT_PRE_SEC, post_sec=D
         for i, (s, e) in enumerate(windows, 1):
             fname = f"{base}_{i:02d}.mp4"
             out_path = os.path.abspath(os.path.join(out_dir, fname))
-            cut_clip(video_path, s, e, out_path, accurate)
+            mode = cut_clip(video_path, s, e, out_path, accurate)
             clips.append({"start_sec": round(s, 3), "end_sec": round(e, 3),
-                          "url": f"{url_prefix}/{fname}", "local_path": out_path})
+                          "url": f"{url_prefix}/{fname}", "local_path": out_path, "cut_mode": mode})
             if progress_cb is not None:
                 progress_cb(i, len(windows))
 
@@ -183,7 +188,7 @@ def export_clips(video_path, items, out_dir, pre_sec=DEFAULT_PRE_SEC, post_sec=D
             else:
                 mname = f"{base}_osszefuzott.mp4"
                 mpath = os.path.abspath(os.path.join(out_dir, mname))
-                concat_clips([c["local_path"] for c in clips], mpath)
+                result["merge_mode"] = concat_clips([c["local_path"] for c in clips], mpath, verify=accurate)
                 result["merged_url"], result["merged_local_path"] = f"{url_prefix}/{mname}", mpath
         return result
     except RuntimeError as ex:

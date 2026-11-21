@@ -1076,6 +1076,8 @@ async def cut_match_endpoint(
     except Exception as ex:
         traceback.print_exc()
         return {"status": "error", "message": f"Meccs vágási hiba: {ex}"}
+    paths = dict(paths)
+    cut_modes = paths.pop("cut_modes", None)  # képkocka-pontos smart cut: copy / smart / full
 
     def to_url(p):
         return f"/clips/{os.path.basename(p)}" if p else None
@@ -1089,6 +1091,7 @@ async def cut_match_endpoint(
         "second_half_url": to_url(paths["second_half"]),
         "full_match_url": to_url(paths["full_match"]),
         "local_paths": paths,
+        "cut_modes": cut_modes,
     }
 
 
@@ -1228,6 +1231,26 @@ def _form_error(message, code=400):
     return JSONResponse(status_code=code, content={"status": "error", "message": message})
 
 
+def _background_opts(raw):
+    """
+    Háttér-mód a form mezőkből: background (vagy hatter) = true → alacsony prioritás + kevés szál,
+    threads (vagy szalak) = N → szálkorlát (háttér-módban alapból a magok fele, akkun a negyede).
+    Hibás értéknél ValueError.
+    """
+    bg_raw = raw.get("background", raw.get("hatter", ""))
+    bg = pipeline._to_bool(bg_raw) if str(bg_raw).strip() else False
+    th_raw = str(raw.get("threads", raw.get("szalak", "")) or "").strip()
+    threads = None
+    if th_raw:
+        try:
+            threads = int(th_raw)
+        except ValueError:
+            raise ValueError(f"Érvénytelen szálszám: {th_raw!r}")
+        if threads < 1:
+            raise ValueError("A szálszám legalább 1.")
+    return {"background": bg, "threads": threads}
+
+
 def _run_match_job(progress, video_path, opts):
     return pipeline.run_match_pipeline(video_path, opts, progress=progress, funcs=_job_funcs())
 
@@ -1243,11 +1266,12 @@ async def analyze_match_job_endpoint(request: Request):
         opts = pipeline.coerce_options(raw)
         pipeline.parse_compilations(opts["compilations"])
         pipeline.build_analysis_config(opts)  # a HSV mezők ellenőrzése még a job indítása előtt
+        bg = _background_opts(raw)
     except ValueError as ex:
         return _form_error(str(ex))
     params = {"video_path": video_path, **{k: opts[k] for k in pipeline.PIPELINE_DEFAULTS},
               "calib_points": opts["calib_points"], "team1_attacks_right": opts["team1_attacks_right"]}
-    job_id = job_manager.submit("analyze-match", _run_match_job, video_path, opts, params=params)
+    job_id = job_manager.submit("analyze-match", _run_match_job, video_path, opts, params=params, **bg)
     return {"status": "success", "job_id": job_id, "status_url": f"/jobs/{job_id}"}
 
 
@@ -1274,12 +1298,24 @@ def _job_cut_match(progress, raw):
                                                 progress.sub(0, 90, "Félidők felismerése"), notes)
     progress(90.0, "Vágás")
     duration = (detection or {}).get("duration_sec")
-    paths = cut_match_halves(raw["video_path"], halves, CLIPS_DIR, padding_sec=opts["padding_sec"], duration_sec=duration)
     to_url = lambda p: f"/clips/{os.path.basename(p)}" if p else None
+    done = {}
+
+    def on_part(key, path):
+        # a kész félidő már a job futása közben elérhető (részeredmény)
+        done[f"{key}_url"] = to_url(path)
+        progress.publish({"status": "success", "reszleges": True, "halves": halves, **done,
+                          "kesz_reszek": [k[:-4] for k in done]})
+        progress.check_cancel()
+        progress.check_pause()  # szüneteltetés / megszakítás a következő fájl előtt
+
+    paths = dict(cut_match_halves(raw["video_path"], halves, CLIPS_DIR, padding_sec=opts["padding_sec"],
+                                  duration_sec=duration, on_part=on_part))
+    cut_modes = paths.pop("cut_modes", None)
     return {"status": "success", "halves": halves, "confidence": (detection or {}).get("confidence"),
             "notes": notes, "first_half_url": to_url(paths["first_half"]),
             "second_half_url": to_url(paths["second_half"]), "full_match_url": to_url(paths["full_match"]),
-            "local_paths": paths}
+            "local_paths": paths, "cut_modes": cut_modes}
 
 
 def _job_heatmap(progress, raw):
@@ -1327,10 +1363,11 @@ async def run_job_endpoint(request: Request):
             pipeline.build_analysis_config(raw)
         elif kind == "cut-match":
             pipeline.coerce_options(raw)
+        bg = _background_opts(raw)
     except ValueError as ex:
         return _form_error(str(ex))
     params = {k: v for k, v in raw.items() if k != "events_json"}
-    job_id = job_manager.submit(kind, JOB_KINDS[kind], raw, params=params)
+    job_id = job_manager.submit(kind, JOB_KINDS[kind], raw, params=params, **bg)
     return {"status": "success", "job_id": job_id, "status_url": f"/jobs/{job_id}"}
 
 
@@ -1350,6 +1387,24 @@ async def get_job_endpoint(job_id: str):
 @app.post("/jobs/{job_id}/cancel")
 async def cancel_job_endpoint(job_id: str):
     job = job_manager.cancel(job_id)
+    if job is None:
+        return _form_error("Nincs ilyen feladat.", 404)
+    return {"status": "success", "job": job}
+
+
+@app.post("/jobs/{job_id}/pause")
+async def pause_job_endpoint(job_id: str):
+    """Szüneteltetés (kooperatív: a feladat a következő haladásjelzésnél áll meg, állapot: paused)."""
+    job = job_manager.pause(job_id)
+    if job is None:
+        return _form_error("Nincs ilyen feladat.", 404)
+    return {"status": "success", "job": job}
+
+
+@app.post("/jobs/{job_id}/resume")
+async def resume_job_endpoint(job_id: str):
+    """A szüneteltetett feladat folytatása."""
+    job = job_manager.resume(job_id)
     if job is None:
         return _form_error("Nincs ilyen feladat.", 404)
     return {"status": "success", "job": job}
