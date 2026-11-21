@@ -555,7 +555,9 @@ class GrassModel:
     LV_TOL_DARK = 1.0        # sötétebb irányban legalább ennyi (log; ~x0,37: az alakok saját árnyéka is fű)
     MODE_CHROMA_GAP = 0.45   # a második módus színaránya legfeljebb ennyire térhet el az elsőtől
     MODE_LV_GAP = 0.25       # ... és világosságban legalább ennyire különbözzön (vagy színarányban 2,5 szigmára)
-    MIN_MODE_W = 0.07        # a második módus minimális súlya
+    MIN_MODE_W = 0.1         # a második módus minimális súlya
+    SHADOW_CHROMA_GAP = 0.25  # árnyék-módus (megvilágítás-korrekcióhoz): legfeljebb ennyi színarány-eltérés ...
+    SHADOW_LV_GAP = 0.25      # ... és legalább ennyivel sötétebb (log; ~x0,78)
     DENS_WIN, DENS_MIN = 5, 0.5   # többségi szűrő: ablakméret (px) és a fű-pixelek minimális aránya
     EDGE_GROW = 0            # a kész maszk tágítása (px, a maszk felbontásán; 0 = nincs)
     D2_WEAK = 36.0           # gyenge jelölt színarány-tűrése (~6 szigma)
@@ -748,6 +750,15 @@ class GrassModel:
         self.history.append((self.n_obs, len(self.modes), self.shadow_weight()))
         return True
 
+    def shadow_like(self):
+        """Igaz, ha a második módus valódi (szorzó jellegű) árnyék: hasonló színarány, jóval sötétebb.
+        A csillanás / fátyolfény (hozzáadódó fény, fakóbb szín) ilyenkor NEM árnyék – arra a
+        szorzós megvilágítás-korrekció rossz volna."""
+        if len(self.modes) < 2:
+            return False
+        a, b = self.modes
+        return float(np.hypot(*(a.mu - b.mu))) < self.SHADOW_CHROMA_GAP and (a.lv - b.lv) >= self.SHADOW_LV_GAP
+
     def shadow_weight(self):
         return 0.0 if len(self.modes) < 2 else float(self.modes[1].w / (self.modes[0].w + self.modes[1].w))
 
@@ -934,7 +945,7 @@ class GrassModel:
         a napos / árnyékos fű átlagszínének aránya (a módusok átlagából – nem zajos, és a nyírási
         csíkok sem zavarják). Visszatér: (szorzó BGR float32[3] vagy None, árnyékos arány 0..1).
         """
-        if len(self.modes) < 2:
+        if not self.shadow_like():
             return None, 0.0
         H, W = frame_bgr.shape[:2]
         x1, y1, x2, y2 = [int(v) for v in bbox]

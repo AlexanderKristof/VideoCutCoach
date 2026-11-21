@@ -146,6 +146,23 @@ class VideoQualityTests(unittest.TestCase):
         self.assertNotIn("reliability", evs[2])
         self.assertTrue(summ["summary_text"].startswith("Videóminőség:"))
 
+    def test_review_banner(self):
+        """Az áttekintő index.html / index.json megkapja a minőség-összesítőt."""
+        import json
+        import tempfile
+        from review_export import ReviewExporter
+        qm, _ = run_monitor(frames("arnyek"))
+        summ = qm.summary()
+        d = tempfile.mkdtemp(prefix="rx_q_")
+        rx = ReviewExporter(d, 25)
+        rx.add_frame(0, 0.0, frames("arnyek")[0])
+        rx.close(video_quality=summ)
+        page = open(os.path.join(d, "index.html"), encoding="utf-8").read()
+        self.assertIn(f"Videóminőség: {summ['grade']}", page)
+        self.assertIn("erős árnyék", page)
+        with open(os.path.join(d, "index.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["video_quality"]["grade"], summ["grade"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

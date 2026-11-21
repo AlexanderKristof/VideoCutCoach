@@ -156,7 +156,7 @@ def frame_metrics(frame, grass_model=None, grass_mask=None):
 
     # árnyék-megosztottság
     shadow_frac, shadow_ratio = 0.0, 1.0
-    if lab_map is not None and len(grass_model.modes) == 2:
+    if lab_map is not None and grass_model.shadow_like():
         n1 = np.count_nonzero(lab_map == 1)
         n2 = np.count_nonzero(lab_map == 2)
         if n1 + n2 > 0:
@@ -215,7 +215,7 @@ def severities(m, sharp_ref=None, sat_ref=None, ratio_ref=None, pan_px=None):
     sev["glare"] = _clip01(max(m["glare_area"] / 0.08, m["clipped"] / 0.06, m["faded_grass"] / 0.25, s_sat))
     # erős árnyék: a fű kétmódusú, a módusok elég nagyok és a világosság-arány kicsi
     f = m["shadow_frac"]
-    balance = _clip01(min(f, 1.0 - f) / 0.2)   # nagy kiterjedésű árnyék (a játékosok saját árnyéka nem)
+    balance = _clip01(min(f, 1.0 - f) / 0.25)   # nagy kiterjedésű árnyék (a játékosok saját árnyéka nem)
     sev["shadow"] = _clip01((0.8 - m["shadow_ratio"]) / 0.3) * balance
     sev["blocking"] = _clip01((m["blockiness"] - 1.7) / 0.8)
     sev["dark_noise"] = _clip01(max((75.0 - m["brightness"]) / 40.0, (m["noise"] - 3.5) / 5.0, m["crushed"] / 0.2))
