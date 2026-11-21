@@ -228,3 +228,49 @@ Válasz:
 - Egyetlen klipnél a `merged_url` maga a klip; `merge=false` esetén `null`.
 - Az ffmpeg útvonala az `FFMPEG_PATH` környezeti változóval állítható (alapértelmezett: `ffmpeg.exe`).
 - Hiba esetén (üres lista, hibás időablak, hiányzó videó / ffmpeg): `{"status": "error", "message": "..."}`.
+
+## Automatikus csapatba sorolás (team_classifier.py)
+
+A kézi HSV-tartományok (az edzőnek a mezre kell kattintania) helyett a motor magától tanulja meg a két mezszínt.
+
+### Mikor melyik mód?
+- **Kézi mód** marad, ha a kliens a `/cut-raw` hívásban `team1_hsv_*` / `team2_hsv_*` tartományt ad (nem a teljes `0,0,0`–`179,255,255` tartományt) – a kézi beállítás mindig nyer.
+- **Automatikus mód**: `auto_teams=true` (alapértelmezett) és nincs csapat-tartomány megadva.
+- A kapus-tartományok (`keeper1/2_hsv_*`) és a modell kapus osztálya automatikus módban is érvényesek.
+- Új form mezők: `auto_teams: bool = true`, `swap_teams: bool = false` (a két csapat felcserélése, ha a sorrend nem a kívánt).
+
+### Működés
+1. **Mezjellemző** detektálásonként (kb. 0.12 ms): felsőtest (a doboz 20–55%-a magasságban, középső 60% szélesség) → 12x16-os folt; a fűszínű pixelek kimaradnak (ha szinte minden „fű”, akkor zöld mezről van szó, és mindent megtartunk); a világosság szélső 10–10%-a (árnyék, csillanás) kimarad; Lab medián (L kisebb súllyal) + 8 rekeszes, telítettséggel súlyozott színezet-hisztogram + 1 színtelen rekesz. Nincs detektálásonkénti KMeans.
+2. **Bemelegítés**: az első 12 mp-ben (vagy 1500 mintáig) követésenként 0.2 mp-enként gyűjtünk mintát. `cv2.kmeans` k=7-tel, majd:
+   - „Csapatrész” az a klaszter, amely sok különböző követésből áll (effektív követésszám ≥ 3.5, méret ≥ 4%). A bíró és a kapus klasztere jellemzően 1–2 követésből áll, ezért „egyéb” marad.
+   - A csapatrészeket (pl. napos és árnyékos fehér mez) a középpontok távolsága szerint két csoportba vonjuk össze → a két csapat.
+   - A csapathoz nagyon közeli „egyéb” klaszter a csapathoz kerül.
+   - A végleges illesztésig 150 mintánként ideiglenes illesztés készül, így az elejétől van (ideiglenes) besorolás; az illesztés előtti legelső képkockákon a régi tartalék szabály (piros > kék) dönt.
+3. **Online besorolás**: legközelebbi klaszter (a klaszter szórásával normált távolság); ami minden klasztertől messze van (z > 4), az „egyéb” szavazat (új, eddig nem látott mez). Követésenként exponenciálisan felejtő szavazás (felezési idő 1 mp) hiszterézissel (váltás csak 1.3-szoros előnynél): 20% hibás kivágásnál is stabil.
+4. **Szerepek**:
+   - „Egyéb” mezű követés **kapus**, ha a pályakoordinátái legalább 60%-ban a kapu előtti 20 m-es sávban vannak, vagy a modell kapus osztályt ad; a csapata az, amelyik azt a kaput védi (a csapatok átlagos x-e alapján).
+   - Különben **bíró** (pályakoordinátával) vagy **egyéb** (kalibráció nélkül). Mindkettő semleges kerettel rajzolódik, és nem kerül a játékosok közé.
+   - Az automatikusan kapusnak minősült követést az álló alak szűrő nem dobja el.
+5. **Csapatsorrend** (determinisztikus): az **1. csapat** az, amelyiknek a játékosai a bemelegítés alatt átlagosan a **bal térfélen** (kisebb x) voltak; ha nincs elég pályakoordináta (nincs kalibráció), a nagyobb klaszter. `swap_teams=true` megcseréli. Automatikus módban tehát a klip elején az 1. csapat védi a bal (x=0) kaput – ehhez illik a `team1_attacks_right=true`.
+
+### Kimenet
+Az `events_<id>.json` új mezői:
+```json
+"team_colors": {"team1": [r, g, b], "team2": [r, g, b], "other": [r, g, b] | null},
+"team_mode": "auto"
+```
+Kézi módban `"team_colors": null, "team_mode": "manual"`. A debug naplóba a tanult klaszterek (szerep, szín, mintaszám, szétválás) is bekerülnek.
+
+### Tesztek (`python3 tests/test_team_classifier.py`)
+Szintetikus kivágások (fű háttér, 20–120 px, árnyék, csillanás, elmosódás, zaj, takarás), 20 mezőnyjátékos + 2 kapus (zöld, narancs) + bíró (sárga/fekete):
+- piros–fehér és kék–égszínkék: ~100% csapat-pontosság; a bíró 100%-ban, a kapusok ~97%-ban nem kerülnek mezőnyjátékosként csapatba;
+- fekete–nagyon sötétkék (nehéz pár): ~81% (a világosság-ingadozás itt nagyobb, mint a két mez különbsége);
+- 20% hibás kivágás: egyedi besorolás ~80%, szavazással 100%;
+- költség: ~0.14 ms / detektálás; a (ritka) illesztés 1600 mintán ~160 ms.
+
+### Korlátok
+- A tanult színek a klip elejéhez igazodnak; nagy fényviszony-változásnál (este, reflektor) új klipnél újra tanul, de egy klipen belül nincs újratanulás.
+- Ha a bíró / kapus mez a csapatéhoz hasonló (pl. fekete bíró – fekete mez), nem választható szét.
+- Kalibráció nélkül a kapus nem ismerhető fel pozíció alapján (csak a modell kapus osztályával vagy kézi színnel).
+- Az illesztés előtt kiadott ideiglenes címkéket nem írjuk vissza; a pályák csapata (`trajectories`) a leggyakoribb címke, így ez alig számít.
+- Ha a bemelegítés alatt csak az egyik csapat látszik (a Veo kamera egy térfélen marad), a két „csapat” rossz lehet – ilyenkor kézi tartomány vagy hosszabb klip ajánlott.
