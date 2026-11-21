@@ -38,7 +38,7 @@ Kiegészítésként a színek egyszerűsítése (pl. a mezszínek klaszterezése
 ## Fázisok
 
 ### 1. Felismerés tisztítása (ez a mostani probléma)
-- Focira tanított modell: `játékos / kapus / bíró / labda` osztályok.
+- Focira tanított modell: `játékos / kapus / bíró / labda` osztályok (beállítás: [MODELL_BEALLITAS.md](MODELL_BEALLITAS.md)).
 - **Pályamaszk:** csak az a téglalap marad, amelynek **alsó közepe (a láb)** a pályán belül van.
   - Első lépés: zöld szín (HSV) alapú maszk.
   - Később: a virtuális pálya poligonja (lásd fent).
