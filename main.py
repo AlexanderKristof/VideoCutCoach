@@ -27,6 +27,8 @@ from pitch_filters import (build_grass_mask, foot_on_grass, CameraMotion,
                            StationaryFilter, extract_dominant_color)
 from model_config import (load_model_config, resolve_weights, build_role_class_map,
                           describe_role_map, should_detect, reset_tracker)
+from match_segmenter import (detect_match_halves, cut_match_halves,
+                             parse_time_value, format_hms)
 from auth import hash_password, verify_password, create_access_token, get_current_user
 
 Base.metadata.create_all(bind=engine)
@@ -589,6 +591,115 @@ async def burn_drawings_endpoint(
     await loop.run_in_executor(executor, process_burn)
 
     return {"status": "success", "clip_url": f"/clips/{output_filename}", "local_path": output_path}
+
+# ============================================================
+# A 90 PERC AUTOMATIKUS KIVÁGÁSA — félidők felismerése
+# (sípszó + képi aktivitás, lásd match_segmenter.py) és vágás
+# ============================================================
+
+_segmenter_person_model = None
+_segmenter_person_lock = threading.Lock()
+
+def _segmenter_person_counter(frame):
+    """
+    Létszám a mintaképkockán a félidő-felismeréshez. Külön (nano) YOLO példány,
+    hogy ne zavarja a /cut-raw követését (a model.track állapota nem szálbiztos).
+    """
+    global _segmenter_person_model
+    with _segmenter_person_lock:
+        if _segmenter_person_model is None:
+            _segmenter_person_model = YOLO('yolov8n.pt')
+        results = _segmenter_person_model.predict(frame, classes=[0], conf=0.3, device=device, verbose=False)
+    return int(len(results[0].boxes)) if results else 0
+
+def _detect_halves_sync(video_path, expected_half_min, use_person_count):
+    return detect_match_halves(
+        video_path,
+        expected_half_min=expected_half_min,
+        person_counter=_segmenter_person_counter if use_person_count else None,
+    )
+
+@app.post("/detect-halves")
+async def detect_halves_endpoint(
+    video_path: str = Form(...),
+    expected_half_min: float = Form(45.0),
+    use_person_count: bool = Form(False)
+):
+    if not os.path.exists(video_path):
+        return {"status": "error", "message": "A videófájl nem található."}
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(executor, _detect_halves_sync, video_path, expected_half_min, use_person_count)
+    except Exception as ex:
+        traceback.print_exc()
+        return {"status": "error", "message": f"Félidő-felismerési hiba: {ex}"}
+    return {"status": "success", **result}
+
+@app.post("/cut-match")
+async def cut_match_endpoint(
+    video_path: str = Form(...),
+    expected_half_min: float = Form(45.0),
+    first_start: str = Form(""),
+    first_end: str = Form(""),
+    second_start: str = Form(""),
+    second_end: str = Form(""),
+    padding_sec: float = Form(5.0),
+    use_person_count: bool = Form(False)
+):
+    if not os.path.exists(video_path):
+        return {"status": "error", "message": "A videófájl nem található."}
+    overrides = [parse_time_value(v) for v in (first_start, first_end, second_start, second_end)]
+
+    def process_cut():
+        notes = []
+        detection = None
+        if any(v is None for v in overrides):
+            detection = _detect_halves_sync(video_path, expected_half_min, use_person_count)
+            notes += detection.get("notes", [])
+        else:
+            notes.append("Kézzel megadott határok – automatikus felismerés nélkül.")
+        fh = dict((detection or {}).get("first_half") or {})
+        sh = dict((detection or {}).get("second_half") or {})
+        for half, keys, vals in ((fh, ("start_sec", "end_sec"), overrides[:2]),
+                                 (sh, ("start_sec", "end_sec"), overrides[2:])):
+            for k, v in zip(keys, vals):
+                if v is not None:
+                    half[k] = v
+        halves = {}
+        for key, half in (("first_half", fh), ("second_half", sh)):
+            if "start_sec" in half and "end_sec" in half and half["end_sec"] > half["start_sec"]:
+                halves[key] = {"start_sec": round(float(half["start_sec"]), 2),
+                               "end_sec": round(float(half["end_sec"]), 2),
+                               "start_hms": format_hms(half["start_sec"]),
+                               "end_hms": format_hms(half["end_sec"])}
+            elif half:
+                notes.append(f"{'Az 1.' if key == 'first_half' else 'A 2.'} félidő határai hibásak, kihagyva.")
+        if not halves:
+            raise RuntimeError("Nincs érvényes félidő a vágáshoz.")
+        duration = detection.get("duration_sec") if detection else None
+        paths = cut_match_halves(video_path, halves, CLIPS_DIR, padding_sec=padding_sec, duration_sec=duration)
+        return halves, paths, notes, (detection or {}).get("confidence")
+
+    loop = asyncio.get_running_loop()
+    try:
+        halves, paths, notes, confidence = await loop.run_in_executor(executor, process_cut)
+    except Exception as ex:
+        traceback.print_exc()
+        return {"status": "error", "message": f"Meccs vágási hiba: {ex}"}
+
+    def to_url(p):
+        return f"/clips/{os.path.basename(p)}" if p else None
+
+    return {
+        "status": "success",
+        "halves": halves,
+        "confidence": confidence,
+        "notes": notes,
+        "first_half_url": to_url(paths["first_half"]),
+        "second_half_url": to_url(paths["second_half"]),
+        "full_match_url": to_url(paths["full_match"]),
+        "local_paths": paths,
+    }
 
 # ============================================================
 # AUTH VÉGPONTOK — eddig hiányoztak, pedig az AuthService.cs
