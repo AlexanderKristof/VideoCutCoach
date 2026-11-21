@@ -45,6 +45,8 @@ ANALYSIS_DEFAULTS = {
     "keeper2_hsv_lower": "0,0,0", "keeper2_hsv_upper": "179,255,255",
     "team1_attacks_right": True,     # az 1. félidőre vonatkozik, a 2.-ban megfordul
     "review_export": True,
+    "auto_teams": True,              # automatikus csapatba sorolás mezszín alapján
+    "swap_teams": False,             # az 1. félidőre vonatkozik, a 2.-ban megfordul
 }
 
 # A teljes folyamat saját beállításai
@@ -135,6 +137,7 @@ def build_analysis_config(opts):
     config = {
         "team1_attacks_right": o["team1_attacks_right"],
         "review_export": o["review_export"],
+        "auto_teams": o["auto_teams"], "swap_teams": o["swap_teams"],
         "roi_top_pct": o["roi_top_pct"], "roi_bottom_pct": o["roi_bottom_pct"],
         "min_player_height_pct": o["min_player_height_pct"],
         "use_static_roi": o["use_static_roi"], "grass_min_ratio": o["grass_min_ratio"],
@@ -473,6 +476,10 @@ def run_match_pipeline(video_path, options=None, progress=None, funcs=None, out_
         cfg = dict(analysis_config)
         if key == "second_half":
             cfg["team1_attacks_right"] = not analysis_config["team1_attacks_right"]  # térfélcsere
+            # Automatikus csapatoknál az 1. csapat = a klip elején bal oldalon álló csapat;
+            # térfélcsere után ez a másik csapat lenne, ezért a sorrendet is megfordítjuk,
+            # így a "team1" mindkét félidőben ugyanaz a csapat marad.
+            cfg["swap_teams"] = not analysis_config.get("swap_teams", False)
         label = f"{HALF_LABELS[key]} elemzése"
         progress(pos, label)
         clip_url, local_path, events_path = funcs["analyze"](
