@@ -35,6 +35,15 @@ python main.py
 ```
 - Taktikai tábla: http://localhost:8000/tabla
 - Egy elemzett meccs visszajátszása: `http://localhost:8000/tabla?events=/clips/events_<azonosító>.json`
+- Rajzolás a meccsvideóra („Videó elemzés” mód), sarokban a felülnézettel:
+  `http://localhost:8000/tabla?video=/clips/raw_<azonosító>.mp4&events=/clips/events_<azonosító>.json`
+  - A rajzok (nyíl, futás, vonal, karika, zóna, toll, felirat, kiemelés) a videó egy képkockájához
+    tapadnak („rajz-megálló”): lejátszáskor ott megáll. Billentyűk: szóköz, ← →, vessző / pont (képkocka).
+  - „Videó exportálása rajzokkal” / „Részlet mentése”: MP4, a megállóknál kimerevítve a rajzzal
+    (`POST /burn-stops` háttérfeladat, lásd `video_annotate.py`). A szerver videói: `GET /videos`.
+  - Időillesztés a felülnézethez: `raw_<id>.mp4` → elemzési idő = `source.start_sec` + videóidő;
+    `match_<id>.mp4` (vágott meccs) → félidőnként az események `full_match_sec` mezőjéből; eredeti videó → azonos.
+  - Ékezetes feliratokhoz az exportban a Pillow ajánlott (`pip install pillow`); nélküle az OpenCV rajzol, ékezet nélkül.
 
 **Teljes meccs elemzése parancssorból (MAUI nélkül):**
 ```powershell
