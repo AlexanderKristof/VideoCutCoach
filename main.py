@@ -34,6 +34,7 @@ from match_segmenter import (detect_match_halves, cut_match_halves,
 from auth import hash_password, verify_password, create_access_token, get_current_user
 from heatmap import TrackMetaCollector, compact_trajectories, generate_heatmaps_from_file
 from clip_export import export_clips, DEFAULT_PRE_SEC, DEFAULT_POST_SEC
+from team_classifier import TeamClassifier, auto_teams_enabled
 
 Base.metadata.create_all(bind=engine)
 
@@ -150,6 +151,13 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
     grass_lower, grass_upper = colors["grass"]
     camera_motion = CameraMotion()
     stationary_filter = StationaryFilter(fps, config["stationary_window_sec"], config["stationary_max_move"])
+
+    # --- AUTO CSAPAT (team_classifier.py): csak ha nincs kézi csapat-HSV tartomány ---
+    team_clf = None
+    if auto_teams_enabled(config):
+        team_clf = TeamClassifier(grass_lower=grass_lower, grass_upper=grass_upper,
+                                  swap_teams=config.get("swap_teams", False))
+    # --- AUTO CSAPAT VÉGE ---
 
     process = subprocess.Popen([
         "ffmpeg.exe", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
@@ -273,14 +281,32 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
                             # 5. Álló alak szűrő (néző, edző) – a kapus kivétel, ő sokáig állhat egy helyben
                             stab_x, stab_y = camera_motion.stabilize(foot_x, foot_y)
                             is_static = stationary_filter.update(tid, frames_done, stab_x, stab_y, box_h)
-                            if is_static and not is_keeper:
+                            if is_static and not is_keeper and not (
+                                    team_clf is not None and team_clf.is_keeper_track(tid, current_time_sec)):  # AUTO CSAPAT: kapus kivétel
                                 debug_file.write(f"F#{frames_done} ID#{tid}: ELDOBVA -> Mozdulatlan alak ({config['stationary_window_sec']:.1f}s)\n")
                                 continue
 
                             crop = frame[max(0, y1):min(height, y2), max(0, x1):min(width, x2)]
                             dominant_color = extract_dominant_color(crop, grass_lower, grass_upper)
 
-                            if is_k1 or check_color_match(hsv_frame, x1, y1, x2, y2, colors["team1"][0], colors["team1"][1]):
+                            # --- AUTO CSAPAT: mezszín-klaszterezés + követésenkénti szavazás ---
+                            if team_clf is not None:
+                                pitch_xy = engine_instance.transform_to_pitch(foot_x, foot_y, H) if H is not None else None
+                                auto = team_clf.observe(tid, crop, current_time_sec, pitch_xy=pitch_xy,
+                                                        model_keeper=model_keeper)
+                                if (auto["is_referee"] or auto["role"] == "other") and not is_keeper:
+                                    # bíró / egyéb mez (pl. kapus pályakoordináta nélkül): semleges keret
+                                    referee_boxes.append((x1, y1, x2, y2))
+                                    continue
+                                is_keeper = is_keeper or auto["is_keeper"]
+                                if is_k1 or is_k2:
+                                    team_id = 1 if is_k1 else 2
+                                else:
+                                    # ismeretlen (bemelegítés eleje / kapus csapata nem dönthető el): szín szerinti tipp
+                                    team_id = (auto["team_id"] or auto["color_team"]
+                                               or (1 if dominant_color[0] > dominant_color[2] else 2))
+                            # --- AUTO CSAPAT VÉGE ---
+                            elif is_k1 or check_color_match(hsv_frame, x1, y1, x2, y2, colors["team1"][0], colors["team1"][1]):
                                 team_id = 1
                             elif is_k2 or check_color_match(hsv_frame, x1, y1, x2, y2, colors["team2"][0], colors["team2"][1]):
                                 team_id = 2
@@ -350,6 +376,9 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
             if frames_done % 25 == 0:
                 print(f"Feldolgozva: {frames_done}/{total_frames} képkocka ({(frames_done/total_frames)*100:.1f}%)")
 
+        if team_clf is not None:  # AUTO CSAPAT: a tanult klaszterek a naplóba
+            debug_file.write("\n" + team_clf.describe() + "\n")
+
     cap.release()
     process.stdin.close()
     process.wait()
@@ -369,7 +398,10 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
         "match_stats": engine_instance.stats,
         "source": {"video_path": video_path, "start_sec": start_sec, "end_sec": end_sec},
         # Tömörített pályák (5 Hz, 0.1 m) a hőtérképhez / statisztikához – lásd heatmap.py
-        "trajectories": compact_trajectories(engine_instance.player_trajectories, track_meta.summary())
+        "trajectories": compact_trajectories(engine_instance.player_trajectories, track_meta.summary()),
+        # AUTO CSAPAT: tanult mezszínek (RGB) a kliensnek / taktikai táblának; kézi módban null
+        "team_colors": team_clf.team_colors() if team_clf is not None else None,
+        "team_mode": "auto" if team_clf is not None else "manual"
     }
     with open(events_path, 'w', encoding='utf-8') as f:
         json.dump(analysis_payload, f, ensure_ascii=False, indent=4)
@@ -398,10 +430,13 @@ async def cut_raw_endpoint(
     keeper1_hsv_lower: str = Form("0,0,0"), keeper1_hsv_upper: str = Form("179,255,255"),
     keeper2_hsv_lower: str = Form("0,0,0"), keeper2_hsv_upper: str = Form("179,255,255"),
     team1_attacks_right: bool = Form(True),
-    review_export: bool = Form(True)
+    review_export: bool = Form(True),
+    auto_teams: bool = Form(True),
+    swap_teams: bool = Form(False)
 ):
     config = {
         "team1_attacks_right": team1_attacks_right,
+        "auto_teams": auto_teams, "swap_teams": swap_teams,
         "review_export": review_export,
         "roi_top_pct": roi_top_pct, "roi_bottom_pct": roi_bottom_pct, "min_player_height_pct": min_player_height_pct,
         "use_static_roi": use_static_roi, "grass_min_ratio": grass_min_ratio,
