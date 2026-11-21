@@ -131,3 +131,22 @@ Ultralytics-frissítés után érdemes megnézni a naplóban a „Labda-jelölte
 a mechanizmust utánozza (a követő az első `track()`-nél regisztrált callback), így a
 `tests/test_e2e_synth.py` a valódi kódutat méri.
 
+
+## 7. Betöltés és a súlyfájl helye (lusta betöltés, models mappa)
+
+A modell **nem** a szerver indulásakor töltődik be, hanem az első elemzéskor (`main.ensure_model()`,
+szálbiztos, egyszer), vagy előre a `POST /models/load` háttérfeladattal. Így a `GET /health`
+azonnal válaszol, és a torch / ultralytics importja sem lassítja az indulást. A nyers
+labda-callback (6. pont) a betöltéskor, az első `track()` előtt regisztrálódik.
+
+A súlyfájlt a `model_manager.py` keresi, ebben a sorrendben: a megadott út (a munkakönyvtárhoz
+képest), a `models/` mappa (fájlnévvel is), az adatmappa, a csomagolt erőforrások, a program
+`models/` mappája. Ha nincs meg:
+- fejlesztői módban (`python main.py`) a régi viselkedés: a név változatlanul megy az ultralytics-nek,
+  amely a hivatalos súlyt a munkakönyvtárba tölti le;
+- alkalmazás-módban (telepített program / `TACTICAL_DATA_DIR`) a hivatalos súlyt (`yolov8*.pt`,
+  `yolo11*.pt`) a motor maga tölti le az adatmappa `models/` mappájába (`TACTICAL_AUTO_DOWNLOAD=0`
+  kikapcsolja; `TACTICAL_MODEL_BASE_URL` belső tükröt ad meg). A letöltés haladása:
+  `POST /models/download` → `GET /jobs/{id}`; állapot: `GET /models/status`.
+
+Alkalmazás-módban a `model_config.json` helye is az adatmappa (`%LOCALAPPDATA%\TacAnaly`).
