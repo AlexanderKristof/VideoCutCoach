@@ -2,8 +2,10 @@ import cv2
 import numpy as np
 import math
 
+from events import EventDetector, EventConfig, GK_EVENT_TYPES
+
 class TacticalEngine:
-    def __init__(self, pitch_length=105.0, pitch_width=68.0):
+    def __init__(self, pitch_length=105.0, pitch_width=68.0, team1_attacks_right=True, event_config=None):
         self.pitch_length = pitch_length
         self.pitch_width = pitch_width
 
@@ -17,12 +19,48 @@ class TacticalEngine:
         self.ball_trajectory = []
         self.possession_history = []
 
+        # Esemény-detektor (lövés, gól, kapus események) – lásd events.py
+        cfg = event_config or EventConfig()
+        cfg.team1_attacks_right = bool(team1_attacks_right)
+        self.event_detector = EventDetector(cfg, pitch_length, pitch_width)
+
+        # A lövés/gól/kapus statisztikák ugyanazok a dict objektumok, mint a detektorban (nincs külön szinkron)
+        det_stats = self.event_detector.stats
         self.stats = {
             "passes": {"team1": 0, "team2": 0},
             "tackles": {"team1": 0, "team2": 0},
-            "shots": {"team1": 0, "team2": 0},
-            "shots_on_target": {"team1": 0, "team2": 0}
+            "shots": det_stats["shots"],
+            "shots_on_target": det_stats["shots_on_target"],
+            "goals": det_stats["goals"],
+            "gk_events": det_stats["gk_events"]
         }
+
+    @property
+    def events(self):
+        """A detektor által eddig talált események (idő szerint rendezve)."""
+        return sorted(self.event_detector.events, key=lambda e: e["time"])
+
+    def set_attack_direction(self, team1_attacks_right):
+        """Félidőnként fordítható: True esetén az 1. csapat az x=105 kapura támad."""
+        self.event_detector.set_attack_direction(team1_attacks_right)
+
+    def finalize(self, timestamp=None):
+        """A feldolgozás végén lezárja a függő eseményeket (pl. megerősítetlen védés)."""
+        return self.event_detector.finalize(timestamp)
+
+    def keeper_team_near(self, coords):
+        """A megadott pálya-pozícióhoz legközelebbi kapus csapata ("team1"/"team2"), vagy None."""
+        return self.event_detector.keeper_team_near(coords)
+
+    def merge_timeline(self, external_events):
+        """Összefésüli a külső (pl. main.py helyezkedési hiba) eseményeket a detektor eseményeivel,
+        idő szerint rendezve, és a külső kapus eseményeket is beszámítja a statisztikába."""
+        for ev in external_events:
+            team = ev.get("team")
+            if ev.get("type") in GK_EVENT_TYPES and team in self.stats["gk_events"]:
+                bucket = self.stats["gk_events"][team]
+                bucket[ev["type"]] = bucket.get(ev["type"], 0) + 1
+        return sorted(list(external_events) + list(self.event_detector.events), key=lambda e: e["time"])
 
     def compute_homography(self, src_points):
         """
@@ -89,6 +127,9 @@ class TacticalEngine:
         if real_ball and current_frame_players:
             self._evaluate_possession_and_events(real_ball, current_frame_players, timestamp)
 
+        # Esemény-detektálás minden képkockán (játékosok nélkül is: a lövés/gól a labdán múlik)
+        self.event_detector.update(timestamp, real_ball, current_frame_players)
+
         return current_frame_players, real_ball
 
     def _evaluate_possession_and_events(self, ball_xy, players, timestamp):
@@ -120,20 +161,7 @@ class TacticalEngine:
                     self.stats["tackles"][team] += 1
                     self.possession_history.append((tid, team, timestamp))
 
-        # Lövés detektálása a labda sebességvektora alapján (> 45 km/h)
-        if len(self.ball_trajectory) >= 3:
-            prev_b = self.ball_trajectory[-3]
-            dt = timestamp - prev_b[2]
-            if dt > 0:
-                speed_mps = math.hypot(bx - prev_b[0], by - prev_b[1]) / dt
-                if (speed_mps * 3.6) > 45.0:
-                    if (prev_b[0] - bx) > 2.0:
-                        slope = (by - prev_b[1]) / (bx - prev_b[0] + 1e-5)
-                        intersect_y = by - slope * bx
-                        if 30.0 <= intersect_y <= 38.0:
-                            self.stats["shots_on_target"]["team2"] += 1
-                        else:
-                            self.stats["shots"]["team2"] += 1
+        # A lövés/gól/kapus események detektálása az EventDetector-ban történik (events.py)
 
     def analyze_goalkeeper(self, gk_coords, ball_coords):
         """Kiszámítja a kapus szögfelezőjét és az ideális pozíciótól mért eltérést méterben."""
@@ -143,8 +171,17 @@ class TacticalEngine:
         gx, gy = gk_coords
         bx, by = ball_coords
 
-        vec_left = self.goal_left_post - np.array([bx, by])
-        vec_right = self.goal_right_post - np.array([bx, by])
+        # A kapus a hozzá közelebbi kaput védi (bal: x=0, jobb: x=pálya hossza)
+        if gx <= self.pitch_length / 2.0:
+            post_a, post_b = self.goal_left_post, self.goal_right_post
+            dist_from_goal = gx
+        else:
+            post_a = np.array([self.pitch_length, self.goal_left_post[1]])
+            post_b = np.array([self.pitch_length, self.goal_right_post[1]])
+            dist_from_goal = self.pitch_length - gx
+
+        vec_left = post_a - np.array([bx, by])
+        vec_right = post_b - np.array([bx, by])
 
         norm_l = vec_left / np.linalg.norm(vec_left)
         norm_r = vec_right / np.linalg.norm(vec_right)
@@ -155,11 +192,12 @@ class TacticalEngine:
 
         p1_to_gk = np.array([gx, gy]) - line_pt1
         p1_to_p2 = line_pt2 - line_pt1
-        cross_prod = np.cross(p1_to_p2, p1_to_gk)
+        # 2D vektoriális szorzat kézzel (a numpy 2.x np.cross már nem fogad 2 elemű vektorokat)
+        cross_prod = p1_to_p2[0] * p1_to_gk[1] - p1_to_p2[1] * p1_to_gk[0]
         offset_meters = cross_prod / np.linalg.norm(p1_to_p2)
 
         return {
-            "dist_from_goal_m": round(float(gx), 2),
+            "dist_from_goal_m": round(float(dist_from_goal), 2),
             "bisector_offset_m": round(float(offset_meters), 2),
             "gk_coords": (gx, gy),
             "ball_coords": (bx, by)
