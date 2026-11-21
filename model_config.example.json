@@ -1,0 +1,12 @@
+{
+    "_megjegyzes": "Másold model_config.json néven a main.py mellé, és írd át. Minden kulcs elhagyható. Leírás: docs/MODELL_BEALLITAS.md",
+    "weights": "models/football-players-detection.pt",
+    "class_names": {
+        "player": ["player"],
+        "goalkeeper": ["goalkeeper"],
+        "referee": ["referee"],
+        "ball": ["ball"]
+    },
+    "ball_conf": 0.35,
+    "detect_every_n": 1
+}

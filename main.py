@@ -6,6 +6,7 @@ import asyncio
 import subprocess
 import time
 import math
+import threading
 import numpy as np
 import traceback
 from datetime import datetime
@@ -24,6 +25,8 @@ from models import Base, User, Match
 from tactical_engine import TacticalEngine
 from pitch_filters import (build_grass_mask, foot_on_grass, CameraMotion,
                            StationaryFilter, extract_dominant_color)
+from model_config import (load_model_config, resolve_weights, build_role_class_map,
+                          describe_role_map, should_detect, reset_tracker)
 from auth import hash_password, verify_password, create_access_token, get_current_user
 
 Base.metadata.create_all(bind=engine)
@@ -35,8 +38,27 @@ app.mount("/clips", StaticFiles(directory=CLIPS_DIR), name="clips")
 executor = ThreadPoolExecutor(max_workers=4)
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-model = YOLO('yolov8x.pt' if device == 'cuda' else 'yolov8n.pt')
-print(f"🔥 Tactical AI Motor aktív: {device.upper()}")
+model_cfg = load_model_config()
+model_weights = resolve_weights(model_cfg, device)
+if model_cfg.get("weights") and not os.path.exists(model_weights):
+    print(f"⚠️ A beállított súlyfájl nem található: {model_weights} (lásd docs/MODELL_BEALLITAS.md)")
+model = YOLO(model_weights)
+# Szerepkör -> osztály id-k a modell osztálynevei alapján (COCO: person / sports ball,
+# focis modell: player / goalkeeper / referee / ball)
+role_classes = build_role_class_map(model.names, model_cfg.get("class_names"))
+if not role_classes["player"] and not role_classes["goalkeeper"]:
+    print("⚠️ A modellben nincs játékos osztály (player / person) – állítsd be a class_names kulcsot!")
+DETECT_EVERY_N = model_cfg["detect_every_n"]
+BALL_CONF = model_cfg["ball_conf"]
+# A megosztott modellt (és a benne tárolt ByteTrack állapotot) egyszerre csak egy elemzés
+# használhatja. Kompromisszum: a párhuzamos elemzések sorban várnak egymásra, cserébe nem kell
+# elemzésenként külön modellt betölteni (a yolov8x több száz MB GPU memória és lassú betöltés),
+# és a követő azonosítói nem keverednek két klip között.
+model_lock = threading.Lock()
+print(f"🔥 Tactical AI Motor aktív: {device.upper()}, modell: {model_weights}")
+print(f"   Osztályok: {describe_role_map(role_classes, model.names)}")
+if DETECT_EVERY_N > 1:
+    print(f"   Gyors mód: felismerés minden {DETECT_EVERY_N}. képkockán")
 
 def check_color_match(hsv_frame, x1, y1, x2, y2, lower, upper):
     if np.array_equal(lower, np.array([0, 0, 0])) and np.array_equal(upper, np.array([179, 255, 255])):
@@ -131,14 +153,24 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
 
     frames_done = 0
     timeline_events = []
+    # Gyors mód: a kihagyott képkockákon az utolsó felismerés eredményét rajzoljuk ki újra,
+    # így a kimeneti videóban minden képkocka megmarad
+    last_valid_players = []
+    last_referee_boxes = []
+    last_ball_pixels = []
 
-    with open(debug_log_path, "w", encoding="utf-8") as debug_file:
+    # A megosztott modellt / követőt az egész klip idejére lefoglaljuk (lásd model_lock),
+    # és töröljük az előző elemzésből megmaradt ByteTrack állapotot
+    with model_lock, open(debug_log_path, "w", encoding="utf-8") as debug_file:
+        trackers_reset = reset_tracker(model)
         debug_file.write(f"=== TACTICAL ANALYZER RUN LOG: {clip_id} ===\n")
         debug_file.write(f"Videó felbontás: {width}x{height} @ {fps} FPS, Összes képkocka: {total_frames}\n")
         debug_file.write(f"Dinamikus Felső ROI Százalék: {roi_top_pct:.2f}, Min Magasság: {min_h:.1f}px\n")
         debug_file.write(f"Fix trapéz szűrő: {'BE' if config['use_static_roi'] else 'KI'}, "
                          f"Fű arány min.: {config['grass_min_ratio']:.2f}, "
-                         f"Álló alak ablak: {config['stationary_window_sec']:.1f}s\n\n")
+                         f"Álló alak ablak: {config['stationary_window_sec']:.1f}s\n")
+        debug_file.write(f"Modell: {model_weights}, osztályok: {describe_role_map(role_classes, model.names)}\n")
+        debug_file.write(f"Felismerés minden {DETECT_EVERY_N}. képkockán, törölt követők: {trackers_reset}\n\n")
 
         while cap.isOpened():
             ret, frame = cap.read()
@@ -146,88 +178,119 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
                 break
 
             current_time_sec = start_sec + (frames_done / fps)
-            hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-            grass_mask, grass_scale = build_grass_mask(hsv_frame, grass_lower, grass_upper)
             camera_motion.update(frame)
             if frames_done % 250 == 0:
                 stationary_filter.prune(frames_done)
-            results = model.track(frame, persist=True, tracker="bytetrack.yaml", device=device, verbose=False)
 
-            raw_detections = []
-            ball_pixel = None
+            detected = should_detect(frames_done, DETECT_EVERY_N)
             gk_real_coords = None
 
-            for r in results:
-                for box in [b for b in r.boxes if int(b.cls[0]) == 32 and float(b.conf[0]) > 0.35]:
-                    bx1, by1, bx2, by2 = map(int, box.xyxy[0])
-                    ball_pixel = (int((bx1 + bx2) / 2), int((by1 + by2) / 2))
-                    cv2.circle(frame, ball_pixel, 5, (0, 255, 255), -1)
+            if detected:
+                hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+                grass_mask, grass_scale = build_grass_mask(hsv_frame, grass_lower, grass_upper)
+                results = model.track(frame, persist=True, tracker="bytetrack.yaml", device=device, verbose=False)
 
-                if r.boxes.id is not None:
-                    for box in [b for b in r.boxes if int(b.cls[0]) == 0]:
+                raw_detections = []
+                referee_boxes = []
+                ball_pixels = []
+                ball_pixel = None
+
+                for r in results:
+                    for box in [b for b in r.boxes if int(b.cls[0]) in role_classes["ball"] and float(b.conf[0]) > BALL_CONF]:
+                        bx1, by1, bx2, by2 = map(int, box.xyxy[0])
+                        ball_pixel = (int((bx1 + bx2) / 2), int((by1 + by2) / 2))
+                        ball_pixels.append(ball_pixel)
+
+                    # Bírók: nem kerülnek a játékosok közé, csak semleges színnel rajzoljuk ki őket
+                    for box in [b for b in r.boxes if int(b.cls[0]) in role_classes["referee"]]:
                         x1, y1, x2, y2 = map(int, box.xyxy[0])
-                        tid = int(box.id[0].item()) if box.id is not None else None
-                        foot_x = max(0, min(int((x1 + x2) / 2), width - 1))
-                        foot_y = max(0, min(int(y2), height - 1))
-                        box_w, box_h = x2 - x1, y2 - y1
+                        on_grass, _ = foot_on_grass(grass_mask, grass_scale, x1, x2, y2, config["grass_min_ratio"])
+                        if on_grass:
+                            referee_boxes.append((x1, y1, x2, y2))
 
-                        # 1. Méretellenőrzés
-                        if box_h < min_h:
-                            debug_file.write(f"F#{frames_done} ID#{tid}: ELDOBVA -> Túl kicsi méret ({box_h}px < {min_h:.1f}px)\n")
-                            continue
+                    if r.boxes.id is not None:
+                        for box in [b for b in r.boxes
+                                    if int(b.cls[0]) in role_classes["player"] or int(b.cls[0]) in role_classes["goalkeeper"]]:
+                            # A focis modell külön kapus osztályt ad – ez a színegyezés mellett is kapusnak jelöl
+                            model_keeper = int(box.cls[0]) in role_classes["goalkeeper"]
+                            x1, y1, x2, y2 = map(int, box.xyxy[0])
+                            tid = int(box.id[0].item()) if box.id is not None else None
+                            foot_x = max(0, min(int((x1 + x2) / 2), width - 1))
+                            foot_y = max(0, min(int(y2), height - 1))
+                            box_w, box_h = x2 - x1, y2 - y1
 
-                        # 2. Dobozarány szűrés
-                        if box_w > box_h * 0.82:
-                            debug_file.write(f"F#{frames_done} ID#{tid}: ELDOBVA -> Nem álló alak (Arány={box_w/box_h:.2f})\n")
-                            continue
-
-                        # 3. Fix trapéz pályahatár (csak álló kamerához – a forgó Veo képnél kikapcsolva)
-                        if config["use_static_roi"]:
-                            in_pitch, reason = is_point_in_pitch_trapezoid(foot_x, foot_y, width, height, roi_top_pct, config["roi_bottom_pct"])
-                            if not in_pitch:
-                                debug_file.write(f"F#{frames_done} ID#{tid}: ELDOBVA -> {reason}\n")
+                            # 1. Méretellenőrzés
+                            if box_h < min_h:
+                                debug_file.write(f"F#{frames_done} ID#{tid}: ELDOBVA -> Túl kicsi méret ({box_h}px < {min_h:.1f}px)\n")
                                 continue
 
-                        # 4. Fűszűrő: a lábnak füvön kell állnia (lelátó, kispad, reklámtábla mögött nincs fű)
-                        on_grass, grass_ratio = foot_on_grass(grass_mask, grass_scale, x1, x2, y2, config["grass_min_ratio"])
-                        if not on_grass:
-                            debug_file.write(f"F#{frames_done} ID#{tid}: ELDOBVA -> Nem füvön áll (fű arány={grass_ratio:.2f})\n")
-                            continue
+                            # 2. Dobozarány szűrés
+                            if box_w > box_h * 0.82:
+                                debug_file.write(f"F#{frames_done} ID#{tid}: ELDOBVA -> Nem álló alak (Arány={box_w/box_h:.2f})\n")
+                                continue
 
-                        is_k1 = check_color_match(hsv_frame, x1, y1, x2, y2, colors["keeper1"][0], colors["keeper1"][1])
-                        is_k2 = check_color_match(hsv_frame, x1, y1, x2, y2, colors["keeper2"][0], colors["keeper2"][1])
-                        is_keeper = is_k1 or is_k2
+                            # 3. Fix trapéz pályahatár (csak álló kamerához – a forgó Veo képnél kikapcsolva)
+                            if config["use_static_roi"]:
+                                in_pitch, reason = is_point_in_pitch_trapezoid(foot_x, foot_y, width, height, roi_top_pct, config["roi_bottom_pct"])
+                                if not in_pitch:
+                                    debug_file.write(f"F#{frames_done} ID#{tid}: ELDOBVA -> {reason}\n")
+                                    continue
 
-                        # 5. Álló alak szűrő (néző, edző) – a kapus kivétel, ő sokáig állhat egy helyben
-                        stab_x, stab_y = camera_motion.stabilize(foot_x, foot_y)
-                        is_static = stationary_filter.update(tid, frames_done, stab_x, stab_y, box_h)
-                        if is_static and not is_keeper:
-                            debug_file.write(f"F#{frames_done} ID#{tid}: ELDOBVA -> Mozdulatlan alak ({config['stationary_window_sec']:.1f}s)\n")
-                            continue
+                            # 4. Fűszűrő: a lábnak füvön kell állnia (lelátó, kispad, reklámtábla mögött nincs fű)
+                            on_grass, grass_ratio = foot_on_grass(grass_mask, grass_scale, x1, x2, y2, config["grass_min_ratio"])
+                            if not on_grass:
+                                debug_file.write(f"F#{frames_done} ID#{tid}: ELDOBVA -> Nem füvön áll (fű arány={grass_ratio:.2f})\n")
+                                continue
 
-                        crop = frame[max(0, y1):min(height, y2), max(0, x1):min(width, x2)]
-                        dominant_color = extract_dominant_color(crop, grass_lower, grass_upper)
+                            is_k1 = check_color_match(hsv_frame, x1, y1, x2, y2, colors["keeper1"][0], colors["keeper1"][1])
+                            is_k2 = check_color_match(hsv_frame, x1, y1, x2, y2, colors["keeper2"][0], colors["keeper2"][1])
+                            is_keeper = is_k1 or is_k2 or model_keeper
 
-                        if is_k1 or check_color_match(hsv_frame, x1, y1, x2, y2, colors["team1"][0], colors["team1"][1]):
-                            team_id = 1
-                        elif is_k2 or check_color_match(hsv_frame, x1, y1, x2, y2, colors["team2"][0], colors["team2"][1]):
-                            team_id = 2
-                        else:
-                            team_id = 1 if dominant_color[0] > dominant_color[2] else 2
+                            # 5. Álló alak szűrő (néző, edző) – a kapus kivétel, ő sokáig állhat egy helyben
+                            stab_x, stab_y = camera_motion.stabilize(foot_x, foot_y)
+                            is_static = stationary_filter.update(tid, frames_done, stab_x, stab_y, box_h)
+                            if is_static and not is_keeper:
+                                debug_file.write(f"F#{frames_done} ID#{tid}: ELDOBVA -> Mozdulatlan alak ({config['stationary_window_sec']:.1f}s)\n")
+                                continue
 
-                        raw_detections.append({
-                            'track_id': tid,
-                            'team_id': team_id,
-                            'screen_foot': (foot_x, foot_y),
-                            'is_keeper': is_keeper,
-                            'bbox': (x1, y1, x2, y2)
-                        })
+                            crop = frame[max(0, y1):min(height, y2), max(0, x1):min(width, x2)]
+                            dominant_color = extract_dominant_color(crop, grass_lower, grass_upper)
 
-            if H is not None:
-                valid_players, real_ball = engine_instance.update_tracks(frames_done, current_time_sec, raw_detections, ball_pixel, H)
+                            if is_k1 or check_color_match(hsv_frame, x1, y1, x2, y2, colors["team1"][0], colors["team1"][1]):
+                                team_id = 1
+                            elif is_k2 or check_color_match(hsv_frame, x1, y1, x2, y2, colors["team2"][0], colors["team2"][1]):
+                                team_id = 2
+                            else:
+                                team_id = 1 if dominant_color[0] > dominant_color[2] else 2
+
+                            raw_detections.append({
+                                'track_id': tid,
+                                'team_id': team_id,
+                                'screen_foot': (foot_x, foot_y),
+                                'is_keeper': is_keeper,
+                                'bbox': (x1, y1, x2, y2)
+                            })
+
+                if H is not None:
+                    valid_players, real_ball = engine_instance.update_tracks(frames_done, current_time_sec, raw_detections, ball_pixel, H)
+                else:
+                    valid_players = raw_detections
+                    real_ball = None
+
+                last_valid_players, last_referee_boxes, last_ball_pixels = valid_players, referee_boxes, ball_pixels
             else:
-                valid_players = raw_detections
+                # Kihagyott képkocka (gyors mód): az előző felismerés újrarajzolása,
+                # statisztika és esemény nem keletkezik belőle (különben duplán számolnánk)
+                valid_players, referee_boxes, ball_pixels = last_valid_players, last_referee_boxes, last_ball_pixels
                 real_ball = None
+
+            for bp in ball_pixels:
+                cv2.circle(frame, bp, 5, (0, 255, 255), -1)
+
+            for x1, y1, x2, y2 in referee_boxes:
+                # Bíró: sárga keret fekete szegéllyel
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 0), 4)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
 
             for p in valid_players:
                 x1, y1, x2, y2 = p['bbox']
