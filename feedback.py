@@ -56,16 +56,30 @@ def _save(clips_dir, events_url, data):
     return data
 
 
-def set_verdict(clips_dir, events_url, ev, verdict):
-    """Egy automatikus esemény ítélete: "ok" (valódi), "hamis" (téves), vagy None / "" (törlés)."""
+def set_verdict(clips_dir, events_url, ev, verdict, corrected_type=None, corrected_team=None, note=None,
+                corrected_time=None):
+    """
+    Egy automatikus esemény ítélete: "ok" (valódi), "hamis" (téves), vagy None / "" (törlés).
+    Téves eseménynél megadható, mi volt valójában: corrected_type (pl. "cross"; "semmi" = nem történt
+    semmi), corrected_team, corrected_time (mp a videóban) – ezek valódi eseményként számítanak a mérésben.
+    """
     if verdict not in VERDICTS + (None, ""):
         raise ValueError(f"Ismeretlen ítélet: {verdict!r} (lehet: ok, hamis)")
     data = load(clips_dir, events_url)
     key = event_key(ev)
     data["items"] = [it for it in data["items"] if it.get("key") != key]
     if verdict:
-        data["items"].append({"key": key, "type": ev.get("type"), "time": round(float(ev.get("time", 0.0)), 2),
-                              "team": ev.get("team"), "verdict": verdict})
+        item = {"key": key, "type": ev.get("type"), "time": round(float(ev.get("time", 0.0)), 2),
+                "team": ev.get("team"), "verdict": verdict}
+        if corrected_type:
+            item["javitott_tipus"] = str(corrected_type)
+        if corrected_team:
+            item["javitott_csapat"] = str(corrected_team)
+        if corrected_time is not None:
+            item["javitott_ido"] = round(float(corrected_time), 2)
+        if note:
+            item["note"] = str(note)[:300]
+        data["items"].append(item)
     return _save(clips_dir, events_url, data)
 
 
@@ -101,6 +115,10 @@ def evaluate(feedback, events, tol_s=3.0):
     truth = [{"type": it["type"], "time": float(it["time"])} for it in feedback.get("items", [])
              if it.get("verdict") == "ok"]
     truth += [{"type": m["type"], "time": float(m["time"])} for m in feedback.get("missing", [])]
+    # téves eseménynél megadott valódi típus ("ez valójában beadás volt") – valódi eseményként számít
+    truth += [{"type": it["javitott_tipus"], "time": float(it.get("javitott_ido", it["time"]))}
+              for it in feedback.get("items", [])
+              if it.get("verdict") == "hamis" and it.get("javitott_tipus") not in (None, "", "semmi")]
     false = [{"type": it["type"], "time": float(it["time"])} for it in feedback.get("items", [])
              if it.get("verdict") == "hamis"]
     evs = [{"type": e.get("type"), "time": float(e.get("time", 0.0))} for e in (events or [])]

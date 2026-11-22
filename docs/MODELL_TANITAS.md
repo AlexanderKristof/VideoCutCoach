@@ -187,3 +187,23 @@ Motor-beállítás: a háttér felismeri (`yolox`); `"onnx_class_names": ["ball"
    a végrehajtót (CPU / CUDA / DirectML).
 6. Modellkártya: keretrendszer + előtanító súly (licenc), tanító meccsek listája, dátum, mért pontosság
    – a kereskedelmi kiadás ellenőrzőlistájához.
+
+## 7. Jelenetek címkézése laptopon (eseményfelismerés javítása)
+
+A képcímkézés (fenti pontok) a felismerő "szemét" tanítja; az eseményeket (passz, beadás, lövés, szöglet …)
+szabályok döntik el. Ezek javításához az edző jelöli, mi történt valójában – ehhez nem kell videókártya
+és Visual Studio sem, csak egy böngésző:
+
+```bat
+REM az elemző gépen: rövid részletek minden eseményhez + 20 véletlen, nem jelölt jelenet
+python tools\cimkezo_csomag.py keszit --esemenyek clips\match_events_ab12.json --ki cimkezo_meccs1 --veletlen 20
+```
+
+A `cimkezo_meccs1` mappát (pendrive / Google Drive) a laptopra másolva az `index.html` böngészőben megnyílik:
+minden jelenetnél a program tippje; ✓ Jó / ✗ Nem jó → mi volt valójában (típus, csapat, a pillanat, megjegyzés).
+A végén „Mentés fájlba” → `cimkek_<meccs>.json`, amit az elemző gépen beolvasunk:
+
+```bat
+python tools\cimkezo_csomag.py beolvas --cimkek cimkek_match_events_ab12.json
+python tools\eval_feedback.py clips\feedback_match_events_ab12.json clips\match_events_ab12.json
+```
