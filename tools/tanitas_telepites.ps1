@@ -7,7 +7,7 @@
 # Ha a "python" nem 3.10–3.12-es, add meg: -Python "C:\Python312\python.exe"
 param(
     [string]$Python = "python",
-    [string]$Cuda = "cu121"   # NVIDIA RTX 30xx/40xx: cu121 jó; CPU-ra: cpu (nagyon lassú tanítás)
+    [string]$Cuda = "cu126"   # NVIDIA RTX 20xx/30xx/40xx: cu126 (PyTorch >= 2.6 kell az rfdetr-hez); CPU-ra: cpu
 )
 $ErrorActionPreference = "Stop"
 $venv = "venv-tanitas"

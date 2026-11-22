@@ -185,9 +185,21 @@ MODEL_SIZES = {"nano": "RFDETRNano", "small": "RFDETRSmall", "medium": "RFDETRMe
 def train(data_dir, out_dir, epochs=40, size="medium", resolution=None, batch=4, accum=4, lr=1e-4,
           models_dir="models", pretrain=None, log=print):
     try:
-        import rfdetr
+        import torch
     except ImportError:
-        raise SystemExit("Az rfdetr nincs telepítve ebben a Python-környezetben. Lásd docs/MODELL_TANITAS.md 5/a.")
+        raise SystemExit("A PyTorch nincs telepítve ebben a Python-környezetben (tools/tanitas_telepites.ps1).")
+    tv = tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2])
+    if tv < (2, 6):
+        raise SystemExit(f"Túl régi PyTorch: {torch.__version__} (legalább 2.6 kell az rfdetr-hez). Frissítés:\n"
+                         "  venv-tanitas\\Scripts\\python -m pip install --upgrade torch torchvision "
+                         "--index-url https://download.pytorch.org/whl/cu126")
+    if not torch.cuda.is_available():
+        log("FIGYELEM: a PyTorch nem látja a videókártyát – a tanítás processzoron nagyon lassú lesz.")
+    try:
+        import rfdetr
+    except ImportError as ex:
+        raise SystemExit(f"Az rfdetr nem tölthető be ({ex}). Telepítés: tools/tanitas_telepites.ps1, "
+                         "lásd docs/MODELL_TANITAS.md 5.")
     cls_name = MODEL_SIZES[size]
     Model = getattr(rfdetr, cls_name, None)
     if Model is None:
