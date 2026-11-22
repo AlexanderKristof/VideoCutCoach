@@ -15,7 +15,10 @@ import time
 from contextlib import contextmanager
 
 STAGES = ("decode", "detect", "ball_pass", "pitch", "grass_quality", "filters", "team", "ball_tracker",
-          "engine", "draw_review", "encode", "other")
+          "engine", "draw_review", "encode", "other", "pitch_overlap")
+# Más szakasszal EGY IDŐBEN (külön szálon) futó szakaszok: a falióra-idő felosztásában nem számítanak
+# (különben a szakaszok összege meghaladná a teljes időt), csak tájékoztató sorként jelennek meg
+OVERLAPPED = {"pitch_overlap"}
 STAGE_LABELS = {
     "decode": "dekódolás",
     "detect": "felismerés + követés",
@@ -29,6 +32,7 @@ STAGE_LABELS = {
     "draw_review": "rajzolás + áttekintő",
     "encode": "kódolás / írás",
     "other": "egyéb",
+    "pitch_overlap": "(pályakövetés + fűmaszk a háttérszálon, átfedve)",
 }
 
 
@@ -60,7 +64,7 @@ class StageTimer:
 
     def summary(self):
         wall = self.wall()
-        measured = sum(self.totals.values())
+        measured = sum(v for k, v in self.totals.items() if k not in OVERLAPPED)
         totals = dict(self.totals)
         if wall > measured:
             totals["other"] = totals.get("other", 0.0) + (wall - measured)
@@ -84,7 +88,7 @@ class StageTimer:
 
     def one_line(self):
         s = self.summary()
-        top = sorted(s["stages"].values(), key=lambda v: -v["ms_per_frame"])[:5]
+        top = sorted((v for k, v in s["stages"].items() if k not in OVERLAPPED), key=lambda v: -v["ms_per_frame"])[:5]
         return (f"Időmérés: {s['fps']:.2f} kép/mp ({s['ms_per_frame']:.0f} ms/képkocka) – "
                 + ", ".join(f"{v['label']} {v['ms_per_frame']:.0f} ms ({v['share_pct']:.0f}%)" for v in top))
 
@@ -93,6 +97,7 @@ def format_timing(timing):
     """Egy events JSON "timing" blokkjából rövid szöveg (pl. az elemzes.py félidő-összegzéséhez)."""
     if not timing:
         return "nincs időmérés"
-    top = sorted((timing.get("stages") or {}).values(), key=lambda v: -v.get("ms_per_frame", 0))[:4]
+    top = sorted((v for k, v in (timing.get("stages") or {}).items() if k not in OVERLAPPED),
+                 key=lambda v: -v.get("ms_per_frame", 0))[:4]
     return (f"{timing.get('fps', 0):.2f} kép/mp, {timing.get('ms_per_frame', 0):.0f} ms/képkocka; "
             + ", ".join(f"{v['label']} {v['ms_per_frame']:.0f} ms ({v['share_pct']:.0f}%)" for v in top))

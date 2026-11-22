@@ -9,6 +9,9 @@ Forrás (erősorrendben):
        TACTICAL_DETECTOR_BACKEND – "ultralytics" (alap) | "onnx" | "ultralytics_predict"
        TACTICAL_ONNX_PATH       – az ONNX modellfájl útvonala (backend = "onnx")
        TACTICAL_BALL_CROP_PASS  – natív felbontású labda-kivágás: auto / 1 / 0
+       TACTICAL_PITCH_REFINE_MAX_EVERY – pályakövetés: a vonal-finomítás legritkább üteme (képkocka; 3 = régi)
+       TACTICAL_GRASS_MASK_EVERY – a fűmaszk újraszámolása ennyi képkockánként (1 = minden képkockán)
+       TACTICAL_PARALLEL_PITCH  – pályakövetés külön szálon, a felismeréssel párhuzamosan: auto / 1 / 0
   2. model_config.json (opcionális, a main.py mellett; a telepített alkalmazásban az adatmappában,
      lásd app_paths.py)
   3. alapértelmezés: yolov8x.pt (CUDA) / yolov8n.pt (CPU), COCO osztályok, minden képkocka
@@ -51,6 +54,17 @@ DEFAULTS = {
     "ball_crop_size": 640,
     "ball_tile_every": 2,
     "ball_crop_conf": 0.10,   # a kivágásos menet minimális pontszáma (a labdakövető szűr tovább)
+    # --- CPU-SZAKASZOK GYORSÍTÁSA (lásd main.py, pitch_tracker.py, docs/MODELL_BEALLITAS.md) ---
+    # Pályakövetés, adaptív vonal-finomítás: stabil követésnél (a vonalak rendre megerősítik a
+    # kamera-előrejelzést) legfeljebb ennyi képkockánként fut a drága vonalkeresés + illesztés;
+    # gyanús jelnél azonnal vissza a 3 képkockás ütemre. 3 = a régi, rögzített ütemezés.
+    "pitch_refine_max_every": 5,
+    # A (videónként tanult) fűmaszk újraszámolása ennyi képkockánként; közte az előző maszk a
+    # kameramozgással eltolva (a fű nem mozog, a kamera lassan pásztáz). 1 = minden képkockán (régi).
+    "grass_mask_every": 2,
+    # Pályakövetés (+ kameramozgás) külön szálon, a felismeréssel párhuzamosan: a GPU-s felismerés
+    # alatt a CPU a pályakövetést számolja. Az eredmény ugyanaz, csak az átfedés gyorsít. "auto" = CUDA-n be.
+    "parallel_pitch": "auto",
     # --- DETEKTOR-HÁTTÉR (lásd detection/, docs/MODELL_BEALLITAS.md 8. pont) ---
     # "ultralytics": model.track() + beépített ByteTrack (AGPL-3.0 – csak fejlesztéshez!)
     # "onnx": ONNX Runtime detektor + saját követő (detection/tracker.py) – a kereskedelmi út
@@ -141,8 +155,13 @@ def load_model_config(config_path=None, env=None):
     cfg["ball_extra_pass"] = v if isinstance(v, bool) else str(v).strip().lower() in ("1", "true", "igen", "yes", "on")
     if env.get("TACTICAL_BALL_CROP_PASS"):
         cfg["ball_crop_pass"] = env["TACTICAL_BALL_CROP_PASS"]
+    for key, var in (("pitch_refine_max_every", "TACTICAL_PITCH_REFINE_MAX_EVERY"),
+                     ("grass_mask_every", "TACTICAL_GRASS_MASK_EVERY"), ("parallel_pitch", "TACTICAL_PARALLEL_PITCH")):
+        if env.get(var):
+            cfg[key] = env[var]
     for key, conv, lo in (("imgsz", int, 32), ("ball_crop_size", int, 64), ("ball_tile_every", int, 1),
-                          ("ball_crop_conf", float, 0.0)):
+                          ("ball_crop_conf", float, 0.0), ("pitch_refine_max_every", int, 1),
+                          ("grass_mask_every", int, 1)):
         try:
             cfg[key] = max(lo, conv(cfg[key]))
         except (TypeError, ValueError):
