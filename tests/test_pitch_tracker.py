@@ -573,6 +573,133 @@ def test_real_veo_frames_if_available():
     assert ok >= len(paths) - 1, ok
 
 
+def test_adaptive_refine_schedule():
+    """SEBESSÉG: stabil, jól megerősített követésnél a vonal-finomítás köze nő (legfeljebb
+    refine_max_every), bármilyen gyanús jelnél azonnal visszaáll refine_every-re."""
+    w, h = 1280, 720
+    H = np.linalg.inv(pt.camera_ground_homography(5, 15, 1000, w, h, CAM))
+    tr = pt.PitchTracker((w, h), H0=H, refine_every=3, refine_max_every=6)
+    tr.conf = 0.9
+    tr.since_verified = tr.bad_streak = tr.lost = 0
+    tr.v = np.array([0.1, 0.01, 0.0, 0.05])
+    good = {"refined": True, "innovation": 0.5, "recall": 0.9}
+    seen = []
+    for _ in range(6):
+        tr._schedule_refine(dict(good))
+        seen.append(tr.refine_interval)
+    assert seen == [4, 5, 6, 6, 6, 6], seen
+    for bad in ({"refined": False, "innovation": 0.5}, {"refined": True, "innovation": 40.0},
+                {"refined": True, "innovation": 0.5, "recall": 0.1}):
+        tr.refine_interval = 6
+        tr._schedule_refine(bad)
+        assert tr.refine_interval == 3, (bad, tr.refine_interval)
+    tr.refine_interval = 6
+    tr.v = np.array([1.5, 0.0, 0.0, 0.0])        # gyors pásztázás
+    tr._schedule_refine(dict(good))
+    assert tr.refine_interval == 3
+    tr.v = np.array([0.8, 0.0, 0.0, 0.0])        # közepes: legfeljebb a két korlát közti köz
+    for _ in range(4):
+        tr._schedule_refine(dict(good))
+    assert tr.refine_interval == 4, tr.refine_interval
+    tr.v = np.zeros(4)
+    tr.refine_interval, tr.conf = 6, 0.5           # alacsony bizalom
+    tr._schedule_refine(dict(good))
+    assert tr.refine_interval == 3
+    # refine_max_every = refine_every: a régi, rögzített ütemezés
+    fixed = pt.PitchTracker((w, h), H0=H, refine_every=3, refine_max_every=3)
+    fixed.conf, fixed.v = 0.9, np.zeros(4)
+    for _ in range(4):
+        fixed._schedule_refine(dict(good))
+    assert fixed.refine_interval == 3
+
+
+def _run_refine_count(n, H_init, tex, refine_max_every, w=1280, h=720):
+    rng = np.random.default_rng(5)
+    players = Players()
+    tracker = pt.PitchTracker((w, h), H0=H_init, refine_every=3, refine_max_every=refine_max_every,
+                              auto_init=False)
+    errs, tried, lost = [], 0, 0
+    for pan, tilt, f in camera_path(n, w, h):
+        players.step()
+        frame, H_true, boxes = render_frame(tex, pan, tilt, f, players, w, h, rng)
+        H_est, q = tracker.update(frame, boxes)
+        tried += int(q.get("refine_tried", False))
+        if H_est is None:
+            lost += 1
+            H_est = tracker.current_H()
+        errs.append(reprojection_error_m(H_est, H_true)[0])
+    return np.array(errs), tried, lost
+
+
+def test_adaptive_refine_keeps_accuracy(n=180):
+    """Az adaptív ütemezés jóval kevesebb vonal-illesztéssel ugyanolyan pontos marad (a két
+    ellenőrzés közti képkockákon a kameramodell előrejelzése adja az állást)."""
+    tex = make_texture()
+    w, h = 1280, 720
+    pan, tilt, f = camera_path(n, w, h)[0]
+    _, H_true0, _ = render_frame(tex, pan, tilt, f, None, w, h)
+    H_init = perturb_H(H_true0, np.random.default_rng(7), px=4.0)
+    e_fix, n_fix, lost_fix = _run_refine_count(n, H_init, tex, 3)
+    e_ad, n_ad, lost_ad = _run_refine_count(n, H_init, tex, 8)
+    print(f"  rögzített (3): {n_fix} ellenőrzés, átlag hiba {e_fix.mean():.2f} m, max {e_fix.max():.2f} m")
+    print(f"  adaptív (3–8): {n_ad} ellenőrzés, átlag hiba {e_ad.mean():.2f} m, max {e_ad.max():.2f} m")
+    assert lost_ad == 0 and lost_fix == 0, (lost_fix, lost_ad)
+    assert n_ad <= 0.8 * n_fix, (n_ad, n_fix)
+    assert e_ad.mean() <= e_fix.mean() + 0.15, (e_ad.mean(), e_fix.mean())
+    assert e_ad.max() <= max(1.5, e_fix.max() + 0.5), (e_ad.max(), e_fix.max())
+
+
+def test_line_mask_roi_matches_full_frame():
+    """SEBESSÉG: a fűzóna befoglaló téglalapjára szűkített vonalkeresés pixelre azonos a teljes képessel."""
+    tex = make_texture()
+    w, h = 960, 540
+    rng = np.random.default_rng(2)
+    for pan, tilt, f in ((-20, 17, 900), (0, 12, 700), (25, 20, 1300)):
+        frame, _, boxes = render_frame(tex, pan, tilt, f * 960 / 1280, Players(), w, h, rng)
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        grass, _ = pt.build_grass_mask(hsv, *pt.DEFAULT_GRASS_HSV, scale=1.0)
+        grass[: h // 3] = 0                        # a fű csak a kép alsó részén: valódi kivágás
+        bm = pt._boxes_mask((h, w), boxes, 1.0)
+        fast = pt.detect_line_mask(frame, grass, bm)
+        kd = pt._odd(max(3, w / 300))
+        zone = cv2.dilate(grass, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kd, kd)))
+        full = pt._line_mask_core(frame, zone, bm, None, w, 22, 140, 8, True)
+        assert np.count_nonzero(full) > 200
+        assert np.array_equal(fast, full), int(np.count_nonzero(fast != full))
+
+
+def test_overlay_matches_per_line_drawing():
+    """SEBESSÉG: a vektorizált (egy vetítés + egy rajzolás) áttekintő réteg pixelre azonos a vonalankénti
+    rajzolással."""
+    w, h = 1280, 720
+    for pan in (-35, 0, 30):
+        G = pt.camera_ground_homography(pan, 15, 1000, w, h, CAM)
+        frame = np.full((h, w, 3), 80, np.uint8)
+        ref = frame.copy()
+        Hm = np.linalg.inv(G)
+        pt.draw_pitch_overlay(frame, Hm)
+        Go = pt.orient_G(np.linalg.inv(Hm), w, h)
+        mask = np.zeros((h, w), np.uint8)
+        for poly in pt.pitch_polylines(0.5):
+            uv, wz = pt.project_points(Go, poly)
+            ok = (wz > 1e-6) & (np.abs(uv[:, 0]) < 1e5) & (np.abs(uv[:, 1]) < 1e5)
+            run = []
+            for i in range(len(uv)):
+                if ok[i]:
+                    run.append(uv[i])
+                else:
+                    if len(run) >= 2:
+                        cv2.polylines(mask, [np.round(np.array(run)).astype(np.int32)], False, 255, 1, cv2.LINE_AA)
+                    run = []
+            if len(run) >= 2:
+                cv2.polylines(mask, [np.round(np.array(run)).astype(np.int32)], False, 255, 1, cv2.LINE_AA)
+        sel = mask > 0
+        a = (mask[sel].astype(np.float32) / 255.0 * 0.45)[:, None]
+        ref[sel] = (ref[sel].astype(np.float32) * (1 - a) + np.array((255, 255, 0), np.float32) * a).astype(np.uint8)
+        assert np.count_nonzero(sel) > 1000
+        assert np.array_equal(frame, ref), int(np.count_nonzero(frame != ref))
+
+
 if __name__ == "__main__":
     tests = [(name, fn) for name, fn in sorted(globals().items()) if name.startswith("test_") and callable(fn)]
     t_all = time.perf_counter()
