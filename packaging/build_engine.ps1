@@ -13,6 +13,9 @@
   powershell -ExecutionPolicy Bypass -File packaging\build_engine.ps1 -Torch cpu -FfmpegExe C:\tools\ffmpeg-lgpl\bin\ffmpeg.exe
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File packaging\build_engine.ps1 -Torch cu124 -Clean
+.EXAMPLE
+  # ÁRUSÍTHATÓ kiadás: torch / ultralytics nélkül, ONNX Runtime DirectML-lel (bármely Windows GPU)
+  powershell -ExecutionPolicy Bypass -File packaging\build_engine.ps1 -Release -FfmpegExe C:\tools\ffmpeg-lgpl\bin\ffmpeg.exe
 #>
 param(
     # cpu = bármely gépen fut (integrált GPU-s laptop); cu118 / cu121 / cu124 / cu126 = NVIDIA CUDA build (nagy: több GB)
@@ -25,12 +28,14 @@ param(
     # A venv és a korábbi build törlése
     [switch]$Clean,
     # Füstteszt kihagyása
-    [switch]$NoSmokeTest
+    [switch]$NoSmokeTest,
+    # Árusítható kiadási build: torch / ultralytics (AGPL) / scikit-learn nélkül, ONNX Runtime DirectML-lel
+    [switch]$Release
 )
 
 $ErrorActionPreference = "Stop"
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
-$Venv = Join-Path $PSScriptRoot ".venv-$Torch"
+$Venv = if ($Release) { Join-Path $PSScriptRoot ".venv-release" } else { Join-Path $PSScriptRoot ".venv-$Torch" }
 $Dist = Join-Path $PSScriptRoot "dist"
 $Work = Join-Path $PSScriptRoot "build"
 $OutDir = Join-Path $Dist "tacanaly_engine"
@@ -51,13 +56,26 @@ try {
     & $Py -m pip install --upgrade pip wheel
     if ($LASTEXITCODE -ne 0) { throw "pip frissítés sikertelen" }
 
-    Write-Host "==> PyTorch ($Torch)"
-    & $Py -m pip install torch torchvision --index-url "https://download.pytorch.org/whl/$Torch"
-    if ($LASTEXITCODE -ne 0) { throw "A torch telepítése sikertelen" }
+    if ($Release) {
+        Write-Host "==> Kiadási build: torch / ultralytics nélkül, ONNX Runtime DirectML"
+        $env:TACANALY_RELEASE = "1"
+        $req = Get-Content requirements.txt | Where-Object { $_ -notmatch '^\s*(ultralytics|scikit-learn|onnxruntime)\b' }
+        $reqFile = Join-Path $env:TEMP "tacanaly_release_requirements.txt"
+        $req | Set-Content -Encoding utf8 $reqFile
+        & $Py -m pip install -r $reqFile pyinstaller psutil onnxruntime-directml
+        if ($LASTEXITCODE -ne 0) { throw "A függőségek telepítése sikertelen" }
+        $leak = & $Py -c "import importlib.util as u; print(','.join(m for m in ('torch','ultralytics','sklearn') if u.find_spec(m)))"
+        if ($leak) { throw "A kiadási környezetben nem lehet jelen: $leak" }
+    } else {
+        Remove-Item Env:TACANALY_RELEASE -ErrorAction SilentlyContinue
+        Write-Host "==> PyTorch ($Torch)"
+        & $Py -m pip install torch torchvision --index-url "https://download.pytorch.org/whl/$Torch"
+        if ($LASTEXITCODE -ne 0) { throw "A torch telepítése sikertelen" }
 
-    Write-Host "==> Függőségek"
-    & $Py -m pip install -r requirements.txt pyinstaller psutil lap
-    if ($LASTEXITCODE -ne 0) { throw "A függőségek telepítése sikertelen" }
+        Write-Host "==> Függőségek"
+        & $Py -m pip install -r requirements.txt pyinstaller psutil lap
+        if ($LASTEXITCODE -ne 0) { throw "A függőségek telepítése sikertelen" }
+    }
     # A csomagba a GUI nélküli OpenCV kerüljön (kisebb, nincs benne Qt)
     & $Py -m pip uninstall -y opencv-python 2>$null
     & $Py -m pip install opencv-python-headless

@@ -16,12 +16,17 @@ mappába csomagolná ki (lassú indulás, telenő %TEMP%). A telepítő az egés
 Környezeti változók a buildhez:
     TACANALY_SPEC_NO_ML=1  – torch / ultralytics NÉLKÜLI próbabuild (a csomag szerkezetének és az
                              indító /health /shutdown működésének ellenőrzésére; elemezni nem tud)
+    TACANALY_RELEASE=1     – ÁRUSÍTHATÓ (kiadási) build: torch / ultralytics (AGPL) / scikit-learn NÉLKÜL,
+                             ONNX Runtime-mal (DirectML / CUDA / CPU); a model_config.json az ONNX hátteret
+                             állítja be (a model_config.onnx.example.json alapján, ha nincs saját).
+                             A focis ONNX modellt a telepítő teszi az adatmappa models/ mappájába.
 """
 import os
-from PyInstaller.utils.hooks import collect_submodules, collect_data_files
+from PyInstaller.utils.hooks import collect_submodules, collect_data_files, collect_dynamic_libs
 
 ROOT = os.path.abspath(os.path.join(SPECPATH, ".."))
-WITH_ML = os.environ.get("TACANALY_SPEC_NO_ML") != "1"
+RELEASE = os.environ.get("TACANALY_RELEASE") == "1"
+WITH_ML = os.environ.get("TACANALY_SPEC_NO_ML") != "1" and not RELEASE
 
 # A motor saját moduljai (a main.py statikusan importálja őket, de a függvényen belüli importok
 # miatt biztosra megyünk)
@@ -29,6 +34,8 @@ APP_MODULES = [
     "main", "app_paths", "engine_control", "model_manager", "model_config", "database", "models", "auth",
     "jobs", "pipeline", "boards", "tactical_engine", "events", "pitch_filters", "pitch_tracker",
     "ball_tracker", "team_classifier", "match_segmenter", "heatmap", "clip_export", "review_export",
+    "fast_cut", "background", "video_writer", "stage_timer", "ball_crops", "video_quality", "video_annotate",
+    "detection", "detection.backend", "detection.detector_base", "detection.onnx_detector", "detection.tracker",
 ]
 
 datas = [
@@ -38,6 +45,12 @@ datas = [
 # Opcionális: a telepítő által mellékelt beállítás (ha van model_config.json a repó gyökerében)
 if os.path.isfile(os.path.join(ROOT, "model_config.json")):
     datas.append((os.path.join(ROOT, "model_config.json"), "."))
+elif RELEASE:
+    # kiadási build: az ONNX háttér a gyári beállítás
+    import shutil, tempfile
+    _cfg_dir = tempfile.mkdtemp(prefix="tacanaly_cfg_")
+    shutil.copy(os.path.join(ROOT, "model_config.onnx.example.json"), os.path.join(_cfg_dir, "model_config.json"))
+    datas.append((os.path.join(_cfg_dir, "model_config.json"), "."))
 
 binaries = []
 # OpenCV H.264 kódoló Windows-on (a VideoWriter tölti be) – a repóban mellékelt DLL
@@ -66,7 +79,13 @@ if WITH_ML:
     hiddenimports += collect_submodules("ultralytics")
     hiddenimports += ["lap"]                             # ByteTrack hozzárendelés (különben pip-pel telepítené)
 else:
-    excludes += ["torch", "torchvision", "ultralytics", "lap"]
+    excludes += ["torch", "torchvision", "ultralytics", "lap", "detection.ultralytics_detector"]
+
+if RELEASE:
+    # Árusítható build: csak engedékeny licencű detektor-futtató (ONNX Runtime, MIT)
+    excludes += ["sklearn", "scikit-learn", "scipy"]
+    hiddenimports += collect_submodules("onnxruntime")
+    binaries += collect_dynamic_libs("onnxruntime")     # DirectML / CUDA / CPU végrehajtók DLL-jei
 
 a = Analysis(
     [os.path.join(ROOT, "engine_launcher.py")],

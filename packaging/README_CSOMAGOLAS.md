@@ -44,6 +44,23 @@ Megjegyzések:
 - Próbabuild torch / ultralytics nélkül (pl. Linuxon, a csomag szerkezetének ellenőrzésére):
   `TACANALY_SPEC_NO_ML=1 pyinstaller packaging/tacanaly_engine.spec`.
 
+### Árusítható kiadási build (`-Release`)
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\build_engine.ps1 -Release -FfmpegExe C:\tools\ffmpeg-lgpl\bin\ffmpeg.exe
+```
+
+- **Nincs benne** torch, ultralytics (AGPL-3.0) és scikit-learn – a build ellenőrzi, hogy a kiadási
+  környezetben ezek nincsenek telepítve, különben leáll.
+- A felismerés **ONNX Runtime + DirectML** (bármely Windowsos videókártya, integrált is; CPU-tartalékkal),
+  a saját követővel (`detection/`). A gyári `model_config.json` az ONNX hátteret állítja be
+  (`model_config.onnx.example.json` alapján) – ha a repó gyökerében van saját `model_config.json`, az kerül be.
+- A **focis ONNX modellt** (`models/focis_detektor.onnx`, a saját tanításból – `docs/MODELL_TANITAS.md`)
+  a telepítő tegye az adatmappa `models\` mappájába (vagy az `engine\models\` mappába).
+- **ffmpeg:** LGPL build kell. Ebben nincs libx264 – a program a videókártya kódolóját (NVENC / Quick Sync /
+  AMF) vagy a libopenh264-et használja (`fast_cut.py`, `video_writer.py`).
+- A kiadás előtti ellenőrzőlista: `docs/LICENC_ES_ARUSITAS.md`.
+
 ## 2. A motor indítása és leállítása a MAUI programból
 
 Parancssor: `tacanaly_engine.exe --port 0 --parent-pid <MAUI PID>`
