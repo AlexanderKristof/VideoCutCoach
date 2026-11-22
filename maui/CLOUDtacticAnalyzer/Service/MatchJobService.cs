@@ -109,7 +109,7 @@ public sealed class MatchEvent
     public string FeedbackKey => $"{Type}@{Time.ToString("0.00", CultureInfo.InvariantCulture)}";
     public string Icon => EventLabels.Icon(Type);
     public bool IsGoalkeeper => Type.StartsWith("gk_", StringComparison.Ordinal);
-    public string TeamLabel => Team switch { "team1" => "Hazai", "team2" => "Vendég", _ => "" };
+    public string TeamLabel => TeamNames.Of(Team);
     /// <summary>Az időpont az eredeti videóban (ezt látod a lejátszón is).</summary>
     public string VideoTimeLabel => FormatTime(Time);
     /// <summary>Hivatalos meccsidő: az 1. félidő 0:00-tól, a 2. félidő 45:00-tól indul (a beállított félidőhossztól).</summary>
@@ -134,6 +134,18 @@ public sealed class MatchEvent
         var t = TimeSpan.FromSeconds(sec);
         return t.TotalHours >= 1 ? $"{(int)t.TotalHours}:{t.Minutes:00}:{t.Seconds:00}" : $"{t.Minutes}:{t.Seconds:00}";
     }
+}
+
+/// <summary>
+/// A két csapat megjelenített neve. A motor a csapatokat mezszín szerint két csoportra osztja: a "team1" az a
+/// csapat, amelyik az 1. félidőben a bal oldali kaput védi (jobbra támad), a "team2" a másik – hogy melyik a
+/// hazai, azt nem tudja. Ezért alapból "1. csapat" / "2. csapat", és az edző nevezheti át (pl. "Mi", "Ellenfél").
+/// </summary>
+public static class TeamNames
+{
+    public static string Team1 { get; set; } = "1. csapat";
+    public static string Team2 { get; set; } = "2. csapat";
+    public static string Of(string? team) => team switch { "team1" => Team1, "team2" => Team2, _ => "" };
 }
 
 public static class EventLabels
@@ -233,7 +245,7 @@ public sealed class MatchResultView
                 foreach (var team in th.EnumerateObject())
                 {
                     if (team.Value.ValueKind != JsonValueKind.String) continue;
-                    var teamLabel = team.Name == "team1" ? "Hazai" : team.Name == "team2" ? "Vendég" : team.Name;
+                    var teamLabel = TeamNames.Of(team.Name) is { Length: > 0 } tn ? tn : team.Name;
                     heat.Add(($"{title} – {teamLabel}", team.Value.GetString()!));
                 }
             }
@@ -395,6 +407,9 @@ public sealed class MatchJobService
         return root.GetProperty("job").Deserialize<JobInfo>(JsonOptions)!;
     }
 
+    /// <summary>A legutóbb betöltött meccs-JSON mezszínei (RGB): "team1", "team2", "other".</summary>
+    public Dictionary<string, (double R, double G, double B)> LastTeamColors { get; private set; } = new();
+
     /// <summary>A meccs-JSON eseményei (URL: "/clips/match_events_….json").</summary>
     public async Task<List<MatchEvent>> LoadEventsAsync(string eventsUrl, CancellationToken ct = default)
     {
@@ -402,6 +417,16 @@ public sealed class MatchJobService
         if (!resp.IsSuccessStatusCode) throw new EngineApiException($"Az eseményfájl nem tölthető le ({(int)resp.StatusCode}).");
         await using var stream = await resp.Content.ReadAsStreamAsync(ct);
         using var doc = await JsonDocument.ParseAsync(stream, cancellationToken: ct);
+        LastTeamColors = new();
+        if (doc.RootElement.TryGetProperty("team_colors", out var tc) && tc.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var p in tc.EnumerateObject())
+            {
+                if (p.Value.ValueKind != JsonValueKind.Array || p.Value.GetArrayLength() < 3) continue;
+                var c = p.Value.EnumerateArray().Select(x => x.TryGetDouble(out var d) ? d : 0).ToArray();
+                LastTeamColors[p.Name] = (c[0], c[1], c[2]);
+            }
+        }
         if (!doc.RootElement.TryGetProperty("events", out var evs) || evs.ValueKind != JsonValueKind.Array) return new();
         var list = evs.Deserialize<List<MatchEvent>>(JsonOptions) ?? new();
         list.Sort((a, b) => a.Time.CompareTo(b.Time));
@@ -420,7 +445,10 @@ public sealed class MatchJobService
         if (!loaded)
             return $"🧠 Beállított modell: {S("model_configured") ?? "?"} (az első elemzéskor töltődik be) • eszköz: {device}";
         var weights = S("model_weights") ?? "?";
-        var warn = weights.Contains("CPUExecutionProvider") && device == "CUDA"
+        // ONNX: "végrehajtó: CUDAExecutionProvider, CPUExecutionProvider" – az első a ténylegesen használt
+        // (a CPU csak tartalék); figyelmeztetés csak akkor, ha a CUDA nincs a listában, pedig van videókártya.
+        var warn = weights.StartsWith("ONNX") && device == "CUDA" && !weights.Contains("CUDAExecutionProvider")
+                   && !weights.Contains("DmlExecutionProvider")
             ? "  ⚠ a modell processzoron fut (az onnxruntime-gpu nem működik)" : "";
         return $"🧠 Modell: {weights} • eszköz: {device}{warn}";
     }

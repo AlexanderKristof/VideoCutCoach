@@ -1040,10 +1040,13 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
             if gk_real_coords and real_ball:
                 gk_eval = engine_instance.analyze_goalkeeper(gk_real_coords, real_ball)
                 # csak tartós, nagy eltérés, ha a labda a kapu közelében van (events.PositioningMonitor)
-                pos_ev = gk_pos_monitor.update(current_time_sec, gk_eval,
-                                               engine_instance.keeper_team_near(gk_real_coords))
-                if pos_ev is not None:
-                    timeline_events.append(pos_ev)
+                # A "helyezkedési hiba" véleményes ítélet (az edző dönti el), ezért alapból nem adjuk ki
+                # eseményként; a "gk_positioning_errors": true analysis-beállítással visszakapcsolható.
+                if config.get("gk_positioning_errors", False):
+                    pos_ev = gk_pos_monitor.update(current_time_sec, gk_eval,
+                                                   engine_instance.keeper_team_near(gk_real_coords))
+                    if pos_ev is not None:
+                        timeline_events.append(pos_ev)
 
             if review is not None:
                 review.add_frame(frames_done, current_time_sec, frame,

@@ -49,6 +49,9 @@ public sealed class EventItem : INotifyPropertyChanged
     public Color RowColor => IsManual ? Color.FromArgb("#1B2A20") : Verdict == "hamis" ? Color.FromArgb("#2A1B1B")
         : Verdict == "ok" ? Color.FromArgb("#1B2A1E") : Color.FromArgb("#1E1E1E");
 
+    /// <summary>Minden kötött mező frissítése (pl. a csapatnevek átnevezése után).</summary>
+    public void Refresh() => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(null));
+
     public event PropertyChangedEventHandler? PropertyChanged;
     private void OnChanged([CallerMemberName] string? name = null) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
 }
@@ -104,7 +107,7 @@ public class MatchAnalysisPage : ContentPage
     private readonly Entry _halfMin = new() { Text = "45", Keyboard = Keyboard.Numeric, WidthRequest = 60, TextColor = Colors.White, BackgroundColor = Panel };
     private readonly Entry _firstStart = TimeEntry("1. kezdete"), _firstEnd = TimeEntry("1. vége"), _secondStart = TimeEntry("2. kezdete"), _secondEnd = TimeEntry("2. vége");
     private readonly CheckBox _background = new() { IsChecked = true }, _heatmaps = new() { IsChecked = true },
-        _gkComp = new() { IsChecked = true }, _highlights = new() { IsChecked = true }, _team1Right = new() { IsChecked = true },
+        _gkComp = new() { IsChecked = true }, _highlights = new() { IsChecked = true },
         _makeFullMatch = new() { IsChecked = true };
     private readonly Button _startButton = new() { Text = "▶ Elemzés indítása", BackgroundColor = Color.FromArgb("#E91E63"), FontAttributes = FontAttributes.Bold };
     private readonly CollectionView _jobList = new() { SelectionMode = SelectionMode.Single, HeightRequest = 260 };
@@ -112,6 +115,10 @@ public class MatchAnalysisPage : ContentPage
     // --- jobb oldal: kiválasztott elemzés
     private readonly Label _jobTitle = new() { Text = "Válassz ki egy elemzést, vagy indíts újat.", FontSize = 18, FontAttributes = FontAttributes.Bold, TextColor = Colors.White };
     private readonly Label _jobPhase = new() { TextColor = Muted };
+    private readonly BoxView _swatch1 = new() { WidthRequest = 22, HeightRequest = 22, CornerRadius = 4, Color = Colors.Gray, VerticalOptions = LayoutOptions.Center };
+    private readonly BoxView _swatch2 = new() { WidthRequest = 22, HeightRequest = 22, CornerRadius = 4, Color = Colors.Gray, VerticalOptions = LayoutOptions.Center };
+    private readonly Entry _name1 = new() { WidthRequest = 170, TextColor = Colors.White, BackgroundColor = Panel, Placeholder = "1. csapat neve" };
+    private readonly Entry _name2 = new() { WidthRequest = 170, TextColor = Colors.White, BackgroundColor = Panel, Placeholder = "2. csapat neve" };
     private readonly Label _engineInfo = new() { TextColor = Color.FromArgb("#90CAF9"), FontSize = 12 };
     private readonly ProgressBar _jobProgress = new() { ProgressColor = Color.FromArgb("#E91E63"), IsVisible = false };
     private readonly Button _pauseButton = SmallButton("⏸ Szünet"), _cancelButton = SmallButton("✖ Megszakítás");
@@ -152,7 +159,7 @@ public class MatchAnalysisPage : ContentPage
 
         _typeFilter.ItemsSource = TypeFilters.Select(f => f.Label).ToList();
         _typeFilter.SelectedIndex = 0;
-        _teamFilter.ItemsSource = new List<string> { "Mindkét csapat", "Hazai", "Vendég" };
+        _teamFilter.ItemsSource = new List<string> { "Mindkét csapat", TeamNames.Team1, TeamNames.Team2 };
         _teamFilter.SelectedIndex = 0;
         _halfFilter.ItemsSource = new List<string> { "Teljes meccs", "1. félidő", "2. félidő" };
         _halfFilter.SelectedIndex = 0;
@@ -224,7 +231,6 @@ public class MatchAnalysisPage : ContentPage
                 new Label { Text = "Félidők (nem kötelező – üresen automatikus felismerés; pp:mm vagy ó:pp:mm):", TextColor = Muted, FontSize = 12 },
                 Row(_firstStart, _firstEnd),
                 Row(_secondStart, _secondEnd),
-                Check(_team1Right, "A hazai csapat az 1. félidőben jobbra támad"),
                 Check(_background, "Háttér-mód (a gép közben használható marad)"),
                 Check(_makeFullMatch, "Szünet nélküli meccsvideó készítése"),
                 Check(_heatmaps, "Hőtérképek"),
@@ -252,6 +258,19 @@ public class MatchAnalysisPage : ContentPage
         };
 
         _resultBox.Children.Add(_summary);
+        _name1.Completed += (_, _) => ApplyTeamNames();
+        _name1.Unfocused += (_, _) => ApplyTeamNames();
+        _name2.Completed += (_, _) => ApplyTeamNames();
+        _name2.Unfocused += (_, _) => ApplyTeamNames();
+        _resultBox.Children.Add(Row(
+            new Label { Text = "Csapatok (mezszín szerint):", TextColor = Colors.White, VerticalOptions = LayoutOptions.Center },
+            _swatch1, _name1, _swatch2, _name2));
+        _resultBox.Children.Add(new Label
+        {
+            Text = "A program a két csapatot mezszín alapján választja szét; az 1. csapat az, amelyik az 1. félidőben a bal oldali " +
+                   "kaput védi. Nevezd el őket (pl. Mi / Ellenfél) – az eseménylista és a hőtérképek ezt a nevet mutatják.",
+            TextColor = Muted, FontSize = 12,
+        });
         _resultBox.Children.Add(_warnings);
         _resultBox.Children.Add(Row(board, drawOnVideo, review));
         _resultBox.Children.Add(_player);
@@ -393,9 +412,9 @@ public class MatchAnalysisPage : ContentPage
             types.Select(x => x.Label).ToArray());
         var picked = types.FirstOrDefault(x => x.Label == choice);
         if (string.IsNullOrEmpty(picked.Type)) return;
-        var teamChoice = await DisplayActionSheetAsync("Melyik csapat?", "Mégse", null, "Hazai", "Vendég", "Nem tudom");
+        var teamChoice = await DisplayActionSheetAsync("Melyik csapat?", "Mégse", null, TeamNames.Team1, TeamNames.Team2, "Nem tudom");
         if (teamChoice is null || teamChoice == "Mégse") return;
-        var team = teamChoice == "Hazai" ? "team1" : teamChoice == "Vendég" ? "team2" : null;
+        var team = teamChoice == TeamNames.Team1 ? "team1" : teamChoice == TeamNames.Team2 ? "team2" : null;
         try
         {
             var item = await _api.AddMissingAsync(_loadedEventsUrl, picked.Type, t, team);
@@ -510,7 +529,7 @@ public class MatchAnalysisPage : ContentPage
             Heatmaps = _heatmaps.IsChecked,
             GoalkeeperCompilations = _gkComp.IsChecked,
             Highlights = _highlights.IsChecked,
-            Team1AttacksRight = _team1Right.IsChecked,
+            Team1AttacksRight = true,   // automatikus csapatok: a "team1" mindig az 1. félidőben balról jobbra támadó
             SkipCut = !_makeFullMatch.IsChecked,
         };
         _startButton.IsEnabled = false;
@@ -655,12 +674,47 @@ public class MatchAnalysisPage : ContentPage
                 _allEvents.Sort((a, b) => a.Event.Time.CompareTo(b.Event.Time));
             }
             catch { /* régebbi motor: nincs /feedback – a lista ítéletek nélkül is használható */ }
+            LoadTeamNames();
             ApplyFilter();
         }
         catch (Exception ex)
         {
             _eventCount.Text = $"Az események nem tölthetők be: {ex.Message}";
         }
+    }
+
+    private string TeamNameKey(int n) => $"csapatnev_{_result?.RunId ?? _currentJob?.Id}_{n}";
+
+    /// <summary>A mezszínek és a mentett csapatnevek betöltése az eseménylista betöltése után.</summary>
+    private void LoadTeamNames()
+    {
+        static Color ToColor((double R, double G, double B) c) =>
+            Color.FromRgb((int)Math.Clamp(c.R, 0, 255), (int)Math.Clamp(c.G, 0, 255), (int)Math.Clamp(c.B, 0, 255));
+        var tc = _api.LastTeamColors;
+        _swatch1.Color = tc.TryGetValue("team1", out var c1) ? ToColor(c1) : Colors.Gray;
+        _swatch2.Color = tc.TryGetValue("team2", out var c2) ? ToColor(c2) : Colors.Gray;
+        _name1.Text = Settings.Get(TeamNameKey(1)) ?? "";
+        _name2.Text = Settings.Get(TeamNameKey(2)) ?? "";
+        ApplyTeamNames(save: false);
+    }
+
+    private void ApplyTeamNames(bool save = true)
+    {
+        var n1 = string.IsNullOrWhiteSpace(_name1.Text) ? "1. csapat" : _name1.Text.Trim();
+        var n2 = string.IsNullOrWhiteSpace(_name2.Text) ? "2. csapat" : _name2.Text.Trim();
+        if (save)
+        {
+            Settings.Set(TeamNameKey(1), _name1.Text?.Trim());
+            Settings.Set(TeamNameKey(2), _name2.Text?.Trim());
+        }
+        if (n1 == TeamNames.Team1 && n2 == TeamNames.Team2 && save) return;
+        TeamNames.Team1 = n1;
+        TeamNames.Team2 = n2;
+        var sel = Math.Max(0, _teamFilter.SelectedIndex);
+        _teamFilter.ItemsSource = new List<string> { "Mindkét csapat", n1, n2 };
+        _teamFilter.SelectedIndex = sel;
+        foreach (var e in _allEvents) e.Refresh();
+        if (_result is not null) ShowHeatmaps(_result);
     }
 
     private void ApplyFilter()
