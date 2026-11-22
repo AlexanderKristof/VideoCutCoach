@@ -1761,6 +1761,8 @@ class PitchTracker:
         self.err_ok_m = 2.5          # a becsült (kovariancia alapú) helyzethiba felső határa 'ok'-hoz
         self.stale_frames = 75       # ennyi képkocka vonal-megerősítés nélkül: 'bizonytalan'
         self.pose_floor = (0.25, 0.25, 0.25, 1.5)   # (fok, fok, fok, 100·ln f) – lásd _check_pose
+        self.strong_line_px = 250.0  # ennyi (×px) hosszú-vonal pixel felett a lefedettséget is ellenőrizzük
+        self.min_recall = 0.4        # ennél kisebb lefedettség: egy erős valódi vonalat nem magyaráz a modell
         self.keyframe_gap = 25       # legalább ennyi képkocka két kulcskép között (kamerahely-becslés)
         self.max_keyframes = 10
         self.reloc_every = 8         # újrapozicionálási kísérletek gyakorisága (sikertelenség után ritkul)
@@ -2218,10 +2220,20 @@ class PitchTracker:
         m = prec if accepted else info["precision_before"]
         weight = min(1.0, n_vis / 300.0) * (0.5 + 0.5 * min(1.0, info.get("visible_len", 0.0) / (150.0 * self.px)))
         quality = 0.5 * m + 0.5 * sup if accepted else 0.5 * m
+        # Lefedettség: a képen látszó HOSSZÚ vonalak mekkora részét magyarázza a modell. Ha egy erős,
+        # hosszú valódi vonal (pl. a felezővonal) mellett fut a vetített modell, a pontosság még lehet
+        # jó (a modell többi vonala illeszkedik), de a bizalom nem maradhat magas – ilyenkor a rossz
+        # illesztés-sorozat újrapozicionálást indít (a keresés a lefedettséget is pontozza).
+        strong = field.n_long >= self.strong_line_px * self.px
+        rec = line_recall(field, self._G_line_of()(self.x)) if strong else None
+        q["recall"] = None if rec is None else round(rec, 3)
+        unexplained = rec is not None and rec < self.min_recall
+        if unexplained:
+            quality *= max(0.3, rec / self.min_recall)
         # erős megerősítés (pl. takarás / elvesztés után) gyorsabban emeli a bizalmat
         a = (0.6 if quality >= 0.8 and quality > self.conf else 0.35) * weight
         self.conf = (1 - a) * self.conf + a * quality
-        good = accepted and prec >= 0.5 and sup >= 0.5 and n_vis >= 80
+        good = accepted and prec >= 0.5 and sup >= 0.5 and n_vis >= 80 and not unexplained
         if good:
             self.since_verified = 0
             self.lost = 0
