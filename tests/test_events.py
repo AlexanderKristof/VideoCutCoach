@@ -259,13 +259,46 @@ def test_long_vs_short_distribution():
 
 
 def test_sweeper():
+    """Kifutás: a kapus a felé tartó (mélységi) labda elé fut."""
     s = Sim()
-    x = 8.0
+    x, bx = 8.0, 45.0
     while x < 26.0:
-        s.step((40.0, 30.0), [P(1, 1, x, 34.0, keeper=True)])
+        s.step((bx, 32.0), [P(1, 1, x, 34.0, keeper=True), P(9, 2, bx + 3.0, 32.0)])
         x += 6.0 * DT
+        bx -= 8.0 * DT
     sw = s.of_type("gk_sweeper")
     check(len(sw) == 1 and sw[0]["team"] == "team1", sw)
+
+
+def test_no_sweeper_when_keeper_runs_away_from_ball_or_to_dead_ball():
+    """Nem kifutás: a kapus az álló labdához megy (szabadrúgás), vagy a labda a túlsó térfélen van."""
+    s = Sim()
+    x = 8.0
+    while x < 26.0:                       # álló labda 30 m-re (rögzített helyzet)
+        s.step((40.0, 30.0), [P(1, 1, x, 34.0, keeper=True)])
+        x += 6.0 * DT
+    check(not s.of_type("gk_sweeper"), s.of_type("gk_sweeper"))
+    s2 = Sim()
+    x, bx = 8.0, 80.0
+    while x < 26.0:                       # a labda messze, a másik térfélen mozog
+        s2.step((bx, 20.0), [P(1, 1, x, 34.0, keeper=True)])
+        x += 6.0 * DT
+        bx += 3.0 * DT
+    check(not s2.of_type("gk_sweeper"), s2.of_type("gk_sweeper"))
+
+
+def test_keeper_free_kick_is_pass():
+    """Les utáni szabadrúgás: a kapus az álló labdához megy (az ötösön kívül), és rövid passzt ad."""
+    s = Sim()
+    gk = P(1, 1, 18.0, 30.0, keeper=True)
+    mate = P(4, 1, 30.0, 20.0)
+    s.hold(2.0, (19.0, 30.0), [gk, mate])
+    s.move((19.0, 30.0), (30.0, 20.5), 12.0, lambda b: [gk, mate])
+    s.hold(1.5, (30.0, 20.5), [gk, mate])
+    s.finalize()
+    passes = s.of_type("gk_short_pass")
+    check(len(passes) == 1 and passes[0]["team"] == "team1", s.det.events)
+    check(not s.of_type("gk_sweeper") and not s.of_type("gk_goal_kick"), s.det.events)
 
 
 # ------------------------------------------------ zajtűrés / regressziók

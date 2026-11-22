@@ -199,7 +199,12 @@ class EventConfig:
         self.sweeper_speed_mps = 4.0
         self.sweeper_min_line_dist_m = 12.0
         self.sweeper_debounce_s = 6.0
+        self.sweeper_max_ball_dist_m = 30.0  # a kifutás a labda felé történik: a labda ennyin belül legyen
+        self.sweeper_toward_ball_cos = 0.5   # a kapus mozgásiránya és a labda iránya közti szög koszinusza
         self.keeper_max_speed_mps = 10.0   # efölött track-ID csere / zaj
+        # --- Kapus szabadrúgás (pl. les után): a kapus az álló labdához megy és elrúgja ---
+        self.gk_free_kick_keeper_radius_m = 3.0
+        self.gk_free_kick_max_line_dist_m = 35.0
 
         # --- Klip javaslat ---
         self.clip_pre_s = 4.0
@@ -1211,6 +1216,10 @@ class EventDetector:
             return
         goal_x = self._goal_area_of(rp, cfg.goal_kick_area_tol_m)
         if goal_x is None:
+            fk = self._keeper_free_kick(rp)
+            if fk is not None:
+                self._gk_armed = {"goal_x": fk, "x": rp[0], "y": rp[1], "t_still": self._rest["t_last"],
+                                  "kind": "free_kick"}
             return
         out_t = self._out.get(goal_x)
         cand = self._goal_cand
@@ -1220,6 +1229,20 @@ class EventDetector:
             if not self._goal_kick_fallback(t, goal_x):
                 return
         self._gk_armed = {"goal_x": goal_x, "x": rp[0], "y": rp[1], "t_still": self._rest["t_last"]}
+
+    def _keeper_free_kick(self, rp):
+        """
+        Kapus szabadrúgás (pl. les után): az álló labda a saját térfelén, a kapujához közel van, és
+        a saját kapusa áll mellette. Visszatér: a kapu x-e, vagy None.
+        """
+        cfg = self.cfg
+        for k in self._keepers.values():
+            gx = self._keeper_goal(k)
+            if self._line_dist(rp, gx) > cfg.gk_free_kick_max_line_dist_m:
+                continue
+            if math.hypot(k["pos"][0] - rp[0], k["pos"][1] - rp[1]) <= cfg.gk_free_kick_keeper_radius_m:
+                return gx
+        return None
 
     def _goal_kick_fallback(self, t, goal_x):
         """Ha az alapvonalon túlra kerülést nem láttuk (pl. a magasan mellé szálló labda vetülete a
@@ -1249,7 +1272,9 @@ class EventDetector:
         self._out.pop(goal_x, None)
         self._gk_poss = None
         self._dist = {
-            "kind": "goal_kick", "tid": tid, "team": team, "goal_x": goal_x,
+            # a kapus szabadrúgása kihozatalként (rövid passz / ívelés) számít, nem kirúgásként
+            "kind": "free_kick" if armed.get("kind") == "free_kick" else "goal_kick",
+            "tid": tid, "team": team, "goal_x": goal_x,
             "t0": armed["t_still"], "p0": (armed["x"], armed["y"]), "max_d": 0.0,
             "last_t": armed["t_still"], "still_t": None,
         }
@@ -1431,6 +1456,35 @@ class EventDetector:
         })
 
     # ------------------------------------------------------------ kifutás
+    def _sweeper_context_ok(self, t, k, vx, vy, sp):
+        """
+        Valódi kifutás: a kapus a (mozgó, nem a nála lévő) labda felé fut. Nem kifutás (valós próbán
+        tévesen az lett): a labdát kézben vivő kapus kifut a 16-os széléig, hogy kirúgja; a kapus
+        az álló labdához megy (szabadrúgás, kirúgás); követési zaj, amikor a labda messze van.
+        """
+        cfg = self.cfg
+        gp = self._gk_poss
+        if gp is not None and gp["team"] == k["team"] and t - gp["t_last"] <= 2.0:
+            return False                         # nála van a labda (kézben / lábnál)
+        d = self._dist
+        if d is not None and d["team"] == k["team"]:
+            return False                         # éppen kihozza / elrúgja a labdát
+        st = self._bst
+        if st is None or t - st["t"] > 0.5:
+            return False                         # labda nélkül nem dönthető el
+        r = self._rest
+        if r is not None and r["t_last"] >= t - 0.2 and r["t_last"] - r["t0"] >= 0.8:
+            return False                         # álló labda: rögzített helyzet, nem kifutás
+        bx, by = st["pos"]
+        kx, ky = k["pos"]
+        dbx, dby = bx - kx, by - ky
+        dist = math.hypot(dbx, dby)
+        if dist > cfg.sweeper_max_ball_dist_m:
+            return False
+        if dist > 1.0 and (vx * dbx + vy * dby) / (dist * sp) < cfg.sweeper_toward_ball_cos:
+            return False                         # nem a labda felé fut
+        return True
+
     def _check_sweeper(self, t):
         cfg = self.cfg
         for k in self._keepers.values():
@@ -1454,6 +1508,8 @@ class EventDetector:
             rn = math.hypot(rx, ry)
             if rn <= 1e-6 or (vx * rx + vy * ry) / rn < 0.3 * sp:
                 continue  # nem a kaputól távolodik (pl. visszafut)
+            if not self._sweeper_context_ok(t, k, vx, vy, sp):
+                continue
             if t - k["last_sweep"] < cfg.sweeper_debounce_s:
                 continue
             k["last_sweep"] = t
