@@ -26,8 +26,8 @@
 
         <Tab Title="Kapus Modul">
             <ShellContent
-                ContentTemplate="{DataTemplate local:GoalkeeperPage}"
-                Route="GoalkeeperPage" />
+                ContentTemplate="{DataTemplate local:KeeperFocusPage}"
+                Route="KeeperFocusPage" />
         </Tab>
     </TabBar>
 

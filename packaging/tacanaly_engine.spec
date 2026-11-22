@@ -35,6 +35,7 @@ APP_MODULES = [
     "jobs", "pipeline", "boards", "tactical_engine", "events", "pitch_filters", "pitch_tracker",
     "ball_tracker", "team_classifier", "match_segmenter", "heatmap", "clip_export", "review_export",
     "fast_cut", "background", "video_writer", "stage_timer", "ball_crops", "video_quality", "video_annotate",
+    "feedback", "keeper_focus",
     "detection", "detection.backend", "detection.detector_base", "detection.onnx_detector", "detection.tracker",
 ]
 

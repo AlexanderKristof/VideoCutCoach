@@ -3,6 +3,7 @@ import cv2
 import os
 import uuid
 import json
+import re
 import asyncio
 import subprocess
 import time
@@ -1745,6 +1746,28 @@ async def post_feedback(request: Request):
         if body.get("remove_missing"):
             return {"status": "success", "feedback": _feedback.remove_missing(CLIPS_DIR, events, body["remove_missing"])}
         raise ValueError("Hiányzik: event + verdict, missing vagy remove_missing.")
+    except (ValueError, TypeError) as ex:
+        return JSONResponse({"status": "error", "message": str(ex)}, status_code=400)
+
+
+# KAPUS MODUL: a választott csapat kapusát érintő jelenetek egy meccs-eredményből (keeper_focus.py)
+#   GET /keeper-focus?events=/clips/match_events_x.json&team=team1&moves=1&min_move=2
+import keeper_focus as _keeper_focus
+
+
+@app.get("/keeper-focus")
+async def get_keeper_focus(events: str, team: str = "team1", moves: int = 1, min_move: float = 2.0):
+    try:
+        name = os.path.basename(str(events or "")).strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+\.json", name):
+            raise ValueError("Érvénytelen eseményfájl-név.")
+        path = os.path.join(CLIPS_DIR, name)
+        if not os.path.isfile(path):
+            return JSONResponse({"status": "error", "message": "Nincs ilyen eredményfájl."}, status_code=404)
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        res = _keeper_focus.build(data, team, min_move_m=max(0.5, float(min_move)), include_moves=bool(moves))
+        return {"status": "success", **res}
     except (ValueError, TypeError) as ex:
         return JSONResponse({"status": "error", "message": str(ex)}, status_code=400)
 

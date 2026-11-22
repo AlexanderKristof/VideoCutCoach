@@ -107,6 +107,8 @@ public sealed class MatchEvent
     [JsonPropertyName("experimental")] public bool? ExperimentalRaw { get; set; }
     /// <summary>Passznál / szabadrúgásnál: "sajat_terfel" vagy "ellenfel_terfel".</summary>
     [JsonPropertyName("zone")] public string? Zone { get; set; }
+    /// <summary>Kapus Modul csoport (keeper_focus.py): kapus / lovesek / beadasok / rogzitett / zona / mozgas.</summary>
+    [JsonPropertyName("group")] public string? Group { get; set; }
 
     /// <summary>A kalap (events.py EVENT_CATEGORIES); régi eredményfájlnál a típusból számolva.</summary>
     public string Category => !string.IsNullOrEmpty(CategoryRaw) ? CategoryRaw! : EventCategories.Of(Type);
@@ -180,14 +182,22 @@ public static class EventLabels
         ["gk_conceded"] = ("Kapott gól", "❌"),
         ["gk_sweeper"] = ("Kapus kifutás (söprögetés)", "🏃"),
         ["gk_positioning_error"] = ("Kapus helyezkedési hiba", "⚠"),
+        ["gk_move"] = ("Kapus mozgás", "↔"),
+        ["attack_in_zone"] = ("Támadás a saját zónában", "🛡"),
     };
 
     public static string Label(string type) => Map.TryGetValue(type, out var v) ? v.Label : type;
 
     /// <summary>A kézzel felvehető eseménytípusok (kód, magyar név) – a "+ Hiányzó esemény" választólistája.</summary>
     public static IReadOnlyList<(string Type, string Label)> All =>
-        Map.Where(kv => kv.Key != "gk_positioning_error").Select(kv => (kv.Key, $"{kv.Value.Icon} {kv.Value.Label}")).ToList();
+        Map.Where(kv => kv.Key is not ("gk_positioning_error" or "gk_move" or "attack_in_zone")).Select(kv => (kv.Key, $"{kv.Value.Icon} {kv.Value.Label}")).ToList();
     public static string Icon(string type) => Map.TryGetValue(type, out var v) ? v.Icon : "•";
+}
+
+public sealed class KeeperFocus
+{
+    public List<(string Key, string Label, int Count)> Groups { get; } = new();
+    public List<MatchEvent> Items { get; set; } = new();
 }
 
 /// <summary>Esemény-kalapok (egyezik az events.py EVENT_CATEGORIES / CATEGORY_LABELS értékeivel).</summary>
@@ -484,6 +494,33 @@ public sealed class MatchJobService
         var list = evs.Deserialize<List<MatchEvent>>(JsonOptions) ?? new();
         list.Sort((a, b) => a.Time.CompareTo(b.Time));
         return list;
+    }
+
+    /// <summary>Kapus Modul: a csapat kapusát érintő jelenetek egy meccs-eredményből (GET /keeper-focus).</summary>
+    public async Task<KeeperFocus> GetKeeperFocusAsync(string eventsUrl, string team, double minMoveM = 2.0,
+        bool moves = true, CancellationToken ct = default)
+    {
+        var url = U($"/keeper-focus?events={Uri.EscapeDataString(eventsUrl)}&team={team}&moves={(moves ? 1 : 0)}" +
+                    $"&min_move={minMoveM.ToString(CultureInfo.InvariantCulture)}");
+        using var resp = await _http.GetAsync(url, ct);
+        var body = await resp.Content.ReadAsStringAsync(ct);
+        using var doc = JsonDocument.Parse(body);
+        var root = doc.RootElement;
+        if (!resp.IsSuccessStatusCode || root.TryGetProperty("status", out var st) && st.GetString() != "success")
+        {
+            var msg = root.TryGetProperty("message", out var m) ? m.GetString() : null;
+            if ((int)resp.StatusCode == 404 && msg is null)
+                msg = "A motor még nem ismeri a Kapus Modult – frissítsd (git pull) és indítsd újra.";
+            throw new EngineApiException(msg ?? $"A Kapus Modul nem tölthető be ({(int)resp.StatusCode}).");
+        }
+        var res = new KeeperFocus();
+        if (root.TryGetProperty("groups", out var gs) && gs.ValueKind == JsonValueKind.Array)
+            foreach (var g in gs.EnumerateArray())
+                res.Groups.Add((g.GetProperty("key").GetString() ?? "", g.GetProperty("label").GetString() ?? "",
+                    g.TryGetProperty("count", out var c) ? c.GetInt32() : 0));
+        if (root.TryGetProperty("items", out var its) && its.ValueKind == JsonValueKind.Array)
+            res.Items = its.Deserialize<List<MatchEvent>>(JsonOptions) ?? new();
+        return res;
     }
 
     /// <summary>A motor állapota (GET /health) a kijelzéshez: melyik modell, melyik eszközön.</summary>
