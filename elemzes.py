@@ -28,7 +28,10 @@ def build_parser():
                    help="várt félidőhossz percben (alap: 45; amatőr meccsen pl. 40 vagy 35)")
     p.add_argument("--kalibracio", default="", metavar='"x,y;x,y;x,y;x,y"',
                    help="kattintott pályapontok a képen, 0..1 relatív koordinátákkal (mint a kliensben); "
-                        "nélküle a program a pályavonalakból próbál automatikusan kalibrálni")
+                        "nélküle a <videó>.kalibracio.json fájlt használja (tools/kalibracio.py), ha van, "
+                        "különben a pályavonalakból próbál automatikusan kalibrálni")
+    p.add_argument("--nincs-kalibracios-fajl", action="store_true",
+                   help="a <videó>.kalibracio.json fájlt akkor se használja, ha létezik")
     p.add_argument("--kalibracio-pontok", default="", metavar='"x,y;..."',
                    help="a --kalibracio pontjainak pálya-koordinátái méterben (pl. a 16-os sarkai: "
                         '"88.5,13.84;105,13.84;105,54.16;88.5,54.16"); üresen a 4 pályasarok sorrendje')
@@ -86,6 +89,33 @@ def options_from_args(args):
             raise SystemExit("Hiba: a --felidok négy értéket vár (1. kezdet, 1. vége, 2. kezdet, 2. vége).")
         opts.update(zip(("first_start", "first_end", "second_start", "second_end"), parts))
     return opts
+
+
+def apply_calibration_file(args, opts):
+    """
+    A tools/kalibracio.py által mentett <videó>.kalibracio.json használata, ha nincs --kalibracio
+    kapcsoló (az 1. félidőé a calib_*, a 2. félidőé a calib2_* opciókba kerül).
+    Visszatér: tájékoztató szöveg vagy None.
+    """
+    if args.kalibracio or getattr(args, "nincs_kalibracios_fajl", False):
+        return None
+    path = args.video + ".kalibracio.json"
+    if not os.path.exists(path):
+        return None
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools"))
+    import kalibracio
+    data = kalibracio.load_calibration_json(path)
+    calib = kalibracio.calibration_options(data)
+    if not calib:
+        return f"Figyelem: a kalibrációs fájl hibás vagy üres, nem használom: {path}"
+    opts.update(calib)
+    halves = [h for h, k in (("1.", "calib_points"), ("2.", "calib2_points")) if calib.get(k)]
+    text = f"Kézi kalibráció a fájlból ({', '.join(halves)} félidő): {path}"
+    size = (data.get("palya") or [105.0, 68.0])[:2]
+    if (float(size[0]), float(size[1])) != (105.0, 68.0):
+        text += (f"\nFigyelem: a fájl {size[0]:g} x {size[1]:g} m-es pályát ad meg, de az elemző motor egyelőre "
+                 "105 x 68 m-es pályával számol (lásd README).")
+    return text
 
 
 class ProgressBar:
@@ -160,6 +190,7 @@ def main(argv=None):
     from jobs import ProgressReporter, JobCancelled
 
     opts = options_from_args(args)
+    calib_info = apply_calibration_file(args, opts)
     try:
         pipeline.coerce_options(opts)
         pipeline.parse_compilations(opts["compilations"])
@@ -174,6 +205,8 @@ def main(argv=None):
     reporter = ProgressReporter(on_update=bar)
     log_path = os.path.join(out_dir, f"elemzes_{time.strftime('%Y%m%d_%H%M%S')}.log")
     print(f"Elemzés indul: {args.video}")
+    if calib_info:
+        print(calib_info)
     if bg_info:
         print(bg_info)
     print(f"Kimenet: {out_dir}" + ("" if args.reszletes else f"  (a motor kiírásai: {log_path})"))

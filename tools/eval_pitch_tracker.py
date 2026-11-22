@@ -138,15 +138,26 @@ def pitch_error(H_est, H_true, w, h):
     return float(np.median(np.minimum(d, 1e3)))
 
 
-def ensure_clip(clip_dir, seed, profile, duration, width, height):
+# Képromlás-csomagok (tools/synth_match.py Degrader): a valódi esti / napos felvétel utánzása
+DEGRADE_SETS = {
+    "tiszta": None,
+    "esti": {"esti": True},
+    "nap": {"nap": 1.0},
+    "rossz": {"arnyek": 0.55, "nap": 0.6, "tomorites": 36, "zaj": 4.0, "elmosodas": 0.7},
+}
+
+
+def ensure_clip(clip_dir, seed, profile, duration, width, height, romlas="tiszta"):
     os.makedirs(clip_dir, exist_ok=True)
-    video = os.path.join(clip_dir, f"{profile}_s{seed}_{int(duration)}s_{width}x{height}.mp4")
+    tag = profile if romlas in (None, "", "tiszta") else f"{profile}-{romlas}"
+    video = os.path.join(clip_dir, f"{tag}_s{seed}_{int(duration)}s_{width}x{height}.mp4")
     gt_path = os.path.splitext(video)[0] + "_gt.json"
     if not (os.path.exists(video) and os.path.exists(gt_path)):
         import synth_match
         print(f"Klip generálása: {video}", flush=True)
         synth_match.generate(video, gt_path, duration=duration, width=width, height=height, fps=25, seed=seed,
-                             audio=False, progress=False, camera_profile=profile)
+                             audio=False, progress=False, camera_profile=profile,
+                             degrade=DEGRADE_SETS.get(romlas or "tiszta"))
     return video, gt_path
 
 
@@ -192,7 +203,7 @@ def run_one(job):
                      "refine_tried": bool(q.get("refine_tried", q.get("n_visible") is not None)),
                      "refined": bool(q.get("refined")), "conf": q.get("conf"),
                      "q": {k: q.get(k) for k in ("err_m", "precision", "support", "innovation", "n_visible",
-                                                 "motion_ok", "inliers", "lost", "camera_refined")
+                                                 "motion_ok", "inliers", "lost", "camera_refined", "recall")
                            if q.get(k) is not None}})
         if q.get("relocalize"):
             rows[-1]["q"]["reloc"] = q["relocalize"]
@@ -279,6 +290,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="A pályakövető mérése szintetikus Veo-szerű klipeken.")
     ap.add_argument("--seeds", default="6,7,8", help="véletlen magok vesszővel (alap: 6,7,8)")
     ap.add_argument("--profiles", default="alap,nehez", help="kameraprofilok: alap, nehez (alap: mindkettő)")
+    ap.add_argument("--romlas", default="tiszta",
+                    help="képromlások vesszővel: tiszta, esti, nap, rossz (alap: tiszta) – lásd tools/synth_match.py")
     ap.add_argument("--modes", default="kezi,auto", help="módok: kezi, auto (alap: mindkettő)")
     ap.add_argument("--duration", type=float, default=75.0, help="klip hossza mp-ben (alap: 75)")
     ap.add_argument("--width", type=int, default=1280)
@@ -296,9 +309,15 @@ def main(argv=None):
     profiles = [p.strip() for p in args.profiles.split(",") if p.strip()]
     modes = [m.strip() for m in args.modes.split(",") if m.strip()]
     jobs = []
+    clips = []
     for prof in profiles:
         for seed in seeds:
-            video, gt_path = ensure_clip(args.clip_dir, seed, prof, args.duration, args.width, args.height)
+            for rom in [r.strip() for r in args.romlas.split(",") if r.strip()]:
+                if rom not in DEGRADE_SETS:
+                    raise SystemExit(f"Ismeretlen --romlas érték: {rom} (lehet: {', '.join(DEGRADE_SETS)})")
+                clips.append((ensure_clip(args.clip_dir, seed, prof, args.duration, args.width, args.height, rom)))
+    for video, gt_path in clips:
+        if True:
             for mode in modes:
                 jobs.append((video, gt_path, mode, args.tracker_module, args.frames_dir,
                              1 if args.jobs > 1 else 0))

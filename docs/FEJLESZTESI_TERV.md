@@ -350,3 +350,46 @@ játékosok, kamera 7 m magas árbocon 6 m-re az oldalvonal mögött, ±25° pá
 - A teszt szintetikus; valódi Veo-felvételen a fűszín-beállítás (`grass_hsv_*`) és a
   vonalak láthatósága (árnyék, kopott festés) befolyásolja a pontosságot – az áttekintő
   lapokon a cián vonalakkal ellenőrizhető.
+
+### Valódi felvételek: robusztusság és költségkorlát (2026. november)
+- **Vonalkeresés:** a top-hat küszöb helyi (a fű top-hat „zajszintjéhez” igazodik, 8–22 között), így a
+  sötét / esti / borús képen a halványabb vonal is megmarad; a beégett, vastag fényfoltok (reflektor,
+  napcsillanás) környéke kimarad; a képre égetett Veo-logó helye (jobb alsó sarok) kimarad.
+- **Saját fű:** a kép alsó sávjának fű-árnyalatától (hue) eltérő fűszínű részek (pl. a kerítés mögötti
+  műfüves pálya a saját vonalaival) kiesnek (`main_grass_mask`); a fű-alaptartomány tágabb (a napos,
+  sárgás fű is benne van).
+- **Megfigyelhetőség:** a pontosság (precision) csak azokon a modellpontokon számít, ahol egyáltalán
+  látszhatna vonal (fű körülötte, nincs kitakarva) – a túlsó oldalvonalat eltakaró nézősor, reklámtábla
+  nem rontja az illeszkedést.
+- **Hipotézisrács:** a felezővonalnál álló kamera sűrű rácsa mellett a felezővonaltól 13–40 m-re álló
+  kamera ritkább rácsa is (amatőr pályán a Veo gyakran máshol áll); a durva pontozás kicsinyített
+  vonalmaszkon, 3 m-es mintavétellel, vektorizált homográfiákkal fut, a jelöltek finomítása legfeljebb
+  1 mp / próbálkozás (`auto_time_budget`).
+- **Visszalépés:** sikertelen automatikus kalibráció után a következő próbálkozás 50 → 100 → … → 500
+  képkocka múlva jön (a szint az elvesztések után is megmarad), de 25 képkockánként egy olcsó vizsgálat
+  (csak a vonalmaszk) azonnal újrapróbál, ha lényegesen több hosszú vonal látszik, mint a legutóbbi
+  sikertelen próbálkozáskor. Az újrapozicionálás is ritkul (8 → 60 képkocka), és csak a visszalépési
+  időzítés szerint vált át teljes automatikus kalibrációra.
+- **Kézi kalibráció mint előzetes:** ha a kalibráció ideje > 20 mp-re esik a klip elejétől, nincs
+  visszaszámolás – a kalibrációból a (rögzített) kamerahely kerül át, az állást tág újrapozicionálás
+  (pan ±75°, zoom 0,5–2×) keresi meg. Kézi kalibrációnál elvesztéskor sem dobjuk el a kamerát: tág
+  újrapozicionálás a kamerahellyel, automatikus kalibráció csak a kézi kamerahely körül.
+- **Kattintós eszköz:** `tools/kalibracio.py` (lásd README, „Kalibráció a kattintós eszközzel”), a
+  kimenete `<videó>.kalibracio.json` (félidőnként), amit az `elemzes.py` magától használ.
+
+### Nem szabványos pályaméret – mi kellene hozzá
+A motor ma mindenhol 105 × 68 m-rel számol. A `tools/kalibracio.py --palya HxSZ` a méretet elmenti
+(és a rajzot ahhoz igazítja), de a motor még nem használja. A teljes támogatáshoz:
+- `pitch_tracker.py`: `PITCH_LENGTH/PITCH_WIDTH` modulszintű állandók (a pályamodell `pitch_polylines`
+  már paraméterezhető; `parse_calib_points`, `auto_calibrate`/`default_hypothesis_groups`,
+  `CAMERA_PRIOR`, `_plausible`, `camera_plausible`, `fit_camera_to_homography`, `_ground_region_mask`,
+  `_pose_error_m`, `_fit_pose_to_G` használja) → `PitchTracker(..., pitch_size=(L, W))` és a modell
+  pontjai ebből;
+- `tactical_engine.py`, `events.py`: már paraméteres (`pitch_length`, `pitch_width`), csak át kell adni;
+- `heatmap.py`, `review_export.py`, `pitch_filters.py` (pályahatár-szűrő), `team_classifier.py`
+  (kapu-zóna): modulszintű 105/68 → paraméter;
+- `ball_tracker.py`: `PITCH_L, PITCH_W` (újraindítási pontok, háló) → paraméter;
+- `main.py`: a `TacticalEngine` létrehozása és a config (`pitch_length`, `pitch_width`) átadása;
+  `static/taktikai_tabla.html`: `const L = 105, W = 68`;
+- a kimeneti koordináták (események, pályák) ilyenkor a valódi méretben lennének – a kliensnek is
+  tudnia kell a méretet (`events_<id>.json`-ba felvenni).
