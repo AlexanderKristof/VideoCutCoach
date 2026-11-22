@@ -245,7 +245,7 @@ def export(checkpoint, out_dir, size="medium", resolution=None, models_dir="mode
     dst = os.path.join(models_dir, "focis_detektor.onnx")
     shutil.copyfile(src, dst)
     res = getattr(getattr(model, "model_config", None), "resolution", None) or resolution
-    cfg = suggested_model_config(dst, res)
+    cfg = suggested_model_config(dst, res, trained_class_names(out_dir, checkpoint))
     cfg_path = os.path.join(out_dir, "model_config.javaslat.json")
     with open(cfg_path, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
@@ -254,12 +254,31 @@ def export(checkpoint, out_dir, size="medium", resolution=None, models_dir="mode
     return dst
 
 
-def suggested_model_config(onnx_path, resolution=None):
+def trained_class_names(out_dir, checkpoint=None):
+    """
+    A tanítás osztálysorrendje (az rfdetr a training_config.json-ba írja). Az újabb rfdetr a Roboflow
+    szülő-kategóriát ("foci", id 0) kihagyja, így a kimenet 0 = ball … 3 = referee; a régebbi
+    a category_id-t használta (0 = foci). Ezt a fájlból döntjük el, nem feltételezzük.
+    """
+    for d in filter(None, (out_dir, os.path.dirname(checkpoint) if checkpoint else None)):
+        p = os.path.join(d, "training_config.json")
+        try:
+            with open(p, encoding="utf-8") as f:
+                names = json.load(f).get("class_names")
+            if names:
+                return list(names)
+        except (OSError, ValueError):
+            continue
+    return list(CLASSES)
+
+
+def suggested_model_config(onnx_path, resolution=None, class_names=None):
+    names = list(class_names or CLASSES)
     cfg = {
         "backend": "onnx",
         "onnx_path": onnx_path.replace("\\", "/"),
-        # RF-DETR kimenet: 0 = szülő-kategória ("foci"), utána a mi osztályaink
-        "onnx_class_names": ["-"] + CLASSES,
+        # a kimenet sorrendje a tanításé; az utolsó (+1.) logit az RF-DETR "nincs objektum" helye
+        "onnx_class_names": names + ["-"],
         "onnx": {"preset": "detr", "normalize": "imagenet"},
     }
     if resolution:
