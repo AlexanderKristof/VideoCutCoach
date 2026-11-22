@@ -1862,9 +1862,7 @@ class PitchTracker:
         self.relocalize_after = relocalize_after
         self.min_conf = min_conf
         self.refine_gain = refine_gain
-        # SEBESSÉG: 350 sarokpont (a régi 500 helyett) – a 4 paraméteres forgásillesztéshez bőven elég, a
-        # piramisos LK ideje a pontszámmal arányos (a szintetikus mérésen a pontosság nem változott)
-        self.motion = MotionEstimator(max_corners=350)
+        self.motion = MotionEstimator()
         self.rot_motion = RotationMotionEstimator(self.motion)
         self.pts_fine = pitch_model_points(0.5)
         self.tan_fine = pitch_model_tangents(0.5)
