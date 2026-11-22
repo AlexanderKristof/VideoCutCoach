@@ -59,6 +59,25 @@ IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], np.float32)
 
 
+def _preload_cuda_dlls(ort):
+    """
+    Az onnxruntime-gpu a CUDA / cuDNN DLL-eket a rendszerben keresi; ha nincsenek (külön CUDA-telepítés
+    nélkül), csendben CPU-ra vált. Ha a környezetben van GPU-s PyTorch, annak a csomagolt DLL-jeit
+    használjuk (a torch importja Windowson a DLL-keresési útra teszi őket), és az újabb onnxruntime
+    preload_dlls() függvényét is meghívjuk. Hiba esetén nincs teendő (marad a régi viselkedés).
+    """
+    try:
+        import torch  # noqa: F401  – csak a CUDA/cuDNN DLL-ek miatt
+    except Exception:
+        pass
+    pre = getattr(ort, "preload_dlls", None)
+    if pre is not None:
+        try:
+            pre()
+        except Exception:
+            pass
+
+
 def select_providers(requested="auto", available=None):
     """A végrehajtók listája: 'auto' -> CUDA > DirectML > CPU közül az elérhetők; lista -> az elérhetők."""
     if available is None:
@@ -161,6 +180,8 @@ class OnnxDetector(Detector):
             if int(cfg.get("threads") or 0) > 0:
                 so.intra_op_num_threads = int(cfg["threads"])
             providers = select_providers(cfg.get("providers", "auto"))
+            if "CUDAExecutionProvider" in providers:
+                _preload_cuda_dlls(ort)
             session = ort.InferenceSession(path, sess_options=so, providers=providers)
         self.session = session
         self.providers = list(session.get_providers()) if hasattr(session, "get_providers") else []
