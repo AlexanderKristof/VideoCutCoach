@@ -1,3 +1,4 @@
+import contextlib
 import cv2
 import os
 import uuid
@@ -29,7 +30,7 @@ from events import PositioningMonitor  # kapus helyezkedési hiba (tartós elté
 from pitch_filters import (build_grass_mask, foot_on_grass, CameraMotion,
                            StationaryFilter, extract_dominant_color,
                            PitchBoundary, PitchTrackSanity, KeeperGate, pitch_h_trusted)  # PÁLYAHATÁR
-from pitch_filters import GrassModel, grass_mode_from_config  # ADAPTÍV FŰ
+from pitch_filters import GrassModel, GrassMaskCache, grass_mode_from_config  # ADAPTÍV FŰ
 from video_quality import VideoQualityMonitor, annotate_event_reliability  # VIDEÓMINŐSÉG
 from model_config import (load_model_config, resolve_weights, build_role_class_map,
                           describe_role_map, should_detect, reset_tracker, ROLES, auto_flag)
@@ -44,7 +45,7 @@ from pitch_tracker import PitchTracker, parse_calib_points, draw_pitch_overlay a
 from ball_tracker import BallTracker, draw_ball_state  # labdakövetés (Kálmán + jelölt-pontozás)
 from ball_crops import BallCropSearch  # LABDA-KIVÁGÁS: natív felbontású labda-felismerés
 from stage_timer import StageTimer  # PROFILOZÁS: szakaszonkénti időmérés
-from video_writer import AnnotatedVideoWriter, choose_h264_encoder, encoder_args as video_writer_encoder_args  # KIMENETI KÓDOLÁS: hardveres H.264, író szál
+from video_writer import AnnotatedVideoWriter, FramePrefetcher, choose_h264_encoder, encoder_args as video_writer_encoder_args  # KIMENETI KÓDOLÁS: hardveres H.264, író szál
 from pitch_filters import BoundaryCrowdFilter  # NÉZŐ A TÚLSÓ PÁLYASZÉLEN (kalibráció nélkül)
 
 Base.metadata.create_all(bind=engine)
@@ -361,7 +362,10 @@ def create_pitch_tracker(video_file, width, height, fps, start_sec, calib_points
             H0 = parse_calib_points(calib_points_str, width, height, config["calib_pitch_points"])
         except Exception as ex:
             print(f"Homográfia hiba (pálya-pontok): {ex}")
-    tracker = PitchTracker((width, height), np.array(config["grass_lower"]), np.array(config["grass_upper"]))
+    # SEBESSÉG: adaptív vonal-finomítás (stabil követésnél ritkább; 3 = a régi, rögzített ütem)
+    refine_max = config.get("pitch_refine_max_every", model_cfg.get("pitch_refine_max_every", 3))
+    tracker = PitchTracker((width, height), np.array(config["grass_lower"]), np.array(config["grass_upper"]),
+                           refine_max_every=refine_max)
     if H0 is None:
         return tracker, "BE, kézi kalibráció nincs -> automatikus kalibráció a pályavonalakból"
     msg = "BE, kézi kalibráció a klip elején"
@@ -528,6 +532,27 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
                        for k in (["keeper1", "keeper2"] + ([] if team_clf is not None else ["team1", "team2"]))))
     OTHER_COLOR = (160, 160, 160)   # ismeretlen / "egyéb" mez: semleges szürke (a hiba így látszik)
     timer = StageTimer()            # PROFILOZÁS
+
+    # --- SEBESSÉG: fűmaszk-gyorsítótár + párhuzamos pályakövetés (model_config: grass_mask_every, parallel_pitch) ---
+    grass_mask_every = int(config.get("grass_mask_every", model_cfg.get("grass_mask_every", 1)) or 1)
+    grass_cache = GrassMaskCache(grass_model.mask, every=grass_mask_every) if grass_model is not None else None
+
+    def _pitch_step(frame_, boxes_, want_mask_):
+        """Kameramozgás + pályakövetés (+ a fűmaszk) egy képkockán. Csak a saját objektumait írja
+        (camera_motion, pitch_tracker, grass_cache), így külön szálon is futhat a felismerés alatt."""
+        t0 = time.perf_counter()
+        camera_motion.update(frame_)
+        H_, q_, F_ = None, None, None
+        if pitch_tracker is not None:
+            H_, q_ = pitch_tracker.update(frame_, boxes_)
+            F_ = pitch_tracker.frame_motion() if hasattr(pitch_tracker, "frame_motion") else None
+        t1 = time.perf_counter()
+        m_ = grass_cache.get(frame_, camera_motion.offset) if want_mask_ else None
+        return {"H": H_, "q": q_, "F": F_, "mask": m_, "t_pitch": t1 - t0, "t_mask": time.perf_counter() - t1}
+
+    parallel_pitch = auto_flag(config.get("parallel_pitch", model_cfg.get("parallel_pitch", "auto")), device)
+    pitch_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="palyakoveto") if parallel_pitch else None
+    # --- /SEBESSÉG ---
     setup_sec = time.perf_counter() - t_setup0
 
     frames_done = 0
@@ -580,7 +605,10 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
 
     # A megosztott modellt / követőt az egész klip idejére lefoglaljuk (lásd model_lock),
     # és töröljük az előző elemzésből megmaradt ByteTrack állapotot
-    with model_lock, open(debug_log_path, "w", encoding="utf-8") as debug_file:
+    # cleanup: a háttérszálak (képkocka-olvasó, párhuzamos pályakövető) leállítása hiba / megszakítás esetén is
+    with model_lock, open(debug_log_path, "w", encoding="utf-8") as debug_file, contextlib.ExitStack() as cleanup:
+        if pitch_pool is not None:
+            cleanup.callback(pitch_pool.shutdown, wait=True)
         # DETEKTOR-HÁTTÉR: a saját követő nullázása (az FPS a követés-puffer méretéhez kell)
         trackers_reset = OWN_BACKEND.reset(frame_rate=fps) if OWN_BACKEND is not None else reset_tracker(model)
         debug_file.write(f"=== TACTICAL ANALYZER RUN LOG: {clip_id} ===\n")
@@ -600,38 +628,78 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
         debug_file.write(f"Felismerés: imgsz={IMGSZ}, félpontosság (FP16): {'BE' if use_half() else 'KI'}; "
                          f"kimeneti videó: {writer.describe()}; labda-kivágás: "
                          + (f"BE ({ball_crops.crop}px, {len(ball_crops.tiles)} csempe)" if ball_crops is not None else "KI")
-                         + f"; előkészítés: {setup_sec:.1f} mp\n\n")
+                         + f"; előkészítés: {setup_sec:.1f} mp\n")
+        debug_file.write(f"Gyorsítás: pályakövetés {'külön szálon (párhuzamos)' if pitch_pool is not None else 'soros'}"
+                         + (f", vonal-finomítás legritkábban {pitch_tracker.refine_max_every} képkockánként"
+                            if getattr(pitch_tracker, "refine_max_every", None) else "")
+                         + f", fűmaszk {grass_mask_every} képkockánként\n\n")
 
+        # BEMENETI DEKÓDOLÁS: előolvasás külön szálon (a dekódolás átfed a feldolgozással)
+        frame_reader = FramePrefetcher(cap) if config.get("prefetch_frames", True) else None
+        if frame_reader is not None:
+            cleanup.callback(frame_reader.close)
         timer.t_start = time.perf_counter()
-        while cap.isOpened():
+        while frame_reader is not None or cap.isOpened():
             with timer("decode"):
-                ret, frame = cap.read()
+                ret, frame = frame_reader.read() if frame_reader is not None else cap.read()
             if not ret:
                 break
 
             current_time_sec = start_sec + (frames_done / fps)
             cam_prev = camera_motion.offset.copy()   # VIDEÓMINŐSÉG: a kamera elfordulása ezen a képkockán
-            with timer("pitch"):
-                camera_motion.update(frame)
-            # --- ADAPTÍV FŰ + VIDEÓMINŐSÉG (a nyers képkockán, a rajzolás előtt) ---
+            q_mask = grass_mask                      # VIDEÓMINŐSÉG: az előző felismerés fűmaszkja (mint eddig)
+            detected = should_detect(frames_done, DETECT_EVERY_N)
+            gk_real_coords = None
+            # --- ADAPTÍV FŰ: a fűmodell lassú frissítése (a maszk előtt, a nyers képkockán) ---
             with timer("grass_quality"):
                 if grass_model is not None and frames_done > 0 and frames_done % grass_update_every == 0:
                     grass_model.observe(frame)
-                if quality.due(frames_done):
-                    pan_px = float(np.hypot(*(camera_motion.offset - cam_prev))) * 1280.0 / max(1, width)
-                    q_sample = quality.update(frame, current_time_sec, grass_mask=grass_mask, pan_px=pan_px)
-                    debug_file.write(f"F#{frames_done} {VideoQualityMonitor.describe_sample(q_sample)}\n")
-            # --- /ADAPTÍV FŰ + VIDEÓMINŐSÉG ---
+            # --- Pályakövetés + kameramozgás (+ fűmaszk): soros módban itt, párhuzamos módban külön szálon,
+            # a felismeréssel egy időben (PÁRHUZAMOS PÁLYAKÖVETÉS) ---
+            want_mask = detected and grass_model is not None
+            if pitch_pool is not None:
+                pitch_future = pitch_pool.submit(_pitch_step, frame, pitch_boxes, want_mask)
+            else:
+                pitch_res = _pitch_step(frame, pitch_boxes, want_mask)
+                timer.add("pitch", pitch_res["t_pitch"])
+                timer.add("grass_quality", pitch_res["t_mask"])
             if frames_done % 250 == 0:
                 stationary_filter.prune(frames_done)
                 keeper_gate.prune(frames_done)  # PÁLYAHATÁR
                 if track_sanity is not None:
                     track_sanity.prune(frames_done)
 
-            # --- Pályakövetés: az aktuális képkocka homográfiája (a rajzolás előtt) ---
+            own_det = None
+            crop_pre = None
+            if detected and pitch_pool is not None:
+                # PÁRHUZAMOS PÁLYAKÖVETÉS: a felismerés (GPU) a pályakövetéssel egy időben; a saját követő
+                # társítása (kamera-kompenzációval) csak a pályakövetés mozgásbecslése után
+                t_det = time.perf_counter()
+                if OWN_BACKEND is not None:
+                    own_det = OWN_BACKEND.detector.detect(frame)
+                else:
+                    _raw_ball_buf["boxes"] = None
+                    results = model.track(frame, persist=True, tracker="bytetrack.yaml", device=device, verbose=False,
+                                          imgsz=IMGSZ, half=use_half())
+                timer.add("detect", time.perf_counter() - t_det)
+                if ball_crops is not None:
+                    # LABDA-KIVÁGÁS (GPU) is a pályakövetés alatt: csak az előző képkocka labdaállapota kell hozzá
+                    t_bp = time.perf_counter()
+                    windows = ball_crops.plan(frames_done, last_ball_state, prev_full_hit)
+                    crop_pre = ball_crops.run(
+                        frame, windows,
+                        lambda cs: _ball_crop_detect(cs, min(ball_crop_conf, ball_cand_conf), ball_crops.crop)) if windows else []
+                    timer.add("ball_pass", time.perf_counter() - t_bp)
+            if pitch_pool is not None:
+                t_wait = time.perf_counter()
+                pitch_res = pitch_future.result()
+                timer.add("pitch", time.perf_counter() - t_wait)       # csak a NEM átfedett (várakozási) idő
+                timer.add("pitch_overlap", pitch_res["t_pitch"] + pitch_res["t_mask"])   # a háttérszál ideje
+
+            # --- Pályakövetés eredménye: az aktuális képkocka homográfiája (a rajzolás előtt) ---
             t_pitch = time.perf_counter()
             if pitch_tracker is not None:
-                H_cur, pitch_q = pitch_tracker.update(frame, pitch_boxes)
+                H_cur, pitch_q = pitch_res["H"], pitch_res["q"]
                 pitch_stats[pitch_q["status"]] = pitch_stats.get(pitch_q["status"], 0) + 1
                 pitch_stats["finomítás"] += int(pitch_q.get("refined", False))
                 if frames_done % 25 == 0:
@@ -639,22 +707,26 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
                                      f"inlier={pitch_q.get('inliers', '-')}, elveszett={pitch_q.get('lost')}, "
                                      f"forrás={pitch_q.get('source')}\n")
                 # LABDAKÖVETÉS: a képtér-mozgás (előző -> aktuális kép) összeszorzása a labda-frissítések között
-                F_img = pitch_tracker.frame_motion() if hasattr(pitch_tracker, "frame_motion") else None
+                F_img = pitch_res["F"]
                 if ball_motion_H is not None:
                     ball_motion_H = None if F_img is None else F_img @ ball_motion_H
                 if OWN_BACKEND is not None:   # DETEKTOR-HÁTTÉR: kamera-kompenzáció a saját követőnek
                     OWN_BACKEND.note_motion(F_img)
             timer.add("pitch", time.perf_counter() - t_pitch)
             # --- /Pályakövetés ---
-
-            detected = should_detect(frames_done, DETECT_EVERY_N)
-            gk_real_coords = None
+            # --- VIDEÓMINŐSÉG (a nyers képkockán, a rajzolás előtt; a kamera elfordulása a kameramozgásból) ---
+            with timer("grass_quality"):
+                if quality.due(frames_done):
+                    pan_px = float(np.hypot(*(camera_motion.offset - cam_prev))) * 1280.0 / max(1, width)
+                    q_sample = quality.update(frame, current_time_sec, grass_mask=q_mask, pan_px=pan_px)
+                    debug_file.write(f"F#{frames_done} {VideoQualityMonitor.describe_sample(q_sample)}\n")
+            # --- /VIDEÓMINŐSÉG ---
 
             if detected:
                 t_gq = time.perf_counter()
                 hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV) if need_hsv else None  # SEBESSÉG: csak ha kell
                 if grass_model is not None:  # ADAPTÍV FŰ (tanulás előtt a modell az alap HSV-re esik vissza)
-                    grass_mask, grass_scale = grass_model.mask(frame)
+                    grass_mask, grass_scale = pitch_res["mask"]
                 else:
                     grass_mask, grass_scale = build_grass_mask(hsv_frame, grass_lower, grass_upper)
                 if crowd_filter is not None:
@@ -664,8 +736,9 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
                 t_det = time.perf_counter()
                 own_raw_ball = None
                 if OWN_BACKEND is not None:
-                    results, own_raw_ball = OWN_BACKEND.track(frame)   # a labda nyers jelöltjei külön
-                else:
+                    # a labda nyers jelöltjei külön (párhuzamos módban a már kész felismerésből)
+                    results, own_raw_ball = OWN_BACKEND.track(frame, detections=own_det)
+                elif pitch_pool is None:
                     _raw_ball_buf["boxes"] = None   # NYERS LABDA: a callback tölti ki a track() alatt
                     # SEBESSÉG: imgsz a beállításból, CUDA-n félpontosság (FP16)
                     results = model.track(frame, persist=True, tracker="bytetrack.yaml", device=device, verbose=False,
@@ -702,10 +775,13 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
                 # LABDA-KIVÁGÁS: natív felbontású kivágás(ok) a becsült labdahely körül / csempén; a dobozok
                 # a teljes képre vetítve, a teljes képes jelöltekkel egyesítve
                 if ball_crops is not None:
-                    windows = ball_crops.plan(frames_done, last_ball_state, prev_full_hit)
-                    crop_boxes = ball_crops.run(
-                        frame, windows,
-                        lambda cs: _ball_crop_detect(cs, min(ball_crop_conf, ball_cand_conf), ball_crops.crop)) if windows else []
+                    if crop_pre is not None:       # párhuzamos mód: már lefutott a pályakövetés alatt
+                        crop_boxes = crop_pre
+                    else:
+                        windows = ball_crops.plan(frames_done, last_ball_state, prev_full_hit)
+                        crop_boxes = ball_crops.run(
+                            frame, windows,
+                            lambda cs: _ball_crop_detect(cs, min(ball_crop_conf, ball_cand_conf), ball_crops.crop)) if windows else []
                     prev_full_hit = any(c > BALL_CONF for _b, c in ball_src)
                     ball_src = ball_crops.merge(ball_src, crop_boxes, count_conf=BALL_CONF)
                 timer.add("ball_pass", time.perf_counter() - t_bp)
@@ -985,6 +1061,10 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
                       f"{frames_done / el:.2f} kép/mp")
                 if progress: progress(100.0 * frames_done / max(1, total_frames), f"{frames_done}/{total_frames} képkocka")  # háttérfeladat haladás (+ megszakítás)
 
+        if pitch_pool is not None:
+            pitch_pool.shutdown(wait=True)
+        if frame_reader is not None:
+            frame_reader.close()
         t_close = time.perf_counter()
         writer_error = writer.close()   # KIMENETI KÓDOLÁS: a sor kiürítése, az ffmpeg lezárása
         timer.add("encode", time.perf_counter() - t_close)

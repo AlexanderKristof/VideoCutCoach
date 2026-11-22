@@ -165,3 +165,59 @@ class AnnotatedVideoWriter:
             self.error = (err or b"").decode("utf-8", "replace").strip()[-300:] or f"ffmpeg kilépési kód {self.proc.returncode}"
         return self.error
 
+
+
+class FramePrefetcher:
+    """
+    BEMENETI DEKÓDOLÁS: a képkockák előolvasása külön szálon, kis, korlátos sorba (alap 4 képkocka) –
+    a dekódolás így átfed a feldolgozással (a cv2.VideoCapture.read() elengedi a GIL-t). A sorrend és
+    a tartalom ugyanaz, mint a közvetlen cap.read()-del.
+        reader = FramePrefetcher(cap)
+        ok, frame = reader.read()      # mint a cap.read()
+        reader.close()
+    """
+
+    def __init__(self, cap, queue_size=4):
+        self.cap = cap
+        self._q = queue.Queue(maxsize=max(1, int(queue_size)))
+        self._stop = threading.Event()
+        self._done = False
+        self.error = None
+        self._thread = threading.Thread(target=self._run, name="kepkocka-olvaso", daemon=True)
+        self._thread.start()
+
+    def _put(self, item):
+        while not self._stop.is_set():
+            try:
+                self._q.put(item, timeout=0.2)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _run(self):
+        try:
+            while not self._stop.is_set():
+                ok, frame = self.cap.read()
+                if not self._put((ok, frame if ok else None)) or not ok:
+                    return
+        except Exception as ex:          # a hiba a fő szálon a videó végeként jelenik meg
+            self.error = f"{type(ex).__name__}: {ex}"
+            self._put((False, None))
+
+    def read(self):
+        if self._done:
+            return False, None
+        ok, frame = self._q.get()
+        if not ok:
+            self._done = True
+        return ok, frame
+
+    def close(self):
+        self._stop.set()
+        try:
+            while True:
+                self._q.get_nowait()
+        except queue.Empty:
+            pass
+        self._thread.join(timeout=5)

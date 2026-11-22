@@ -21,7 +21,8 @@ def build_grass_mask(hsv_frame, lower, upper, scale=0.5):
     """
     if is_full_range(lower, upper):
         return None, scale
-    small = cv2.resize(hsv_frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST)
+    small = hsv_frame if scale == 1.0 else cv2.resize(hsv_frame, None, fx=scale, fy=scale,
+                                                       interpolation=cv2.INTER_NEAREST)
     mask = cv2.inRange(small, lower, upper)
     k = max(5, (int(small.shape[0] / 60) // 2) * 2 + 1)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
@@ -558,6 +559,48 @@ class KeeperGate:
             del self.tracks[tid]
 
 
+class GrassMaskCache:
+    """
+    SEBESSÉG: a fűmaszk újraszámolása csak minden every-edik hívásnál; közte az utoljára számolt maszk
+    a kameramozgással (CameraMotion összesített eltolása) eltolva. A fű nem mozog, a forgó kamera két
+    képkocka között jó közelítéssel csak eltolja a képet; a széleken felbukkanó sáv a szomszédos
+    maszkértéket kapja. Nagy elmozdulásnál (max_shift_px, a maszk felbontásán) mindig újraszámol.
+    every = 1: minden hívásnál új maszk (a régi működés).
+        cache = GrassMaskCache(grass_model.mask, every=2)
+        mask, scale = cache.get(frame, camera_motion.offset)
+    """
+
+    def __init__(self, compute, every=1, max_shift_px=24.0):
+        self.compute = compute
+        self.every = max(1, int(every))
+        self.max_shift_px = float(max_shift_px)
+        self._mask = None
+        self._scale = 0.5
+        self._ref = None
+        self._age = 0
+        self.stats = {"számolt": 0, "eltolt": 0}
+
+    def get(self, frame, cam_offset=None):
+        off = None if cam_offset is None else np.asarray(cam_offset, np.float64).copy()
+        if self._mask is not None and self._age + 1 < self.every and off is not None and self._ref is not None:
+            d = (off - self._ref) * self._scale
+            if float(np.hypot(*d)) <= self.max_shift_px:
+                self._age += 1
+                self.stats["eltolt"] += 1
+                if abs(d[0]) < 0.5 and abs(d[1]) < 0.5:
+                    return self._mask, self._scale
+                h, w = self._mask.shape[:2]
+                M = np.float32([[1, 0, d[0]], [0, 1, d[1]]])
+                return cv2.warpAffine(self._mask, M, (w, h), flags=cv2.INTER_NEAREST,
+                                      borderMode=cv2.BORDER_REPLICATE), self._scale
+        mask, scale = self.compute(frame)
+        self._mask, self._scale, self._ref, self._age = mask, scale, off, 0
+        self.stats["számolt"] += 1
+        if mask is None:
+            self._mask = None
+        return mask, scale
+
+
 # ======================================================================
 # ADAPTÍV FŰMODELL: a fű színeloszlása videónként tanulva (árnyék-, csillanás- és színezet-tűrő)
 # ======================================================================
@@ -594,6 +637,43 @@ def _features(bgr):
     out[..., 1] = f[..., 1] - f[..., 0]
     out[..., 2] = _LOG_LUT[gray]
     return out
+
+
+def _as_mask255(m):
+    """bool / 0-1 / 0-255 maszk -> uint8 (0/255)."""
+    m = np.asarray(m)
+    if m.dtype == np.uint8 and (m.size == 0 or m.max() > 1):
+        return m
+    return np.where(m.astype(bool), 255, 0).astype(np.uint8)
+
+
+def _box_count_ge(mask255, win, frac):
+    """
+    Többségi szűrő: 255, ahol a win×win ablak legalább frac része 255 (mint
+    cv2.blur(maszk, (win, win)) >= frac a 0/1 float maszkon, ugyanazzal a peremkezeléssel) –
+    egész aritmetikával, uint8 / uint16 cv2-műveletekkel (SEBESSÉG).
+    """
+    need = int(math.ceil(frac * win * win - 1e-9))
+    cnt = cv2.boxFilter(mask255, cv2.CV_16U, (win, win), normalize=False)   # 255 × darabszám
+    return cv2.compare(cnt, need * 255, cv2.CMP_GE)
+
+
+def _drop_components(mask255, cc, stats, keep):
+    """A keep == False összefüggő részek törlése a maszkból (helyben). Kevés, kicsi eldobott résznél
+    csak azok befoglaló téglalapjában dolgozunk; különben címke-táblázattal."""
+    drop = np.flatnonzero(~keep[1:]) + 1
+    if len(drop) == 0:
+        return mask255
+    boxes = stats[drop]
+    if len(drop) <= 256 and float(np.sum(boxes[:, cv2.CC_STAT_WIDTH] * boxes[:, cv2.CC_STAT_HEIGHT])) <= 0.25 * mask255.size:
+        for i, (x, y, bw, bh) in zip(drop, boxes[:, :4]):
+            sub = mask255[y:y + bh, x:x + bw]
+            sub[cc[y:y + bh, x:x + bw] == i] = 0
+        return mask255
+    table = np.where(keep, 255, 0).astype(np.uint8)
+    table[0] = 0
+    mask255[...] = table.take(cc)
+    return mask255
 
 
 class _Mode:
@@ -940,6 +1020,17 @@ class GrassModel:
             self._lut = self.classify_features(_features(grid)).astype(np.uint8)
             self._lut_key = key
         sh = 8 - self.LUT_BITS
+        if bgr.ndim == 3 and bgr.shape[2] == 3 and bgr.flags.c_contiguous and bgr.shape[0] * bgr.shape[1] >= 4096:
+            # SEBESSÉG: képre a táblázat-index csatornánkénti cv2.LUT-tal (ugyanaz az index, mint lent)
+            if getattr(self, "_chan_lut", None) is None:
+                v = (np.arange(256) >> sh).astype(np.int32)
+                cl = np.zeros((256, 1, 3), np.int32)
+                cl[:, 0, 0] = v << (2 * self.LUT_BITS)
+                cl[:, 0, 1] = v << self.LUT_BITS
+                cl[:, 0, 2] = v
+                self._chan_lut = cl
+            c = cv2.LUT(bgr, self._chan_lut)
+            return self._lut.take(c[..., 0] + c[..., 1] + c[..., 2])
         b = bgr[..., 0].astype(np.uint32) >> sh
         g = bgr[..., 1].astype(np.uint32) >> sh
         r = bgr[..., 2].astype(np.uint32) >> sh
@@ -958,12 +1049,14 @@ class GrassModel:
             return build_grass_mask(hsv, *DEFAULT_GRASS_HSV, scale=scale)
         small = cv2.resize(frame_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
         lab = self.labels(small)
-        strong = (lab > 0) & (lab < self.WEAK)
+        # SEBESSÉG: uint8 (0/255) maszkok cv2-műveletekkel (ugyanaz az eredmény, mint a bool tömbökkel)
+        strong = cv2.inRange(lab, 1, self.WEAK - 1)
         # csak a SŰRŰ biztos fű mellett (a fák / bokrok elszórt "fűszínű" foltjai mellett nem)
-        solid = (lab == 1) | (lab == 2)    # a kifakult (csillanó) rész mellett nem: ott minden szürkés-zöld
-        dense = solid & (cv2.blur(solid.astype(np.float32), (5, 5)) >= 0.7)
-        near = cv2.dilate(dense.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
-        return self._clean_mask(strong, extra=(lab == self.WEAK) & near), scale
+        solid = cv2.inRange(lab, 1, 2)     # a kifakult (csillanó) rész mellett nem: ott minden szürkés-zöld
+        dense = cv2.bitwise_and(solid, _box_count_ge(solid, 5, 0.7))
+        near = cv2.dilate(dense, np.ones((5, 5), np.uint8))
+        extra = cv2.bitwise_and(cv2.compare(lab, self.WEAK, cv2.CMP_EQ), near)
+        return self._clean_mask(strong, extra=extra), scale
 
     def _clean_mask(self, raw, extra=None):
         """
@@ -972,26 +1065,26 @@ class GrassModel:
         részébe nyúló vagy nagyon nagy összefüggő részek maradnak (a fasor, a távoli zöld felületek
         nem a pálya). extra: további (gyenge) fű-pixelek – az összefüggőség-vizsgálatban nem
         vesznek részt (nem köthetik össze a fasort a pályával), csak a végső maszkban.
+        raw / extra: bool vagy uint8 (0/255) maszk.
         """
+        raw = _as_mask255(raw)
         h, w = raw.shape[:2]
-        dens = cv2.blur(raw.astype(np.float32), (self.DENS_WIN, self.DENS_WIN))
         # a vékony (1–2 px) fehér vonalak ne vágják szét a füvet, a vastagabb tábla / salaksáv igen
-        rawd = cv2.dilate(raw.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
-        core = np.where((dens >= self.DENS_MIN) & rawd, 255, 0).astype(np.uint8)
+        rawd = cv2.dilate(raw, np.ones((3, 3), np.uint8))
+        core = cv2.bitwise_and(_box_count_ge(raw, self.DENS_WIN, self.DENS_MIN), rawd)
         # az összefüggő részek a zárás ELŐTT: a reklámtábla / salaksáv még elválasztja a fasort a pályától
         n, cc, stats, _ = cv2.connectedComponentsWithStats(core, connectivity=8)
         if n > 2:
             low = int(h * 0.55)
-            keep = np.zeros(n, bool)
-            for i in range(1, n):
-                y0, hh, area = stats[i, cv2.CC_STAT_TOP], stats[i, cv2.CC_STAT_HEIGHT], stats[i, cv2.CC_STAT_AREA]
-                keep[i] = (y0 + hh > low and area >= 0.002 * h * w) or area >= 0.2 * h * w
-            core = np.where(keep[cc], 255, 0).astype(np.uint8)
+            y0, hh, area = stats[:, cv2.CC_STAT_TOP], stats[:, cv2.CC_STAT_HEIGHT], stats[:, cv2.CC_STAT_AREA]
+            keep = ((y0 + hh > low) & (area >= 0.002 * h * w)) | (area >= 0.2 * h * w)
+            keep[0] = False
+            _drop_components(core, cc, stats, keep)
         # a többségi szűrő a széleken "rág" (a játékosok körül): a megtartott részek közvetlen
         # környezetében a pixelenkénti döntés számít
-        zone = cv2.dilate(core, np.ones((5, 5), np.uint8)) > 0
-        full = raw if extra is None else (raw | extra)
-        mask = np.where(full & zone, 255, 0).astype(np.uint8)
+        zone = cv2.dilate(core, np.ones((5, 5), np.uint8))
+        full = raw if extra is None else cv2.bitwise_or(raw, _as_mask255(extra))
+        mask = cv2.bitwise_and(full, zone)
         k = max(5, (int(h / 60) // 2) * 2 + 1)
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)

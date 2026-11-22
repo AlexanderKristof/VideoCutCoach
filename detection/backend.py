@@ -110,8 +110,10 @@ class OwnTrackerBackend:
         self._motion, self._motion_ok = None, True
         return m
 
-    def track(self, frame, motion=None):
-        det = self.detector.detect(frame)
+    def track(self, frame, motion=None, detections=None):
+        """detections: a képkocka kész felismerése (pl. a pályakövetéssel párhuzamosan futtatva) –
+        ilyenkor csak a követés (társítás) fut; None: a detektor itt fut."""
+        det = self.detector.detect(frame) if detections is None else detections
         self.last_detections = det
         m = motion if motion is not None else self._take_motion()
         if motion is not None:

@@ -156,6 +156,21 @@ mutatja az időt (ms/képkocka, arány), a tényleges kép/mp-t és a kimeneti v
 (NVENC / QSV / AMF / libx264 veryfast / libopenh264 – a `fast_cut` felderítése szerint). Az annotált
 videó kicsinyíthető: `output_scale` (pl. 0.5), parancssorban `--kimenet-felbontas 0.5`.
 
+### 6c. A CPU-szakaszok gyorsítása (pályakövetés, fűmaszk)
+
+A GPU-s felismerés mellett a képkockánkénti idő nagy része CPU-munka (pályakövetés, fűmodell,
+rajzolás). Ezek beállításai (a környezeti változó felülírja a JSON-t):
+
+| kulcs | alap | jelentés |
+|---|---|---|
+| `pitch_refine_max_every` | 5 | adaptív vonal-finomítás: stabil, a vonalakkal rendre megerősített követésnél a drága vonalkeresés + illesztés legfeljebb ennyi képkockánként fut (közte a kameramodell mozgásbecslése adja az állást); gyanús jelnél (rossz illesztés, nagy eltérés, gyors pásztázás / zoom, sikertelen mozgásbecslés) azonnal vissza a 3 képkockás ütemre. `3` = a régi, rögzített ütemezés (`TACTICAL_PITCH_REFINE_MAX_EVERY`) |
+| `grass_mask_every` | 2 | a fűmaszk újraszámolása ennyi képkockánként; közte az előző maszk a kameramozgással eltolva. `1` = minden képkockán (`TACTICAL_GRASS_MASK_EVERY`) |
+| `parallel_pitch` | `"auto"` | a pályakövetés (+ kameramozgás, fűmaszk) külön szálon, a felismeréssel egy időben; az eredmény ugyanaz, csak az átfedés gyorsít. `auto` = CUDA-n be (CPU-s felismerésnél a két szál csak egymást lassítaná; `TACTICAL_PARALLEL_PITCH`) |
+
+A legpontosabb (régi) működés: `pitch_refine_max_every: 3`, `grass_mask_every: 1`. Párhuzamos módban a
+napló időmérése a pályakövetésnél csak a várakozást mutatja; a háttérszál ideje külön sorban
+(„átfedve”) jelenik meg.
+
 
 ## 7. Betöltés és a súlyfájl helye (lusta betöltés, models mappa)
 

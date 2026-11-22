@@ -72,7 +72,7 @@ import math
 import cv2
 import numpy as np
 
-from pitch_filters import build_grass_mask, is_full_range
+from pitch_filters import build_grass_mask, is_full_range, _drop_components
 
 PITCH_LENGTH = 105.0
 PITCH_WIDTH = 68.0
@@ -354,7 +354,7 @@ def main_grass_mask(hsv, grass, tol=14.0, max_tol=24.0, min_keep=0.5, model=None
         area[0] = 0
         keep = area >= max(0.01 * h * w, 0.05 * area.max())
         keep[0] = False
-        m = np.where(keep[lab], 255, 0).astype(np.uint8)
+        m = _drop_components(m, lab, stats, keep)
     if np.count_nonzero(m) < min_keep * max(1, np.count_nonzero(grass)):
         return grass
     return m
@@ -362,14 +362,14 @@ def main_grass_mask(hsv, grass, tol=14.0, max_tol=24.0, min_keep=0.5, model=None
 
 def _glare_mask(mn, k):
     """Beégett, nagy kiterjedésű fényfoltok (reflektor, napcsillanás): ezek közelében nincs megbízható vonal."""
-    bright = (mn >= 235).astype(np.uint8) * 255
-    if not bright.any():
+    bright = cv2.compare(mn, 235, cv2.CMP_GE)
+    if cv2.countNonZero(bright) == 0:
         return None
     # csak a VASTAG foltok (a k átmérőjű erózió után is megmaradó részek): a beégett, de vékony
     # pályavonal így nem esik ki
     ke = _odd(max(3, k))
     core = cv2.erode(bright, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ke, ke)))
-    if not core.any():
+    if cv2.countNonZero(core) == 0:
         return None
     kd = _odd(ke + 6)                    # a folt eredeti mérete + néhány px (a peremén is lehet hamis "vonal")
     return cv2.dilate(core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kd, kd)))
@@ -387,8 +387,34 @@ def detect_line_mask(small_bgr, grass_mask=None, box_mask=None, hsv=None, min_to
     - a beégett, nagy fényfoltok (reflektor, csillanás) környéke kimarad,
     - telítettség-küszöb, fűzóna (tágítva, hogy a szélső vonal is benne legyen),
     - a játékos-/labdadobozok kitakarva.
+    SEBESSÉG: fűmaszk esetén csak a fűzóna befoglaló téglalapján (+ a szűrők hatósugarán) számolunk –
+    a zónán kívül úgyis nincs vonal, a zónán belül az eredmény pixelre azonos a teljes képes számítással.
     """
     h, w = small_bgr.shape[:2]
+    zone = None
+    if grass_mask is not None:
+        kd = _odd(max(3, w / 300))
+        zone = cv2.dilate(grass_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kd, kd)))
+        x, y, bw, bh = cv2.boundingRect(zone)
+        if bw == 0 or bh == 0:
+            return np.zeros((h, w), np.uint8)
+        k = _odd(max(7, w / 55))
+        kb = _odd(max(15, w / 12))
+        pad = kb // 2 + k + 4        # a top-hat + a helyi zajszint ablakának hatósugara (a többi kisebb)
+        x0, y0 = max(0, x - pad), max(0, y - pad)
+        x1, y1 = min(w, x + bw + pad), min(h, y + bh + pad)
+        if (x1 - x0) * (y1 - y0) < 0.95 * w * h:
+            sl = (slice(y0, y1), slice(x0, x1))
+            out = np.zeros((h, w), np.uint8)
+            out[sl] = _line_mask_core(small_bgr[sl], zone[sl], None if box_mask is None else box_mask[sl],
+                                      None if hsv is None else hsv[sl], w, min_tophat, max_sat,
+                                      min_tophat_floor, adaptive)
+            return out
+    return _line_mask_core(small_bgr, zone, box_mask, hsv, w, min_tophat, max_sat, min_tophat_floor, adaptive)
+
+
+def _line_mask_core(small_bgr, zone, box_mask, hsv, w, min_tophat, max_sat, min_tophat_floor, adaptive):
+    """detect_line_mask számítása egy (kivágott) képrészen; w: a TELJES kép szélessége (a méretekhez)."""
     b, g, r = cv2.split(small_bgr)
     mn = cv2.min(cv2.min(b, g), r)
     k = _odd(max(7, w / 55))     # a legvastagabb (közeli) vonalnál szélesebb legyen
@@ -406,11 +432,9 @@ def detect_line_mask(small_bgr, grass_mask=None, box_mask=None, hsv=None, min_to
     mask = (line & (hsv[:, :, 1] <= max_sat)).astype(np.uint8) * 255
     glare = _glare_mask(mn, k)
     if glare is not None:
-        mask[glare > 0] = 0
-    if grass_mask is not None:
-        kd = _odd(max(3, w / 300))
-        zone = cv2.dilate(grass_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kd, kd)))
-        mask &= zone
+        mask = cv2.bitwise_and(mask, cv2.bitwise_not(glare))
+    if zone is not None:
+        mask = cv2.bitwise_and(mask, zone)
     if box_mask is not None:
         mask[box_mask > 0] = 0
     mask = _coherent(mask, sigma=max(1.5, w / 400.0))
@@ -463,7 +487,7 @@ def _keep_thin_components(mask, min_len=8, max_half_width=4.5):
     thick[np.unique(lab[dt > max_half_width])] = True
     keep = (length >= min_len) & ~thick
     keep[0] = False
-    return np.where(keep[lab], 255, 0).astype(np.uint8)
+    return _drop_components(mask.copy(), lab, stats, keep)
 
 
 # ---------------------------------------------------------------------------
@@ -481,8 +505,8 @@ class _LineField:
         self.observable = observable
         inv = cv2.compare(line_mask, 0, cv2.CMP_EQ)       # 255, ahol nincs vonal
         self.D = cv2.distanceTransform(inv, cv2.DIST_L2, 5).astype(np.float32)
-        self.gx = cv2.Sobel(self.D, cv2.CV_32F, 1, 0, ksize=3) / 8.0
-        self.gy = cv2.Sobel(self.D, cv2.CV_32F, 0, 1, ksize=3) / 8.0
+        self.gx = cv2.Sobel(self.D, cv2.CV_32F, 1, 0, ksize=3, scale=0.125)
+        self.gy = cv2.Sobel(self.D, cv2.CV_32F, 0, 1, ksize=3, scale=0.125)
         self.n_line = int(np.count_nonzero(line_mask))
         self._long = None
 
@@ -653,34 +677,46 @@ def refine_homography(field, G, pts, taus=(8.0, 4.0, 2.0), iters=6, prior=2e-2, 
     return G, info
 
 
+_RECALL_POLYS = None
+
+
 def line_recall(field, G, tol_px=3):
     """A felismert vonalpixelek mekkora része esik a vetített modellvonalak közelébe (0..1)."""
     if field.n_long == 0:
         return 0.0
+    global _RECALL_POLYS
+    if _RECALL_POLYS is None:
+        _RECALL_POLYS = _joined_polylines(pitch_polylines(0.5))
     model = np.zeros((field.h, field.w), np.uint8)
-    for poly in pitch_polylines(0.5):
-        uv, wz = project_points(G, poly)
-        _draw_projected(model, uv, wz, 255, 1)
+    uv, wz = project_points(G, _RECALL_POLYS)
+    _draw_projected(model, uv, wz, 255, 1)
     model = cv2.dilate(model, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * tol_px + 1, 2 * tol_px + 1)))
     return float(np.count_nonzero(model[field.long_mask > 0])) / field.n_long
 
 
+def _projected_runs(uv, wz, shift_scale=1.0, out=None):
+    """A vetített vonal kirajzolható szakaszai (int32 pontsorok): a kamera mögé eső (vagy
+    túl messzi) pontoknál a vonal megszakad. Vektorizált (SEBESSÉG: a régi pontonkénti ciklus helyett)."""
+    out = [] if out is None else out
+    lim = 1e5
+    ok = (wz > 1e-6) & (np.abs(uv[:, 0]) < lim) & (np.abs(uv[:, 1]) < lim)
+    if not ok.any():
+        return out
+    edges = np.flatnonzero(np.diff(np.concatenate(([0], ok.view(np.int8), [0]))))
+    pts = None
+    for s, e in zip(edges[0::2], edges[1::2]):
+        if e - s >= 2:
+            if pts is None:
+                pts = np.round(np.where(ok[:, None], uv, 0.0) * shift_scale).astype(np.int32)
+            out.append(pts[s:e])
+    return out
+
+
 def _draw_projected(img, uv, wz, color, thickness, lineType=cv2.LINE_8, shift_scale=1.0):
     """Vetített vonal kirajzolása; a kamera mögé eső pontoknál a vonal megszakad."""
-    ok = wz > 1e-6
-    lim = 1e5
-    run = []
-    for i in range(len(uv)):
-        if ok[i] and abs(uv[i, 0]) < lim and abs(uv[i, 1]) < lim:
-            run.append(uv[i])
-        else:
-            if len(run) >= 2:
-                cv2.polylines(img, [np.round(np.array(run) * shift_scale).astype(np.int32)], False,
-                              color, thickness, lineType)
-            run = []
-    if len(run) >= 2:
-        cv2.polylines(img, [np.round(np.array(run) * shift_scale).astype(np.int32)], False,
-                      color, thickness, lineType)
+    runs = _projected_runs(uv, wz, shift_scale)
+    if runs:
+        cv2.polylines(img, runs, False, color, thickness, lineType)
 
 
 def evaluate_fit(field, G, pts, tangents=None, step=0.5):
@@ -1643,9 +1679,19 @@ class RotationMotionEstimator:
         R1t = camera_rotation(x_prev[0], x_prev[1], x_prev[2]).T
         B = R1t @ K1inv           # az előző kép pixeléből világ-irány
 
+        def M_of(x2):
+            return camera_K(x_focal(x2), img_w, img_h) @ camera_rotation(x2[0], x2[1], x2[2]) @ B
+
         def pred(x2):
-            M = camera_K(x_focal(x2), img_w, img_h) @ camera_rotation(x2[0], x2[1], x2[2]) @ B
-            return _transform(M, p0f)
+            return _transform(M_of(x2), p0f)
+
+        def pred_batch(xs):
+            # SEBESSÉG: több állapot vetítése egy (kötegelt) mátrixszorzással (a numerikus Jacobi-hoz)
+            Ms = np.stack([M_of(x2) for x2 in xs])
+            X = np.matmul(p0f, Ms[:, :, :2].transpose(0, 2, 1)) + Ms[:, None, :, 2]
+            w = X[..., 2:3]
+            w = np.where(np.abs(w) < 1e-12, 1e-12, w)
+            return X[..., :2] / w
 
         x = np.asarray(x_pred, np.float64).copy()
         eps = np.array([1e-3, 1e-3, 1e-3, 1e-3])
@@ -1653,13 +1699,17 @@ class RotationMotionEstimator:
         for scale in (8.0, 4.0, 2.0, 1.0, 1.0):
             s = scale * sc
             for _ in range(2):
-                uv = pred(x)
-                r = (uv - p1f).ravel()
-                J = np.empty((len(r), 4))
+                xs = [x]
                 for j in range(4):
                     x2 = x.copy()
                     x2[j] += eps[j]
-                    J[:, j] = ((pred(x2) - p1f).ravel() - r) / eps[j]
+                    xs.append(x2)
+                U = pred_batch(xs)
+                uv = U[0]
+                r = (uv - p1f).ravel()
+                J = np.empty((len(r), 4))
+                for j in range(4):
+                    J[:, j] = ((U[j + 1] - p1f).ravel() - r) / eps[j]
                 e = np.repeat(np.linalg.norm((uv - p1f), axis=1), 2)
                 wgt = 1.0 / (1.0 + (e / s) ** 2)
                 A = J.T @ (J * wgt[:, None])
@@ -1710,6 +1760,37 @@ class RotationMotionEstimator:
 # A követő
 # ---------------------------------------------------------------------------
 
+class _LazyGrass:
+    """Egy képkocka HSV-képe és fűmaszkja, csak az első használatkor számolva (PitchTracker._prepare
+    lusta változata). main: a saját pálya füve (main_grass_mask) kell-e."""
+
+    def __init__(self, tracker, small, main):
+        self._t, self._small, self.main = tracker, small, main
+        self._hsv = self._grass = None
+        self.computed = False
+
+    def _compute(self):
+        t = self._t
+        hsv = cv2.cvtColor(self._small, cv2.COLOR_BGR2HSV)
+        grass, _ = build_grass_mask(hsv, t.grass_lower, t.grass_upper, scale=1.0)
+        t._grass_raw = not self.main
+        if self.main:
+            grass = t._main_grass(hsv, grass)
+        self._hsv, self._grass, self.computed = hsv, grass, True
+
+    @property
+    def hsv(self):
+        if not self.computed:
+            self._compute()
+        return self._hsv
+
+    @property
+    def grass(self):
+        if not self.computed:
+            self._compute()
+        return self._grass
+
+
 class PitchTracker:
     """
     Képkockánkénti homográfia mozgó kamerához.
@@ -1735,7 +1816,7 @@ class PitchTracker:
 
     def __init__(self, frame_size, grass_lower=None, grass_upper=None, H0=None, proc_width=640,
                  line_width=960, refine_every=3, auto_init=True, auto_init_every=50, auto_init_max_every=500, max_lost=15,
-                 relocalize_after=75, min_conf=0.35, refine_gain=0.5):
+                 relocalize_after=75, min_conf=0.35, refine_gain=0.5, refine_max_every=5):
         self.W, self.H = int(frame_size[0]), int(frame_size[1])
         self.s = min(1.0, float(proc_width) / max(1, self.W))
         self.ws, self.hs = int(round(self.W * self.s)), int(round(self.H * self.s))
@@ -1755,6 +1836,19 @@ class PitchTracker:
         self.grass_lower = np.minimum(np.asarray(grass_lower), DEFAULT_GRASS_HSV[0])
         self.grass_upper = np.maximum(np.asarray(grass_upper), DEFAULT_GRASS_HSV[1])
         self.refine_every = max(1, int(refine_every))
+        # SEBESSÉG – adaptív finomítás (kamera mód): stabil követésnél (a vonalak rendre megerősítik a
+        # mozgás-előrejelzést) a vonal-illesztés ritkul refine_every-ről legfeljebb refine_max_every
+        # képkockára; bármilyen gyanús jelnél (rossz illesztés, nagy újítás, gyors pásztázás, sikertelen
+        # mozgásbecslés) azonnal visszaáll. refine_max_every = refine_every: a régi, rögzített ütemezés.
+        self.refine_max_every = max(self.refine_every, int(refine_max_every or self.refine_every))
+        self.refine_interval = self.refine_every   # a jelenlegi finomítási köz (képkocka)
+        # SEBESSÉG: a jellemzőpont-maszk fűzónája csak ennyi képkockánként (lásd _feature_grass_zone)
+        self.feature_grass_every = 3
+        self._feat_zone, self._feat_zone_frame, self._feat_zone_main = None, -10 ** 9, None
+        self.stable_conf = 0.8          # ennél nagyobb bizalom kell a ritkításhoz
+        self.stable_innovation = 4.0    # ... és ennél kisebb újítás (Mahalanobis², az előrejelzéshez képest)
+        self.stable_pan_deg = 0.5       # ... és ennél lassabb pásztázás / dőlés (fok / képkocka)
+        self.stable_zoom = 0.6          # ... és zoom (100·ln f / képkocka)
         self.main_grass_only = True   # a kerítés mögötti másik pálya füvét / vonalait kizárjuk (main_grass_mask)
         self._hue_model = None
         self._hue_model_frame = -10 ** 9
@@ -1882,6 +1976,7 @@ class PitchTracker:
             self.C_prior_info = np.eye(3) / C_sigma ** 2
             self.keyframes = []
         self.v = np.zeros(4)
+        self.refine_interval = self.refine_every
         self._update_G()
 
     def _update_G(self):
@@ -1930,6 +2025,13 @@ class PitchTracker:
             grass = self._main_grass(hsv, grass)
         return small, gray, hsv, grass
 
+    def _prepare_lazy(self, frame, main=True):
+        """SEBESSÉG: mint a _prepare, de a HSV-kép és a fűmaszk csak első használatkor készül
+        (_LazyGrass) – a köztes képkockákon a jellemzőpont-maszk a gyorsítótárazott fűzónát használja."""
+        small = cv2.resize(frame, (self.ws, self.hs), interpolation=cv2.INTER_AREA) if self.s < 1.0 else frame
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        return small, gray, _LazyGrass(self, small, main)
+
     def _main_grass(self, hsv, grass):
         if self.main_grass_only and grass is not None:
             # az árnyalat-modellt ritkán frissítjük (olcsóbb, és nem ugrál képkockánként)
@@ -1969,7 +2071,9 @@ class PitchTracker:
         return _LineField(mask, obs)
 
     def _feature_mask(self, grass, box_mask):
-        if grass is None:
+        if isinstance(grass, _LazyGrass):
+            m = self._feature_grass_zone(grass)
+        elif grass is None:
             m = np.full((self.hs, self.ws), 255, np.uint8)
         else:
             kd = _odd(max(9, self.ws / 30))
@@ -1979,11 +2083,30 @@ class PitchTracker:
             # (eredményjelző) és a horizont feletti részek nem a kamera forgásával mozognak
             g = self._ground_region_mask()
             if g is not None:
-                m2 = m & g
-                if np.count_nonzero(m2) > 0.05 * m2.size:
+                m2 = cv2.bitwise_and(m, g)
+                if cv2.countNonZero(m2) > 0.05 * m2.size:
                     m = m2
-        m[box_mask > 0] = 0
+        if box_mask is not None and box_mask.any():
+            m[box_mask > 0] = 0
         return m
+
+    def _feature_grass_zone(self, src):
+        """
+        A jellemzőpont-maszk fűzónája (a fűmaszk erősen – ws/30 px-lel – tágítva). SEBESSÉG: csak
+        feature_grass_every képkockánként (vagy ha a fűmaszk az adott képkockán úgyis elkészült)
+        számoljuk újra; a tágítás miatt az 1–2 képkockás késés a sarokpontok kiválasztásán nem látszik.
+        """
+        stale = (self._feat_zone is None or src.computed or src.main != self._feat_zone_main
+                 or self.frame_idx - self._feat_zone_frame >= self.feature_grass_every)
+        if stale:
+            grass = src.grass
+            if grass is None:
+                z = np.full((self.hs, self.ws), 255, np.uint8)
+            else:
+                kd = _odd(max(9, self.ws / 30))
+                z = cv2.dilate(grass, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kd, kd)))
+            self._feat_zone, self._feat_zone_frame, self._feat_zone_main = z, self.frame_idx, src.main
+        return self._feat_zone.copy()
 
     def _ground_region_mask(self, margin=4.0, cell=4):
         """A pálya (+ margin m) talajsík-tartománya a feldolgozási képen (255), a jelenlegi G alapján."""
@@ -2012,7 +2135,7 @@ class PitchTracker:
     def update(self, frame, boxes=None):
         """Egy képkocka feldolgozása. Visszatér: (H_t vagy None, minőség-szótár)."""
         self.frame_idx += 1
-        small, gray, hsv, grass = self._prepare(frame, main=self.G is not None)
+        small, gray, src = self._prepare_lazy(frame, main=self.G is not None)
         box_mask = _boxes_mask(gray.shape, boxes, self.s)
         q = {"frame": self.frame_idx, "refined": False, "motion_ok": None, "refine_tried": False}
 
@@ -2025,26 +2148,29 @@ class PitchTracker:
             else:
                 motion_failed = not self._propagate_homography(gray, q)
         self.prev_gray = gray
-        self.prev_mask = self._feature_mask(grass, box_mask)
+        self.prev_mask = self._feature_mask(src, box_mask)
 
         field = None
         # 2) Sodródás-javítás és önellenőrzés a vonalakkal
         if self.G is not None:
             self.since_refine += 1
             self.since_verified += 1
-            need = (self.since_refine >= self.refine_every or motion_failed or self.lost > 0
+            if motion_failed:
+                self.refine_interval = self.refine_every
+            need = (self.since_refine >= self.refine_interval or motion_failed or self.lost > 0
                     or self.conf < max(self.min_conf, self.conf_ok if self.mode == "kamera" else -1.0)
                     or self.bad_streak > 0)
             if need:
-                field = self._line_field(frame, small, hsv, grass, box_mask, boxes)
+                field = self._line_field(frame, small, src.hsv, src.grass, box_mask, boxes)
                 if self.mode == "kamera":
                     self._check_pose(field, q)
+                    self._schedule_refine(q)
                 else:
                     self._refine(field, q, wide=self.lost > 0)
             if self.mode == "kamera" and (self.bad_streak >= 4 or self.lost > self.max_lost) \
                     and self.frame_idx - self.last_reloc_try >= self._reloc_wait:
                 if field is None:
-                    field = self._line_field(frame, small, hsv, grass, box_mask, boxes)
+                    field = self._line_field(frame, small, src.hsv, src.grass, box_mask, boxes)
                 self._relocalize(field, q)
             if self.lost > self.relocalize_after or (self.mode == "kamera" and self.bad_streak > self.relocalize_after):
                 if self.mode == "kamera" and self.manual_prior is not None:
@@ -2063,13 +2189,13 @@ class PitchTracker:
             due = since is None or since >= self._auto_wait
             if not due and since >= self.promise_every and since % self.promise_every == 0:
                 if field is None:
-                    field = self._line_field(frame, small, hsv, grass, box_mask, boxes)
+                    field = self._line_field(frame, small, src.hsv, src.grass, box_mask, boxes)
                 if self._looks_promising(field):
                     due = True
                     q["auto_promising"] = True
             if due:
                 if field is None:
-                    field = self._line_field(frame, small, hsv, grass, box_mask, boxes)
+                    field = self._line_field(frame, small, src.hsv, src.grass, box_mask, boxes)
                 self._auto_attempt(field, q)
 
         q["lost"] = self.lost
@@ -2094,7 +2220,37 @@ class PitchTracker:
         q["status"] = STATUS_OK
         return self.current_H(), q
 
+    def _schedule_refine(self, q):
+        """
+        Adaptív finomítási ütemezés (a vonal-ellenőrzés után): ha a vonalak megerősítették az
+        előrejelzést (elfogadott, jó illesztés, magas bizalom, kis újítás) és a kamera lassan mozog,
+        a következő ellenőrzésig eggyel több képkocka telik el; minden más esetben azonnal vissza a
+        refine_every-re. A felső korlát a kamera sebességétől függ: lassú mozgásnál refine_max_every,
+        közepesnél (legfeljebb a küszöb kétszerese) a kettő közti érték, gyors pásztázásnál / zoomnál
+        refine_every. A két ellenőrzés közti képkockákon a fizikai kameramodell mozgásbecslése
+        (előrejelzés) adja az állást.
+        """
+        v = np.abs(self.v) if self.v is not None else np.zeros(4)
+        rec = q.get("recall")
+        stable = (bool(q.get("refined")) and self.since_verified == 0 and self.bad_streak == 0
+                  and self.lost == 0 and self.conf >= self.stable_conf
+                  and float(q.get("innovation", np.inf)) <= self.stable_innovation
+                  and (rec is None or rec >= self.min_recall))
+        speed = max(max(v[0], v[1]) / self.stable_pan_deg, v[3] / self.stable_zoom)
+        if speed <= 1.0:
+            cap = self.refine_max_every
+        elif speed <= 2.0:
+            cap = (self.refine_every + self.refine_max_every) // 2
+        else:
+            cap = self.refine_every
+        if stable and cap > self.refine_every:
+            self.refine_interval = min(cap, self.refine_interval + 1)
+        else:
+            self.refine_interval = self.refine_every
+        q["refine_interval"] = self.refine_interval
+
     def _reset(self):
+        self.refine_interval = self.refine_every
         self.G = None
         self.x = None
         self.C = None
@@ -2108,7 +2264,7 @@ class PitchTracker:
         # a visszalépés szintje (self._auto_wait) megmarad: a sikertelen próbálkozások nem halmozódnak
 
     _STATE_KEYS = ("mode", "x", "C", "P", "v", "G", "source", "conf", "lost", "bad_streak", "since_refine",
-                   "since_verified", "keyframes", "C_calib", "C_prior_info")
+                   "since_verified", "keyframes", "C_calib", "C_prior_info", "refine_interval")
 
     def _snapshot(self):
         import copy
@@ -2424,6 +2580,7 @@ class PitchTracker:
         self.bad_streak = 0
         self.since_verified = 0
         self._update_G()
+        self.refine_interval = self.refine_every
         q["relocalize"]["accepted"] = True
         return True
 
@@ -2562,7 +2719,7 @@ def draw_pitch_overlay(frame, H, color=(255, 255, 0), alpha=0.45, thickness=1):
     if H is None:
         return frame
     if _OVERLAY_POLYS is None:
-        _OVERLAY_POLYS = pitch_polylines(0.5)
+        _OVERLAY_POLYS = _joined_polylines(pitch_polylines(0.5))
     try:
         G = np.linalg.inv(np.asarray(H, np.float64))
     except np.linalg.LinAlgError:
@@ -2570,12 +2727,26 @@ def draw_pitch_overlay(frame, H, color=(255, 255, 0), alpha=0.45, thickness=1):
     h, w = frame.shape[:2]
     # a homográfia előjele tetszőleges (pl. H[2,2] = 1-re normálva): a kamera előtti pontokhoz w > 0 kell
     G = orient_G(G, w, h)
+    # SEBESSÉG: az összes vonal egy vetítéssel és egy rajzolással; a keverés csak a vonal-pixeleken
+    uv, wz = project_points(G, _OVERLAY_POLYS)
+    runs = _projected_runs(uv, wz)
+    if not runs:
+        return frame
     mask = np.zeros((h, w), np.uint8)
-    for poly in _OVERLAY_POLYS:
-        uv, wz = project_points(G, poly)
-        _draw_projected(mask, uv, wz, 255, thickness, cv2.LINE_AA)
-    sel = mask > 0
-    if np.any(sel):
-        a = (mask[sel].astype(np.float32) / 255.0 * alpha)[:, None]
-        frame[sel] = (frame[sel].astype(np.float32) * (1 - a) + np.array(color, np.float32) * a).astype(np.uint8)
+    cv2.polylines(mask, runs, False, 255, thickness, cv2.LINE_AA)
+    nz = cv2.findNonZero(mask)
+    if nz is not None:
+        nz = nz.reshape(-1, 2)
+        xs, ys = nz[:, 0], nz[:, 1]
+        a = (mask[ys, xs].astype(np.float32) / 255.0 * alpha)[:, None]
+        frame[ys, xs] = (frame[ys, xs].astype(np.float32) * (1 - a) + np.array(color, np.float32) * a).astype(np.uint8)
     return frame
+
+
+def _joined_polylines(polys):
+    """A vonalak egy tömbben, köztük NaN elválasztóval (a vetítés után ott megszakad a rajz)."""
+    sep = np.full((1, 2), np.nan)
+    parts = []
+    for p in polys:
+        parts += [np.asarray(p, np.float64), sep]
+    return np.concatenate(parts[:-1]) if parts else np.zeros((0, 2))

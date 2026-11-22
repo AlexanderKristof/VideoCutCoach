@@ -119,6 +119,65 @@ def test_stage_timer():
     assert "ms/képkocka" in format_timing(s)
 
 
+def test_stage_timer_overlapped_stage():
+    """A háttérszálon, átfedve futó szakasz (pitch_overlap) nem számít a falióra-idő felosztásába."""
+    import time
+    t = StageTimer()
+    with t("detect"):
+        time.sleep(0.02)
+    t.add("pitch_overlap", 0.5)        # a felismeréssel egy időben futott
+    t.frames = 1
+    t.stop()
+    s = t.summary()
+    shares = sum(v["share_pct"] for k, v in s["stages"].items() if k != "pitch_overlap")
+    assert abs(shares - 100.0) < 1.0, shares
+    assert "átfedve" not in t.one_line() and "átfedve" not in format_timing(s)
+    assert "átfedve" in t.table_text()
+
+
+def test_frame_prefetcher_matches_direct_read():
+    """A külön szálon előolvasott képkockák sorrendje és tartalma azonos a közvetlen cap.read()-del."""
+    import cv2
+    import video_writer
+    d = tempfile.mkdtemp(prefix="pf_")
+    try:
+        path = os.path.join(d, "t.avi")
+        vw = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"MJPG"), 25, (64, 48))
+        for i in range(23):
+            vw.write(np.full((48, 64, 3), (i * 10) % 256, np.uint8))
+        vw.release()
+        cap = cv2.VideoCapture(path)
+        direct = []
+        while True:
+            ok, fr = cap.read()
+            if not ok:
+                break
+            direct.append(fr)
+        cap.release()
+        assert len(direct) == 23, len(direct)
+        cap = cv2.VideoCapture(path)
+        r = video_writer.FramePrefetcher(cap, queue_size=3)
+        got = []
+        while True:
+            ok, fr = r.read()
+            if not ok:
+                break
+            got.append(fr)
+        assert r.read() == (False, None)
+        r.close()
+        cap.release()
+        assert len(got) == len(direct) and all(np.array_equal(a, b) for a, b in zip(got, direct))
+        # korai leállítás (pl. megszakított elemzés): a szál leáll, nem akad el a teli soron
+        cap = cv2.VideoCapture(path)
+        r = video_writer.FramePrefetcher(cap, queue_size=2)
+        r.read()
+        r.close()
+        assert not r._thread.is_alive()
+        cap.release()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_video_writer_scale():
     ff = shutil.which("ffmpeg")
     if not ff:
