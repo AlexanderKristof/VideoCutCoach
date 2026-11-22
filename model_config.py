@@ -117,7 +117,7 @@ def load_model_config(config_path=None, env=None):
 
     if config_path and os.path.isfile(config_path):
         try:
-            with open(config_path, "r", encoding="utf-8") as f:
+            with open(config_path, "r", encoding="utf-8-sig") as f:  # utf-8-sig: a PowerShell Set-Content BOM-mal ír
                 data = json.load(f)
             if not isinstance(data, dict):
                 raise ValueError("a fájl gyökere nem JSON objektum")
