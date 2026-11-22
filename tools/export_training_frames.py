@@ -26,6 +26,7 @@ import argparse
 import csv
 import glob
 import os
+import time
 import sys
 
 import cv2
@@ -91,7 +92,20 @@ def scan_video(path, every_sec=2.0, skip_start=0.0, skip_end=0.0, min_sharpness=
     cands, kept_hashes, prev_thumb = [], [], None
     n_blur = n_dup = 0
     idx = first
+    end = last if last is not None else total
+    t0 = time.time()
+    next_report = t0 + 5.0
+    log(f"{os.path.basename(path)}: átnézés ({(end - first) // step if end else '?'} jelölt képkocka, "
+        f"{every_sec:g} mp-enként)…")
     while last is None or idx < last:
+        now = time.time()
+        if now >= next_report and end and end > first:
+            # haladás 5 mp-enként, hogy látsszon: dolgozik (egy meccs pár perc)
+            done = (idx - first) / (end - first)
+            eta = (now - t0) * (1 - done) / done if done > 0.01 else None
+            log(f"   {100 * done:4.0f}%  ({idx / fps / 60:.0f}. perc"
+                + (f", kb. {eta / 60:.1f} perc van hátra" if eta is not None else "") + ")")
+            next_report = now + 5.0
         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ok, frame = cap.read()
         if not ok:
@@ -118,7 +132,8 @@ def export(videos, out_dir, per_video=150, every_sec=2.0, skip_start=0.0, skip_e
     img_dir = os.path.join(out_dir, "kepek")
     os.makedirs(img_dir, exist_ok=True)
     rows = []
-    for vp in videos:
+    for n, vp in enumerate(videos, 1):
+        log(f"[{n}/{len(videos)}] {vp}")
         cands = scan_video(vp, every_sec, skip_start, skip_end, min_sharpness, dedupe_bits, log)
         if not cands:
             continue
@@ -127,6 +142,7 @@ def export(videos, out_dir, per_video=150, every_sec=2.0, skip_start=0.0, skip_e
                                  [c["brightness"] / bmax, min(1.0, c["motion"] / 4.0) * 0.5]]) for c in cands]
         sel = farthest_point_select(feats, per_video, seed)
         stem = os.path.splitext(os.path.basename(vp))[0].replace(" ", "_")
+        log(f"  mentés: {len(sel)} kép…")
         cap = cv2.VideoCapture(vp)
         for i in sel:
             c = cands[i]
