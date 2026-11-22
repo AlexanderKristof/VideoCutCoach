@@ -29,3 +29,16 @@ maui/**/bin/
 maui/**/obj/
 maui/**/.vs/
 *.csproj.user
+
+# Helyi, gépenként más adatok (nem kerülnek a repóba): elemzések, fiókok, tanító adatok és környezet
+clips/
+boards/
+tactical_app.db
+model_config.json
+model_config.regi.json
+tanito/
+elocimke/
+export/
+adat_rfdetr/
+futasok/
+venv-tanitas/
