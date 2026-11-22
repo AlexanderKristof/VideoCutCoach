@@ -4,7 +4,7 @@ A gép által javasolt keretek – **neked csak javítanod kell**, nem nulláró
 
 - Készült: YOLOX-m (Apache-2.0) csempés felismeréssel eredeti felbontáson (`tools/prelabel.py --csempe 640`),
   utána a kerítés előtti nézősor automatikusan kiszűrve (a fűterület felső széle alapján).
-- Tartalom: 1641 keret – 1522 `player`, 119 `ball` (a labdák egy része téves lehet: fej, pálya-jelölés).
+- Tartalom: 1641 keret – 1517 `player`, 124 `ball` (a labdák egy része téves lehet: fej, pálya-jelölés).
 - Mindenki `player`: a **kapusokat** és a **bírókat** neked kell átcímkézni.
 
 ## Betöltés CVAT-ba
