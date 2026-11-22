@@ -1,0 +1,100 @@
+﻿<?xml version="1.0" encoding="utf-8" ?>
+<ContentPage xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+             x:Class="TacticalAnalyzer.MainPage"
+             Title="Tactical Analyzer - Vágó és Kalibráló"
+             BackgroundColor="#121212">
+
+    <ScrollView>
+        <VerticalStackLayout Padding="20" Spacing="15">
+
+            <HorizontalStackLayout Spacing="10">
+                <Button Text="1. Videó kiválasztása" Clicked="OnLoadVideoClicked" BackgroundColor="#2196F3" />
+                <Label x:Name="SelectedFileLabel" Text="Nincs videó kiválasztva" VerticalOptions="Center" FontAttributes="Bold" TextColor="White" />
+            </HorizontalStackLayout>
+
+            <HorizontalStackLayout Spacing="10">
+                <Label Text="Képkocka ideje (p:mp):" VerticalOptions="Center" TextColor="White" />
+                <Entry x:Name="CalibTimeEntry" Text="0:00" WidthRequest="100" TextColor="White" BackgroundColor="#333333" />
+                <Button Text="2. Képkocka Betöltése" Clicked="OnLoadFrameClicked" BackgroundColor="#2196F3" />
+            </HorizontalStackLayout>
+
+            <Frame BackgroundColor="#1E1E1E" BorderColor="#4CAF50" Padding="15" CornerRadius="8">
+                <VerticalStackLayout Spacing="10">
+                    <Label x:Name="WizardInstructionLabel" 
+                           Text="👋 Üdv! Tölts be egy képkockát, majd válaszd ki a 'Fű (Pálya)' gombot a kezdéshez!" 
+                           TextColor="White" FontSize="16" FontAttributes="Bold" HorizontalOptions="Center" />
+
+                    <Button x:Name="BtnNextStep" 
+                            Text="✅ Kész! (Mentés)" 
+                            BackgroundColor="#4CAF50" 
+                            FontAttributes="Bold" 
+                            HorizontalOptions="Center" 
+                            Padding="30,5"
+                            IsVisible="False" 
+                            Clicked="OnNextStepClicked" />
+                </VerticalStackLayout>
+            </Frame>
+
+            <HorizontalStackLayout Spacing="10">
+                <Button x:Name="BtnCalibGrass" Text="Fű (Pálya)" BackgroundColor="#4CAF50" Clicked="OnSelectCalibModeClicked"/>
+                <Button x:Name="BtnCalibRef" Text="Bíró" BackgroundColor="#FFEB3B" TextColor="Black" Clicked="OnSelectCalibModeClicked"/>
+                <Button x:Name="BtnCalibTeam1" Text="Csapat 1" BackgroundColor="#1976D2" Clicked="OnSelectCalibModeClicked"/>
+                <Button x:Name="BtnCalibTeam2" Text="Csapat 2" BackgroundColor="#D32F2F" Clicked="OnSelectCalibModeClicked"/>
+                <Button x:Name="BtnCalibKeeper1" Text="Kapus 1" BackgroundColor="#F57C00" Clicked="OnSelectCalibModeClicked"/>
+                <Button x:Name="BtnCalibKeeper2" Text="Kapus 2" BackgroundColor="#9C27B0" Clicked="OnSelectCalibModeClicked"/>
+                <Button x:Name="BtnCalibPitch" Text="Pálya sarkai (4 pont)" BackgroundColor="#607D8B" Clicked="OnSelectCalibModeClicked"/>
+            </HorizontalStackLayout>
+
+            <HorizontalStackLayout Spacing="20">
+                <Label x:Name="ActiveCalibModeLabel" Text="Aktuális Mód: Nincs" VerticalOptions="Center" FontAttributes="Bold" TextColor="White"/>
+                <Button Text="↩ Utolsó Jelölés Törlése" BackgroundColor="#757575" Clicked="OnUndoMarkerClicked"/>
+                <Label x:Name="StatusLabel" Text="Készen áll" VerticalOptions="Center" TextColor="LightGray"/>
+            </HorizontalStackLayout>
+
+            <AbsoluteLayout x:Name="ImageOverlayContainer" WidthRequest="1000" HeightRequest="562" BackgroundColor="Black" HorizontalOptions="Start">
+                <AbsoluteLayout.GestureRecognizers>
+                    <TapGestureRecognizer Tapped="OnCalibrationImageTapped" />
+                </AbsoluteLayout.GestureRecognizers>
+                <Image x:Name="DynamicCalibImage" Aspect="AspectFit" AbsoluteLayout.LayoutBounds="0,0,1,1" AbsoluteLayout.LayoutFlags="All" />
+
+                <GraphicsView x:Name="PitchCornerCanvas" InputTransparent="True" AbsoluteLayout.LayoutBounds="0,0,1,1" AbsoluteLayout.LayoutFlags="All" />
+
+                <BoxView x:Name="HorizonMaskView" Color="#A6000000" InputTransparent="True" IsVisible="False" AbsoluteLayout.LayoutBounds="0,0,1,0.3" AbsoluteLayout.LayoutFlags="All" />
+                <BoxView x:Name="BenchMaskView" Color="#A6000000" InputTransparent="True" IsVisible="False" AbsoluteLayout.LayoutBounds="0,1,1,0.1" AbsoluteLayout.LayoutFlags="All" />
+            </AbsoluteLayout>
+
+            <HorizontalStackLayout Spacing="10" Margin="0,10,0,0">
+                <Label Text="Vágás kezdete (p:mp):" VerticalOptions="Center" TextColor="White" />
+                <Entry x:Name="StartTimeEntry" Text="0:00" WidthRequest="60" TextColor="White" BackgroundColor="#333333" />
+                <Label Text="Vége:" VerticalOptions="Center" TextColor="White" />
+                <Entry x:Name="EndTimeEntry" Text="0:10" WidthRequest="60" TextColor="White" BackgroundColor="#333333" />
+
+                <Label Text="Kizárás fentről:" VerticalOptions="Center" Margin="10,0,0,0" TextColor="White" />
+                <Slider x:Name="HorizonSlider" Minimum="0.0" Maximum="0.5" Value="0.25" WidthRequest="100" VerticalOptions="Center" ValueChanged="OnSlidersChanged" />
+
+                <Label Text="Kizárás alulról:" VerticalOptions="Center" Margin="10,0,0,0" TextColor="White" />
+                <Slider x:Name="BottomSlider" Minimum="0.0" Maximum="0.5" Value="0.10" WidthRequest="100" VerticalOptions="Center" ValueChanged="OnSlidersChanged" />
+
+                <Label Text="Debug:" VerticalOptions="Center" Margin="10,0,0,0" TextColor="White" />
+                <Switch x:Name="AiSwitch" IsToggled="True" />
+            </HorizontalStackLayout>
+
+            <Button Text="3. Videó Elemzése és Vágása" BackgroundColor="#E91E63" FontAttributes="Bold" Clicked="OnCutSceneClicked" />
+
+            <Button x:Name="BtnSaveMatch" Text="4. Meccs Mentése" BackgroundColor="#00897B" FontAttributes="Bold"
+                    IsVisible="False" Clicked="OnSaveMatchClicked" />
+            <Label x:Name="SaveMatchStatusLabel" TextColor="LightGray" HorizontalOptions="Center" IsVisible="False" />
+
+            <VerticalStackLayout x:Name="ProgressLayout" Spacing="5" IsVisible="False">
+                <ProgressBar x:Name="AnalysisProgressBar" Progress="0" ProgressColor="#E91E63" HeightRequest="10" />
+                <Label x:Name="ProgressTextLabel" Text="Feldolgozás: 0%" TextColor="White" HorizontalOptions="Center" FontSize="14" />
+            </VerticalStackLayout>
+
+            <ScrollView Orientation="Horizontal" Margin="0,10,0,0">
+                <HorizontalStackLayout x:Name="TimelineContainer" Spacing="10" />
+            </ScrollView>
+
+        </VerticalStackLayout>
+    </ScrollView>
+</ContentPage>

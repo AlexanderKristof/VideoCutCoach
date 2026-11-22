@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<Shell
+    x:Class="TacticalAnalyzer.AppShell"
+    xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+    xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+    xmlns:local="clr-namespace:TacticalAnalyzer">
+
+    <TabBar>
+        <Tab Title="Mezőny Taktika">
+            <ShellContent
+                ContentTemplate="{DataTemplate local:MainPage}"
+                Route="MainPage" />
+        </Tab>
+
+        <Tab Title="Kapus Modul">
+            <ShellContent
+                ContentTemplate="{DataTemplate local:GoalkeeperPage}"
+                Route="GoalkeeperPage" />
+        </Tab>
+    </TabBar>
+
+</Shell>

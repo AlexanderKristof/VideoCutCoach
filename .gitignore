@@ -25,3 +25,7 @@ models/
 packaging/build/
 packaging/dist/
 packaging/.venv*/
+maui/**/bin/
+maui/**/obj/
+maui/**/.vs/
+*.csproj.user

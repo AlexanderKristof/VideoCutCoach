@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<ContentPage xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+             xmlns:toolkit="http://schemas.microsoft.com/dotnet/2022/maui/toolkit"
+             x:Class="TacticalAnalyzer.GoalkeeperPage"
+             Title="Cloud AI Kapus Modul"
+             BackgroundColor="#121212">
+
+    <ScrollView>
+        <VerticalStackLayout Padding="20" Spacing="15">
+
+            <Label Text="Cloud AI Kapus &amp; Meccs Elemző"
+                   FontSize="22"
+                   FontAttributes="Bold"
+                   TextColor="#4CAF50"
+                   HorizontalOptions="Center" />
+
+            <Border Stroke="#333333" StrokeThickness="1" StrokeShape="RoundRectangle 8" Padding="15" BackgroundColor="#1E1E1E">
+                <VerticalStackLayout Spacing="15">
+
+                    <Button Text="Meccsvideó kiválasztása"
+                            Clicked="OnPickVideoClicked"
+                            BackgroundColor="#2196F3"
+                            TextColor="White"
+                            FontAttributes="Bold"
+                            HeightRequest="48" />
+
+                    <Label x:Name="SelectedVideoLabel" Text="Nincs videó kiválasztva" TextColor="#CCCCCC" FontSize="12" />
+
+                    <BoxView HeightRequest="1" Color="#333333" />
+
+                    <VerticalStackLayout x:Name="ManualTimeContainer" Spacing="10">
+                        <Label Text="Időalapú Vágás" FontSize="14" FontAttributes="Bold" TextColor="#AAAAAA" />
+
+                        <Grid ColumnDefinitions="*, *" ColumnSpacing="15">
+                            <VerticalStackLayout Grid.Column="0">
+                                <Label Text="Kezdet (mp vagy p:mp):" FontSize="11" TextColor="Gray" />
+                                <Entry x:Name="StartTimeEntry" Text="18:00" HorizontalTextAlignment="Center" TextColor="White" BackgroundColor="#2A2A2A" />
+                            </VerticalStackLayout>
+                            <VerticalStackLayout Grid.Column="1">
+                                <Label Text="Vége (mp vagy p:mp):" FontSize="11" TextColor="Gray" />
+                                <Entry x:Name="EndTimeEntry" Text="20:25" HorizontalTextAlignment="Center" TextColor="White" BackgroundColor="#2A2A2A" />
+                            </VerticalStackLayout>
+                        </Grid>
+
+                        <Button x:Name="LoadClipButton"
+                                Text="🔴 1. Kézi Jelenet Betöltése"
+                                Clicked="OnLoadClipClicked"
+                                BackgroundColor="#D32F2F"
+                                TextColor="White"
+                                FontAttributes="Bold"
+                                HeightRequest="48" />
+                    </VerticalStackLayout>
+
+                    <HorizontalStackLayout Spacing="10" Margin="0, 10, 0, 0" HorizontalOptions="Start">
+                        <Switch x:Name="DevModeSwitch" OnColor="#4CAF50" />
+                        <Label Text="Fejlesztői Nézet (YOLO Bounding Boxok beégetése)" VerticalOptions="Center" TextColor="#AAAAAA" />
+                    </HorizontalStackLayout>
+
+                    <VerticalStackLayout Spacing="10">
+                        <BoxView HeightRequest="1" Color="#333333" />
+                        <Label Text="Automatikus AI Elemzés" FontSize="14" FontAttributes="Bold" TextColor="#AAAAAA" />
+
+                        <Button x:Name="AiAnalyzeButton"
+                                Text="🤖 Cloud AI Kapus Keresés"
+                                Clicked="OnAiAnalyzeClicked"
+                                BackgroundColor="#FF9800"
+                                TextColor="Black"
+                                FontAttributes="Bold"
+                                HeightRequest="48" />
+
+                        <Button x:Name="CancelAiButton"
+                                Text="🛑 AI Keresés Leállítása"
+                                Clicked="OnCancelAiClicked"
+                                BackgroundColor="#7F0000"
+                                TextColor="White"
+                                FontAttributes="Bold"
+                                HeightRequest="48"
+                                IsVisible="False" />
+                    </VerticalStackLayout>
+
+                </VerticalStackLayout>
+            </Border>
+
+            <ActivityIndicator x:Name="GkLoadingIndicator" IsRunning="False" IsVisible="False" Color="#4CAF50" />
+            <Label x:Name="StatusLabel" TextColor="#FFB300" FontSize="14" FontAttributes="Bold" HorizontalOptions="Center" />
+
+            <Border x:Name="PlayerBorder" IsVisible="False" Stroke="#444444" StrokeThickness="2" HeightRequest="400">
+                <Grid>
+                    <toolkit:MediaElement x:Name="ClipVideoPlayer" ShouldAutoPlay="False" ShouldShowPlaybackControls="True" Aspect="AspectFit" />
+                    <GraphicsView x:Name="DrawingCanvasView" InputTransparent="True" StartInteraction="OnDrawingStart" DragInteraction="OnDrawingDrag" EndInteraction="OnDrawingEnd" />
+                </Grid>
+            </Border>
+
+            <Border x:Name="ControlsBorder" IsVisible="False" Stroke="#333333" StrokeShape="RoundRectangle 8" Padding="10" BackgroundColor="#1E1E1E">
+                <HorizontalStackLayout Spacing="10" HorizontalOptions="Center">
+                    <Button x:Name="ToggleDrawingButton" Text="Rajzolás: KIKAPCSOLVA" Clicked="OnToggleDrawingClicked" BackgroundColor="#424242" TextColor="White" FontAttributes="Bold" />
+                    <Button x:Name="BtnLine" Text="Vonal" Clicked="OnToolLineClicked" BackgroundColor="#FFC107" TextColor="Black" FontAttributes="Bold" IsEnabled="False" />
+                    <Button x:Name="BtnCircle" Text="Kör" Clicked="OnToolCircleClicked" BackgroundColor="#333333" TextColor="White" IsEnabled="False" />
+                    <Button x:Name="BtnArrow" Text="Nyíl" Clicked="OnToolArrowClicked" BackgroundColor="#333333" TextColor="White" IsEnabled="False" />
+                    <Button Text="Törlés" Clicked="OnClearDrawingsClicked" BackgroundColor="#D32F2F" TextColor="White" />
+                </HorizontalStackLayout>
+            </Border>
+
+            <Border x:Name="IntegrateBorder" IsVisible="False" Stroke="#4CAF50" StrokeThickness="2" StrokeShape="RoundRectangle 8" Padding="15" BackgroundColor="#1A2E1A">
+                <Button Text="🚀 Vonalak Beégetése az MP4-be" Clicked="OnIntegrateAndExportClicked" BackgroundColor="#4CAF50" TextColor="White" FontAttributes="Bold" HeightRequest="50" />
+            </Border>
+
+        </VerticalStackLayout>
+    </ScrollView>
+</ContentPage>

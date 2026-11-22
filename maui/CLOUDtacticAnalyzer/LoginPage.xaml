@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<ContentPage xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+             x:Class="TacticalAnalyzer.LoginPage"
+             Title="Bejelentkezés"
+             BackgroundColor="#121212">
+
+    <VerticalStackLayout Padding="30" Spacing="15" VerticalOptions="Center">
+
+        <Label Text="⚽ Tactical Analyzer"
+               FontSize="26" FontAttributes="Bold"
+               TextColor="White" HorizontalOptions="Center" Margin="0,0,0,20" />
+
+        <Entry x:Name="EmailEntry" Placeholder="Email cím" Keyboard="Email"
+               TextColor="White" PlaceholderColor="Gray" BackgroundColor="#1E1E1E" />
+
+        <Entry x:Name="PasswordEntry" Placeholder="Jelszó" IsPassword="True"
+               TextColor="White" PlaceholderColor="Gray" BackgroundColor="#1E1E1E" />
+
+        <Button x:Name="LoginButton" Text="Bejelentkezés" BackgroundColor="#2196F3" Clicked="OnLoginClicked" />
+        <Button x:Name="RegisterButton" Text="Regisztráció" BackgroundColor="#4CAF50" Clicked="OnRegisterClicked" />
+
+        <ActivityIndicator x:Name="LoadingIndicator" IsRunning="False" IsVisible="False" Color="White" />
+        <Label x:Name="ErrorLabel" TextColor="#FF5252" HorizontalOptions="Center" IsVisible="False" />
+
+    </VerticalStackLayout>
+</ContentPage>
