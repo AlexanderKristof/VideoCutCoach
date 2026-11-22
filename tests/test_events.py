@@ -160,6 +160,37 @@ def test_goal():
     check(len(s.of_type("shot")) == 1, s.of_type("shot"))
 
 
+def test_clearance_to_corner_is_not_goal():
+    """Felszabadítás szögletre (a valós felvételen gólnak vette): a labda a kapufa mellett, a vonal
+    mögé megy, majd a szögletzászlónál áll meg – nem gól, nem kapott gól."""
+    s = Sim()
+    defender = P(4, 2, 95.0, 30.0)
+    gk = P(1, 2, 103.0, 40.0, keeper=True)
+    s.hold(1.0, (95.0, 30.0), [defender, gk])
+    # lassú, kapufa közelébe (y≈30.5, a kapufa 30.34) tartó labda a vonal mögé – nincs "lövés" előtte
+    s.move((95.0, 30.0), (106.0, 30.6), 9.0, lambda b: [defender, gk])
+    s.hold(2.0, (106.0, 30.6), [defender, gk])
+    s.move((106.0, 30.6), (104.6, 0.6), 6.0, lambda b: [defender, gk])   # a labdát a sarokhoz viszik
+    s.hold(3.0, (104.6, 0.6), [defender, gk])
+    s.finalize()
+    check(not s.of_type("goal"), s.of_type("goal"))
+    check(not s.of_type("gk_conceded"), s.of_type("gk_conceded"))
+
+
+def test_ball_behind_line_without_shot_needs_kickoff():
+    """Lövés nélkül a vonal mögött álló labda nem megerősített gól; középkezdés után igen."""
+    s = Sim()
+    gk = P(1, 2, 98.0, 20.0, keeper=True)
+    s.hold(1.0, (100.0, 34.0), [gk])
+    s.move((100.0, 34.0), (105.8, 34.0), 3.0, lambda b: [gk])    # lassan begurul (nem lövés-sebesség)
+    s.hold(3.0, (105.8, 34.0), [gk])
+    s.move((105.8, 34.0), (52.5, 34.0), 20.0, lambda b: [gk])
+    s.hold(2.0, (52.5, 34.0), [gk])                               # középkezdés
+    s.finalize()
+    goals = s.of_type("goal")
+    check(len(goals) == 1 and goals[0]["confirmation"] == "kickoff", goals)
+
+
 # ------------------------------------------------------------ kapus események
 def test_save():
     s = Sim()
@@ -375,6 +406,31 @@ def test_engine_integration():
     check(eng.stats["gk_events"]["team1"].get("gk_positioning_error") == 1, eng.stats)
     r = eng.analyze_goalkeeper((103.0, 34.0), (90.0, 34.0))
     check(r["dist_from_goal_m"] == 2.0 and abs(r["bisector_offset_m"]) < 0.01, r)
+
+
+def test_positioning_monitor():
+    from events import PositioningMonitor
+    m = PositioningMonitor(offset_m=2.5, min_s=1.5, ball_max_dist_m=30.0, debounce_s=20.0)
+
+    def ev(off, bx=90.0, gx=103.0):
+        return {"bisector_offset_m": off, "gk_coords": (gx, 34.0), "ball_coords": (bx, 30.0), "dist_from_goal_m": 2.0}
+
+    out = []
+    t = 0.0
+    for _ in range(25):          # 1 mp nagy eltérés: még nem esemény
+        out.append(m.update(t, ev(3.0), "team2")); t += 0.04
+    for _ in range(10):          # rövid szünet (a kapus visszalép)
+        out.append(m.update(t, ev(0.5), "team2")); t += 0.04
+    check(not any(out), "a rövid kilengés nem esemény")
+    out = []
+    for _ in range(60):          # 2.4 mp tartós eltérés
+        out.append(m.update(t, ev(-3.4), "team2")); t += 0.04
+    evs = [e for e in out if e]
+    check(len(evs) == 1 and evs[0]["team"] == "team2" and evs[0]["offset_m"] == -3.4, evs)
+    # a labda a túlsó térfélen: nem számít
+    m2 = PositioningMonitor()
+    res = [m2.update(i * 0.04, ev(5.0, bx=20.0), "team2") for i in range(100)]
+    check(not any(res), "távoli labdánál nincs helyezkedési hiba")
 
 
 if __name__ == "__main__":

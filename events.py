@@ -142,6 +142,10 @@ class EventConfig:
         self.goal_kickoff_radius_m = 2.5
         self.goal_keeper_radius_m = 2.0    # kapus ennyin belül a labdánál az átjutáskor -> valószínű védés
         self.goal_keeper_line_m = 3.0      # ... és a kapus is a gólvonal közelében van
+        self.goal_post_inner_m = 0.4       # a "vonal mögött maradt" megerősítéshez a labda a kapufáktól
+                                           # ennyivel BEJJEBB jusson át (a kapufa melletti, szögletre / alapvonalra
+                                           # menő labda vetülete a kalibráció ~1 m-es hibájával könnyen "bent" van)
+        self.goal_corner_radius_m = 4.0    # a jelölt után a szögletzászlónál megálló labda: szöglet, nem gól
         self.goal_emit_unconfirmed = True   # megerősítetlen, de valószínű gól kiadása ("Valószínű GÓL",
                                             # confirmed=False, confidence=0.5) – lásd _likely_unconfirmed
 
@@ -740,7 +744,7 @@ class EventDetector:
         self._goal_cand = {
             "t": t_cross, "goal_x": gx, "keeper_near": keeper_near, "ktid": ktid,
             "keeper_team": k["team"] if k is not None else self.defending_team(gx, t),
-            "behind_n": b[1], "behind_last": t, "returned": 0, "shot": ps,
+            "behind_n": b[1], "behind_last": t, "returned": 0, "shot": ps, "ys": [y],
             "k0": k["pos"] if k is not None else None,
         }
         if ps is not None:
@@ -757,6 +761,7 @@ class EventDetector:
             if beyond and self.post_lo - 1.0 <= ball[1] <= self.post_hi + 1.0:
                 c["behind_n"] += 1
                 c["behind_last"] = t
+                c.setdefault("ys", []).append(ball[1])
             elif self._line_dist(ball, gx) > 1.5:
                 c["returned"] += 1
                 c.setdefault("first_return_t", t)
@@ -776,8 +781,13 @@ class EventDetector:
         if ko is not None and c["t"] + 1.0 < ko[0] <= c["t"] + cfg.goal_kickoff_window_s:
             self._confirm_goal(c, "kickoff")
             return
-        if (not c["keeper_near"] and c["behind_n"] >= cfg.goal_persist_samples
-                and c["behind_last"] - c["t"] >= cfg.goal_persist_s and c["returned"] < 3):
+        # Elvetés: a labda a szögletzászlónál áll meg (szöglet lesz belőle, nem gól)
+        r = self._rest
+        if (r is not None and r["t0"] > c["t"] and r["n"] >= 3 and r["t_last"] - r["t0"] >= 0.8
+                and self._near_corner((r["sx"] / r["n"], r["sy"] / r["n"]), gx)):
+            self._reject_goal(c, keeper=False)
+            return
+        if (not c["keeper_near"] and self._persist_ok(c) and c["returned"] < 3):
             self._confirm_goal(c, "persist")
             return
         # Elvetés: a játék közben folytatódott (új lövés, vagy a labda a túlsó térfélen jár) – a
@@ -795,7 +805,10 @@ class EventDetector:
         if self._gk_armed is not None and self._gk_armed["goal_x"] == gx and self._gk_armed["t_still"] > c["t"]:
             self._reject_goal(c, keeper=c["keeper_near"])
             return
-        if not c["keeper_near"] and c["returned"] >= 8:
+        # Lövés nélkül, de a kapuban maradt labda: a középkezdést várjuk (a labdát közben kiviszik a
+        # kapuból – ez itt nem elvetés); a szöglet / kirúgás / folytatódó játék fent elveti.
+        waiting_kickoff = c.get("shot") is None and not c["keeper_near"] and self._persisted_inside(c)
+        if not c["keeper_near"] and c["returned"] >= 8 and not waiting_kickoff:
             if self._likely_unconfirmed(c):
                 self._confirm_goal(c, "unconfirmed")
             else:
@@ -808,18 +821,47 @@ class EventDetector:
         cfg = self.cfg
         if c["keeper_near"] or (live_play and c["behind_last"] - c["t"] < cfg.goal_persist_s):
             self._reject_goal(c, keeper=True)
-        elif c["behind_n"] >= cfg.goal_persist_samples and c["behind_last"] - c["t"] >= cfg.goal_persist_s:
+        elif self._persist_ok(c):
             self._confirm_goal(c, "persist")
         elif self._likely_unconfirmed(c):
             self._confirm_goal(c, "unconfirmed")
         else:
             self._reject_goal(c, keeper=False)
 
+    def _persist_ok(self, c):
+        """
+        "A labda a gólvonal mögött maradt" megerősítés. Csak ha volt hozzá lövés (a lövés nélküli,
+        a vonal mögött álló labda sokkal gyakrabban szöglet / kirúgás előtti labda, vagy a kalibráció
+        hibája), és a labda a kapufák között, azoktól kissé beljebb jutott át. Különben a középkezdés
+        erősítheti meg, vagy "Valószínű gól" lehet belőle.
+        """
+        return c.get("shot") is not None and self._persisted_inside(c)
+
+    def _persisted_inside(self, c):
+        """A labda elég ideig a vonal mögött volt, a kapufák között (azoktól kissé beljebb)."""
+        cfg = self.cfg
+        if c["behind_n"] < cfg.goal_persist_samples or c["behind_last"] - c["t"] < cfg.goal_persist_s:
+            return False
+        ys = sorted(c.get("ys") or [])
+        if ys:
+            ym = ys[len(ys) // 2]
+            if not (self.post_lo + cfg.goal_post_inner_m <= ym <= self.post_hi - cfg.goal_post_inner_m):
+                return False
+        return True
+
+    def _near_corner(self, p, gx):
+        r = self.cfg.goal_corner_radius_m
+        return (abs(p[0] - gx) <= r and (p[1] <= r or p[1] >= self.W - r))
+
     def _likely_unconfirmed(self, c):
         """Megerősítetlen, de valószínű gól (csak goal_emit_unconfirmed=True esetén): a labda több mintán
         át a vonal mögött volt, a kapus nem volt ott, és utána legalább 3 mp-ig nem tért vissza a pályára
         (nem kipattanó). Tipikus eset: a hálóban / középen álló labdát a detektor nem látja."""
         if not self.cfg.goal_emit_unconfirmed or c["keeper_near"] or c["behind_n"] < 3:
+            return False
+        ys = sorted(c.get("ys") or [])
+        if ys and not (self.post_lo + self.cfg.goal_post_inner_m <= ys[len(ys) // 2]
+                       <= self.post_hi - self.cfg.goal_post_inner_m):
             return False
         fr = c.get("first_return_t")
         return fr is None or fr - c["behind_last"] >= 3.0
@@ -1422,3 +1464,62 @@ class EventDetector:
                 "desc": f"Kapus kifutás – {_keeper_label(k['team'], k['tid'])}, "
                         f"{abs(x - goal_x):.0f} m-re a gólvonaltól, {sp:.1f} m/s",
             })
+
+
+class PositioningMonitor:
+    """
+    Kapus helyezkedési hiba – csak a valóban értelmezhető esetek: a labda a kapus kapujához közel
+    (veszélyes zónában) van, a kapus a labda és a kapu közepe közti szögfelezőtől TARTÓSAN és
+    jelentősen eltér (a kamera képéből számolt pozíció képkockánként 1–2 m-t is remeghet).
+    Kapusonként (csapatonként) legfeljebb debounce_s-enként egy esemény.
+    Korábban minden 1,2 m-nél nagyobb, egyetlen képkockás eltérés esemény lett (2 perc alatt 8 db,
+    a pálya túlsó végén lévő labdánál is) – ez használhatatlan volt.
+    """
+
+    def __init__(self, offset_m=2.5, min_s=1.5, ball_max_dist_m=30.0, debounce_s=20.0,
+                 gap_s=0.4, pitch_length=105.0):
+        self.offset_m = offset_m
+        self.min_s = min_s
+        self.ball_max_dist_m = ball_max_dist_m
+        self.debounce_s = debounce_s
+        self.gap_s = gap_s
+        self.L = pitch_length
+        self._run = {}        # team -> {"t0", "t_last", "max", "emitted"}
+        self._last_emit = {}  # team -> t
+
+    def update(self, t, gk_eval, team):
+        """gk_eval: TacticalEngine.analyze_goalkeeper eredménye (vagy None). Visszatér: esemény dict vagy None."""
+        if not gk_eval or team is None:
+            return None
+        gx = gk_eval["gk_coords"][0]
+        bx = gk_eval["ball_coords"][0]
+        ball_dist = bx if gx <= self.L / 2.0 else self.L - bx
+        off = float(gk_eval["bisector_offset_m"])
+        bad = abs(off) >= self.offset_m and 0.0 <= ball_dist <= self.ball_max_dist_m
+        run = self._run.get(team)
+        if not bad:
+            if run is not None and t - run["t_last"] > self.gap_s:
+                self._run.pop(team, None)
+            return None
+        if run is None or t - run["t_last"] > self.gap_s:
+            run = self._run[team] = {"t0": t, "t_last": t, "max": off, "emitted": False}
+        run["t_last"] = t
+        if abs(off) > abs(run["max"]):
+            run["max"] = off
+        if run["emitted"] or t - run["t0"] < self.min_s:
+            return None
+        if t - self._last_emit.get(team, -1e9) < self.debounce_s:
+            return None
+        run["emitted"] = True
+        self._last_emit[team] = t
+        t0 = run["t0"]
+        return {
+            "type": "gk_positioning_error",
+            "time": round(t0, 2),
+            "team": team,
+            "start_sec": round(max(0.0, t0 - 3.0), 2),
+            "end_sec": round(t + 2.0, 2),
+            "offset_m": round(run["max"], 2),
+            "desc": f"Kapus helyezkedési hiba: {abs(run['max']):.1f} m-re a szögfelezőtől, "
+                    f"{t - t0:.1f} mp-en át ({'labda felőli' if run['max'] > 0 else 'túlsó'} oldal)",
+        }

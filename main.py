@@ -25,6 +25,7 @@ import model_manager  # súlyfájlok keresése / letöltése a models mappába
 from database import get_db, engine
 from models import Base, User, Match
 from tactical_engine import TacticalEngine
+from events import PositioningMonitor  # kapus helyezkedési hiba (tartós eltérés)
 from pitch_filters import (build_grass_mask, foot_on_grass, CameraMotion,
                            StationaryFilter, extract_dominant_color,
                            PitchBoundary, PitchTrackSanity, KeeperGate, pitch_h_trusted)  # PÁLYAHATÁR
@@ -531,6 +532,7 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
 
     frames_done = 0
     timeline_events = []
+    gk_pos_monitor = PositioningMonitor()   # kapus helyezkedési hiba: csak tartós, értelmezhető eltérés
 
     # Áttekintő lapok (esemény-lapok + percenkénti áttekintés) – kevés képből ellenőrizhető az elemzés
     review_dir = os.path.abspath(os.path.join(CLIPS_DIR, f"review_{clip_id}"))
@@ -961,16 +963,11 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
 
             if gk_real_coords and real_ball:
                 gk_eval = engine_instance.analyze_goalkeeper(gk_real_coords, real_ball)
-                if gk_eval and abs(gk_eval["bisector_offset_m"]) > 1.2:
-                    if not timeline_events or (current_time_sec - timeline_events[-1]["time"]) > 3.0:
-                        timeline_events.append({
-                            "type": "gk_positioning_error",
-                            "time": round(current_time_sec, 2),
-                            "team": engine_instance.keeper_team_near(gk_real_coords),
-                            "start_sec": round(max(0.0, current_time_sec - 4.0), 2),
-                            "end_sec": round(current_time_sec + 3.0, 2),
-                            "desc": f"Kapus helyezkedési hiba: {gk_eval['bisector_offset_m']} m eltolódás"
-                        })
+                # csak tartós, nagy eltérés, ha a labda a kapu közelében van (events.PositioningMonitor)
+                pos_ev = gk_pos_monitor.update(current_time_sec, gk_eval,
+                                               engine_instance.keeper_team_near(gk_real_coords))
+                if pos_ev is not None:
+                    timeline_events.append(pos_ev)
 
             if review is not None:
                 review.add_frame(frames_done, current_time_sec, frame,

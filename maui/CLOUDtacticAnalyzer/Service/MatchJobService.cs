@@ -108,9 +108,15 @@ public sealed class MatchEvent
     public string Icon => EventLabels.Icon(Type);
     public bool IsGoalkeeper => Type.StartsWith("gk_", StringComparison.Ordinal);
     public string TeamLabel => Team switch { "team1" => "Hazai", "team2" => "Vendég", _ => "" };
+    /// <summary>Az időpont az eredeti videóban (ezt látod a lejátszón is).</summary>
+    public string VideoTimeLabel => FormatTime(Time);
+    /// <summary>Hivatalos meccsidő: az 1. félidő 0:00-tól, a 2. félidő 45:00-tól indul (a beállított félidőhossztól).</summary>
     public string ClockLabel => !string.IsNullOrEmpty(MatchClock) ? MatchClock! : FormatTime(Time);
     public string Title => string.IsNullOrEmpty(TeamLabel) ? $"{Icon} {Label}" : $"{Icon} {Label} – {TeamLabel}";
-    public string Subtitle => $"{ClockLabel}{(string.IsNullOrEmpty(HalfLabel) ? "" : $" ({HalfLabel})")}  {Desc}";
+    public string Subtitle =>
+        $"🎬 {VideoTimeLabel} a videóban" +
+        (string.IsNullOrEmpty(MatchClock) ? "" : $"  •  ⏱ {MatchClock} meccsidő{(string.IsNullOrEmpty(HalfLabel) ? "" : $" ({HalfLabel})")}") +
+        $"  •  {Desc}";
 
     /// <summary>Klip-időablak az eredeti videóban (ha az eseménynek nincs saját ablaka: idő −5 / +4 mp).</summary>
     public (double Start, double End) ClipWindow(double pre = 5, double post = 4)

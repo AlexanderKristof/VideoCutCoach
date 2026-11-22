@@ -58,7 +58,7 @@ h2 { font-family: var(--font-display); font-weight: 600; font-size: 17px; letter
 input[type="text"], input[type="number"], select, textarea { font: 14px var(--font-body); color: var(--fg); background: var(--bg); border: 1px solid var(--line); border-radius: 7px; padding: 6px 8px; min-height: 34px; }
 textarea { width: 100%; min-height: 90px; resize: vertical; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
 .canvas-wrap { position: relative; width: 100%; border-radius: 10px; overflow: hidden; background: #2f6b39; }
-canvas#pitch { display: block; width: 100%; touch-action: none; cursor: crosshair; }
+canvas#pitch { display: block; width: 100%; max-width: 100%; touch-action: none; cursor: crosshair; }
 .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px; display: flex; flex-direction: column; gap: 18px; min-width: 0; }
 .row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
@@ -111,6 +111,23 @@ h3.sub { font: 600 12px var(--font-body); letter-spacing: .05em; text-transform:
   .vbtns .btn { padding: 6px 7px; font-size: 12.5px; }
 }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+/* Széles képernyőn (asztali program): az eszközök a pálya mellett, jobbra, egy oszlopban – így a pálya
+   egészben látszik görgetés nélkül (a vászon méretét a layout() a látható magassághoz is igazítja). */
+@media (min-width: 1100px) {
+  .stage { display: grid; grid-template-columns: minmax(0, 1fr) 150px; column-gap: 10px; align-items: start; }
+  .stage > * { grid-column: 1; }
+  .stage > .toolbar { grid-column: 2; grid-row: 1 / span 6; flex-direction: column; flex-wrap: nowrap; align-items: stretch; position: sticky; top: 8px; }
+  .stage > .toolbar { gap: 4px; }
+  .stage > .toolbar .tool, .stage > .toolbar .btn { justify-content: flex-start; width: 100%; min-height: 30px; padding: 4px 9px; }
+  .stage > .toolbar #txt, .stage > .toolbar select { min-height: 30px; padding: 3px 8px; }
+  .stage > .toolbar .sep { width: 100%; height: 1px; margin: 2px 0; }
+  .stage > .toolbar #txt, .stage > .toolbar select { width: 100%; }
+  .stage > .toolbar .swatches { flex-wrap: wrap; padding-left: 0; }
+  header.top { margin-bottom: 8px; }
+  canvas#pitch { margin: 0 auto; }
+  .canvas-wrap { background: transparent; }
+  canvas#pitch { border-radius: 10px; background: #2f6b39; }
+}
 </style>
 
 <header class="top">
@@ -480,12 +497,21 @@ h3.sub { font: 600 12px var(--font-body); letter-spacing: .05em; text-transform:
     if (!cw) return; // videó módban a pálya rejtve van
     const vertical = cw < 560 && window.innerHeight > window.innerWidth;
     const worldW = (vertical ? W : L) + MARGIN * 2, worldH = (vertical ? L : W) + MARGIN * 2;
-    const s = cw / worldW;
+    let s = cw / worldW;
+    if (!vertical && window.innerWidth >= 1100) {
+      // a pálya férjen ki egészben a látható részbe (alatta visszajátszáskor az idővonal is)
+      const top = wrap.getBoundingClientRect().top + window.scrollY;
+      const below = state.mode === "replay" ? 150 : 16;
+      const availH = window.innerHeight - top - below;
+      if (availH > 260) s = Math.min(s, availH / worldH);
+    }
+    const cwFit = Math.round(worldW * s);
     const ch = Math.round(worldH * s);
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    canvas.width = Math.round(cw * dpr); canvas.height = Math.round(ch * dpr);
+    canvas.width = Math.round(cwFit * dpr); canvas.height = Math.round(ch * dpr);
     canvas.style.height = ch + "px";
-    view = { vertical, s, ox: MARGIN * s, oy: MARGIN * s, cw, ch, dpr, mini: false };
+    canvas.style.width = cwFit + "px";
+    view = { vertical, s, ox: MARGIN * s, oy: MARGIN * s, cw: cwFit, ch, dpr, mini: false };
     draw();
   }
   function toScreen(x, y) {
