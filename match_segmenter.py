@@ -844,22 +844,26 @@ def concat_segments(paths, out_path, work_dir=None, ffmpeg_bin=None):
 
 
 def cut_match_halves(video_path, halves, out_dir, padding_sec=5.0, duration_sec=None, ffmpeg_bin=None,
-                     on_part=None):
+                     on_part=None, on_step=None):
     """
     A félidők kivágása és a szünet nélküli teljes meccs elkészítése (képkocka-pontosan).
     halves: {"first_half": {"start_sec","end_sec"}, "second_half": {...} vagy None}
     on_part(kulcs, útvonal): minden elkészült fájl után (pl. hogy a kliens már a kész félidőt
     lejátszhassa, mielőtt a teljes meccs elkészül); a kulcs "first_half" / "second_half" / "full_match".
+    on_step(kulcs, sorszám, összes): minden lépés ELŐTT (haladásjelzéshez).
     Visszatér: {"first_half": útvonal, "second_half": útvonal vagy None, "full_match": útvonal,
                 "cut_modes": {kulcs: "copy" / "smart" / "full"}}
     """
     clip_id = uuid.uuid4().hex[:8]
     out = {"first_half": None, "second_half": None, "full_match": None, "cut_modes": {}}
     parts = []
+    steps = [k for k in ("first_half", "second_half") if halves.get(k)] + ["full_match"]
     for key, name in (("first_half", "half1"), ("second_half", "half2")):
         h = halves.get(key)
         if not h:
             continue
+        if on_step is not None:
+            on_step(key, steps.index(key), len(steps))
         s = max(0.0, float(h["start_sec"]) - padding_sec)
         e = float(h["end_sec"]) + padding_sec
         if duration_sec:
@@ -876,6 +880,8 @@ def cut_match_halves(video_path, halves, out_dir, padding_sec=5.0, duration_sec=
     if not parts:
         raise RuntimeError("Nincs kivágható szakasz.")
     full = os.path.abspath(os.path.join(out_dir, f"match_{clip_id}.mp4"))
+    if on_step is not None:
+        on_step("full_match", len(steps) - 1, len(steps))
     if len(parts) == 1:
         import shutil
         shutil.copyfile(parts[0], full)  # egy félidő: a meccsvideó maga a félidő

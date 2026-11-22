@@ -819,6 +819,60 @@ def test_pipeline_publishes_cut_before_analysis():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_cancel_stops_running_subprocess():
+    """A megszakítás a futó külső folyamatot (pl. percekig tartó ffmpeg-vágást) is azonnal leállítja."""
+    import background
+    d = _tmpdir()
+    try:
+        mgr = JobManager(d)
+        started = threading.Event()
+        caught = {}
+
+        def work(progress):
+            started.set()
+            try:
+                # akár egy "except Exception" tartalék-ág se nyelje el (mint a smart cut → újrakódolás)
+                background.run([sys.executable, "-c", "import time; time.sleep(60)"], capture_output=True)
+            except Exception as ex:   # noqa: BLE001 – szándékosan: ide NEM szabad bejönnie
+                caught["ex"] = ex
+            return {"status": "success"}
+
+        jid = mgr.submit("teszt", work)
+        assert started.wait(5)
+        time.sleep(0.5)
+        t0 = time.monotonic()
+        mgr.cancel(jid)
+        job = mgr.wait(jid, 10)
+        assert job["status"] == "cancelled", job
+        assert time.monotonic() - t0 < 5, "a megszakítás nem állította le a folyamatot"
+        assert "ex" not in caught, caught
+
+        # megszakítás nélkül a run() a megszokott eredményt adja (kimenet, kilépési kód)
+        out = {}
+
+        def ok(progress):
+            r = background.run([sys.executable, "-c", "import sys; print('hello'); sys.exit(3)"], capture_output=True)
+            out["r"] = (r.returncode, r.stdout.decode().strip())
+            return {"status": "success"}
+
+        assert mgr.wait(mgr.submit("teszt", ok), 10)["status"] == "done"
+        assert out["r"] == (3, "hello"), out
+        mgr.shutdown()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_cancellable_run_timeout():
+    import background
+    ev = threading.Event()
+    with background.cancel_scope(ev):
+        try:
+            background.run([sys.executable, "-c", "import time; time.sleep(30)"], capture_output=True, timeout=0.6)
+            raise AssertionError("időtúllépés kellett volna")
+        except subprocess.TimeoutExpired:
+            pass
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failed = 0

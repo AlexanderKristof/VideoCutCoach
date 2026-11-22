@@ -24,6 +24,7 @@ import sys
 import shutil
 import threading
 import subprocess
+import time
 from contextlib import contextmanager
 
 # Windows prioritási osztályok / szálprioritás (a subprocess modulban csak Windows-on vannak meg)
@@ -158,11 +159,73 @@ def prepare(cmd, cfg=None, _os_name=None, _which=shutil.which, _nice_now=None):
     return cmd, {}
 
 
+class ProcessCancelled(BaseException):
+    """
+    A feladatot megszakították, ezért a futó ffmpeg-folyamatot leállítottuk.
+    BaseException (mint a KeyboardInterrupt), hogy a vágás "except Exception" tartalék-ágai
+    (pl. smart cut → teljes újrakódolás) ne nyeljék el, hanem a jobkezelőig jusson.
+    """
+
+
+@contextmanager
+def cancel_scope(event):
+    """
+    A blokkban (ebben a szálban) indított run() hívások figyelik az eseményt (threading.Event):
+    ha beállítják, a futó folyamatot leállítják és ProcessCancelled-et dobnak. Így egy percekig
+    tartó ffmpeg-vágás is azonnal megszakítható, nem csak a következő haladásjelzésnél.
+    """
+    prev = getattr(_local, "cancel", None)
+    _local.cancel = event
+    try:
+        yield
+    finally:
+        _local.cancel = prev
+
+
+def _cancel_event():
+    return getattr(_local, "cancel", None)
+
+
 def run(cmd, **kwargs):
-    """subprocess.run háttér-mód szerinti prioritással."""
+    """subprocess.run háttér-mód szerinti prioritással (megszakítható, ha van cancel_scope)."""
     cmd, extra = prepare(cmd)
     extra.update(kwargs)
-    return subprocess.run(cmd, **extra)
+    ev = _cancel_event()
+    if ev is None:
+        return subprocess.run(cmd, **extra)
+    return _run_cancellable(cmd, ev, **extra)
+
+
+def _run_cancellable(cmd, ev, capture_output=False, timeout=None, check=False, input=None, poll_sec=0.3, **kwargs):
+    """A subprocess.run megfelelője, ami poll_sec-enként ellenőrzi a megszakítást."""
+    if ev.is_set():
+        raise ProcessCancelled("A feladatot megszakították.")
+    if capture_output:
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.PIPE
+    if input is not None:
+        kwargs["stdin"] = subprocess.PIPE
+    deadline = None if timeout is None else time.monotonic() + timeout
+    with subprocess.Popen(cmd, **kwargs) as proc:
+        data = input
+        while True:
+            try:
+                out, err = proc.communicate(input=data, timeout=poll_sec)
+                break
+            except subprocess.TimeoutExpired:
+                data = None   # a bemenetet a communicate egyszer már átadta
+                if ev.is_set():
+                    proc.kill()
+                    proc.communicate()
+                    raise ProcessCancelled("A feladatot megszakították.")
+                if deadline is not None and time.monotonic() > deadline:
+                    proc.kill()
+                    out, err = proc.communicate()
+                    raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err)
+        res = subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+    if check:
+        res.check_returncode()
+    return res
 
 
 def popen(cmd, **kwargs):

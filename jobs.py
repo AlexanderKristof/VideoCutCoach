@@ -514,10 +514,11 @@ class JobManager:
             self._bg_enter(threads)
         try:
             # háttér-mód / szálkorlát: az ebből a szálból indított ffmpeg-folyamatokra (fast_cut, ...)
-            with background.context(enabled=bg, threads=threads):
+            # a megszakítás a futó ffmpeg-folyamatot is azonnal leállítja (background.cancel_scope)
+            with background.context(enabled=bg, threads=threads), background.cancel_scope(cancel_event):
                 reporter.check_pause()  # a várakozás közben szüneteltetett job el sem indul
                 result = func(reporter, *args, **kwargs)
-        except JobCancelled:
+        except (JobCancelled, background.ProcessCancelled):
             self._finish(job_id, STATUS_CANCELLED)
         except BaseException as ex:  # noqa: B902 – a job hibája ne vigye el a szálat
             tb = traceback.format_exc()

@@ -19,6 +19,7 @@ from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 import app_paths  # adat- és erőforrás-útvonalak (fejlesztői módban a régi relatív utak)
+import background  # háttér-mód és megszakítható ffmpeg-futtatás
 import model_manager  # súlyfájlok keresése / letöltése a models mappába
 
 from database import get_db, engine
@@ -407,7 +408,8 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
     debug_log_path = os.path.abspath(os.path.join(CLIPS_DIR, f"analysis_debug_{clip_id}.log"))
     temp_cut = os.path.abspath(os.path.join(CLIPS_DIR, f"temp_cut_{clip_id}.mp4"))
 
-    subprocess.run([
+    # background.run: háttér-mód prioritás, és a job megszakítása ezt a másolást is leállítja
+    background.run([
         "ffmpeg.exe", "-y", "-ss", str(start_sec), "-i", video_path,
         "-t", str(end_sec - start_sec), "-c", "copy", temp_cut
     ], capture_output=True)

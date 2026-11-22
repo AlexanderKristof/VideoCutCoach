@@ -21,6 +21,7 @@ public sealed class JobInfo
     [JsonPropertyName("cancel_requested")] public bool CancelRequested { get; set; }
     [JsonPropertyName("background")] public bool Background { get; set; }
     [JsonPropertyName("created_at")] public string? CreatedAt { get; set; }
+    [JsonPropertyName("started_at")] public string? StartedAt { get; set; }
     [JsonPropertyName("finished_at")] public string? FinishedAt { get; set; }
     [JsonPropertyName("elapsed_sec")] public double? ElapsedSec { get; set; }
     [JsonPropertyName("error")] public string? Error { get; set; }
@@ -28,6 +29,47 @@ public sealed class JobInfo
     [JsonPropertyName("result")] public JsonElement? Result { get; set; }
 
     public bool IsFinished => Status is "done" or "error" or "cancelled" or "megszakadt";
+
+    /// <summary>Az indítás óta eltelt idő (a motor ugyanezen a gépen fut, helyi idővel).</summary>
+    public TimeSpan? Elapsed
+    {
+        get
+        {
+            if (ElapsedSec is { } done) return TimeSpan.FromSeconds(done);
+            if (!DateTime.TryParse(StartedAt, out var start)) return null;
+            var d = DateTime.Now - start;
+            return d < TimeSpan.Zero ? TimeSpan.Zero : d;
+        }
+    }
+
+    /// <summary>Durva becslés a hátralévő időre (csak ha már elég adat van), különben null.</summary>
+    public TimeSpan? Remaining
+    {
+        get
+        {
+            if (IsFinished || Status == "paused" || Elapsed is not { } el) return null;
+            if (Progress < 16 || el.TotalSeconds < 120) return null;   // a félidő-felismerés és a vágás még nem jellemző
+            return TimeSpan.FromSeconds(el.TotalSeconds * (100 - Progress) / Progress);
+        }
+    }
+
+    /// <summary>"10.4% • 4:12 telt el • kb. 1 ó 20 perc van hátra"</summary>
+    public string ProgressText
+    {
+        get
+        {
+            var parts = new List<string>();
+            if (!IsFinished) parts.Add($"{Progress.ToString("0.0", CultureInfo.InvariantCulture)}%");
+            if (Elapsed is { } el) parts.Add($"{FormatDuration(el)} {(IsFinished ? "volt" : "telt el")}");
+            if (Remaining is { } rem) parts.Add($"kb. {FormatDuration(rem)} van hátra");
+            return string.Join(" • ", parts);
+        }
+    }
+
+    public static string FormatDuration(TimeSpan t) =>
+        t.TotalHours >= 1 ? $"{(int)t.TotalHours} ó {t.Minutes} perc"
+        : t.TotalMinutes >= 1 ? $"{(int)t.TotalMinutes} perc {t.Seconds:00} mp"
+        : $"{t.Seconds} mp";
     public bool IsRunning => Status is "running" or "queued";
 
     public string? VideoPath =>
@@ -37,7 +79,7 @@ public sealed class JobInfo
     public string StatusLabel => Status switch
     {
         "queued" => "Sorban áll",
-        "running" => Paused ? "Szüneteltetés kérve…" : "Fut",
+        "running" => CancelRequested ? "Megszakítás folyamatban…" : Paused ? "Szüneteltetés kérve…" : "Fut",
         "paused" => "Szüneteltetve",
         "done" => "Kész",
         "error" => "Hiba",

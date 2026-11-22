@@ -526,9 +526,19 @@ def run_match_pipeline(video_path, options=None, progress=None, funcs=None, out_
             if hasattr(progress, "check_pause"):
                 progress.check_pause()  # szüneteltetés a következő fájl előtt
 
+        cut_lo, cut_hi = bounds["cut"]
+        step_labels = {"first_half": "1. félidő", "second_half": "2. félidő", "full_match": "összefűzés"}
+
+        def on_step(key, index, total):
+            # a vágás lépésenként halad (1. félidő → 2. félidő → összefűzés), hogy a kliens lássa
+            progress(cut_lo + (cut_hi - cut_lo) * index / max(1, total),
+                     f"A meccs kivágása (szünet nélkül): {step_labels.get(key, key)} ({index + 1}/{total})")
+
         kwargs = {"padding_sec": opts["padding_sec"], "duration_sec": duration}
         if _accepts(funcs["cut_match"], "on_part"):
             kwargs["on_part"] = on_part
+        if _accepts(funcs["cut_match"], "on_step"):
+            kwargs["on_step"] = on_step
         paths = dict(funcs["cut_match"](video_path, halves, out_dir, **kwargs))
         cut_modes = paths.pop("cut_modes", None)
         cut_offsets = _cut_offsets(halves, opts["padding_sec"], duration)

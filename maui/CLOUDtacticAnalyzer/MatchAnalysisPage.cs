@@ -25,18 +25,25 @@ public sealed class EventItem : INotifyPropertyChanged
     private void OnChanged([CallerMemberName] string? name = null) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
 }
 
-/// <summary>Egy elemzés a listában.</summary>
-public sealed class JobItem
+/// <summary>Egy elemzés a listában (helyben frissül, így a lista nem villog).</summary>
+public sealed class JobItem : INotifyPropertyChanged
 {
     public JobItem(JobInfo job) => Job = job;
-    public JobInfo Job { get; }
+    public JobInfo Job { get; private set; }
+    public string Id => Job.Id;
     public string Title => Path.GetFileName(Job.VideoPath ?? "") is { Length: > 0 } n ? n : Job.Id;
-    public string Subtitle => $"{Job.StatusLabel}{(Job.IsFinished ? "" : $" – {Job.Progress:0}%")}  {FormatCreated(Job.CreatedAt)}";
+    public string Subtitle => $"{Job.StatusLabel} – {Job.ProgressText}";
+    public string Created => DateTime.TryParse(Job.CreatedAt, out var t) ? t.ToString("yyyy.MM.dd HH:mm") : "";
     public double Progress => Job.Progress / 100.0;
     public bool ShowProgress => !Job.IsFinished;
 
-    private static string FormatCreated(string? iso) =>
-        DateTime.TryParse(iso, out var t) ? t.ToString("yyyy.MM.dd HH:mm") : "";
+    public void Update(JobInfo job)
+    {
+        Job = job;
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(null));   // minden kötött mező frissül
+    }
+
+    public event PropertyChangedEventHandler? PropertyChanged;
 }
 
 /// <summary>
@@ -249,6 +256,8 @@ public class MatchAnalysisPage : ContentPage
         title.SetBinding(Label.TextProperty, nameof(JobItem.Title));
         var sub = new Label { TextColor = Muted, FontSize = 12 };
         sub.SetBinding(Label.TextProperty, nameof(JobItem.Subtitle));
+        var created = new Label { TextColor = Color.FromArgb("#808080"), FontSize = 11 };
+        created.SetBinding(Label.TextProperty, nameof(JobItem.Created));
         var bar = new ProgressBar { ProgressColor = Color.FromArgb("#E91E63") };
         bar.SetBinding(ProgressBar.ProgressProperty, nameof(JobItem.Progress));
         bar.SetBinding(IsVisibleProperty, nameof(JobItem.ShowProgress));
@@ -258,7 +267,7 @@ public class MatchAnalysisPage : ContentPage
             BackgroundColor = Panel,
             Padding = 8,
             Margin = new Thickness(0, 3),
-            Content = new VerticalStackLayout { Spacing = 2, Children = { title, sub, bar } }
+            Content = new VerticalStackLayout { Spacing = 2, Children = { title, sub, bar, created } }
         };
     }
 
@@ -404,11 +413,18 @@ public class MatchAnalysisPage : ContentPage
         try
         {
             var jobs = (await _api.ListJobsAsync(100)).Where(j => j.Kind == "analyze-match").ToList();
+            var sameOrder = jobs.Count == _jobs.Count && jobs.Select(j => j.Id).SequenceEqual(_jobs.Select(x => x.Id));
+            if (sameOrder)
+            {
+                // helyben frissítés: nem épül újra a lista (nem villog, a kijelölés megmarad)
+                for (var i = 0; i < jobs.Count; i++) _jobs[i].Update(jobs[i]);
+                return;
+            }
             var selectedId = _currentJob?.Id;
             _jobs.Clear();
             foreach (var j in jobs) _jobs.Add(new JobItem(j));
             if (selectedId is not null)
-                _jobList.SelectedItem = _jobs.FirstOrDefault(x => x.Job.Id == selectedId);
+                _jobList.SelectedItem = _jobs.FirstOrDefault(x => x.Id == selectedId);
         }
         catch (Exception ex)
         {
@@ -424,11 +440,15 @@ public class MatchAnalysisPage : ContentPage
         }
         _currentJob = job;
         _jobTitle.Text = Path.GetFileName(job.VideoPath ?? job.Id);
-        _jobPhase.Text = job.Status == "error" ? $"Hiba: {job.Error}" : $"{job.StatusLabel} – {job.Phase}";
+        _jobPhase.Text = job.Status == "error"
+            ? $"Hiba: {job.Error}"
+            : $"{job.StatusLabel} – {job.Phase}{Environment.NewLine}{job.ProgressText}";
         _jobProgress.IsVisible = !job.IsFinished;
         _jobProgress.Progress = job.Progress / 100.0;
         _pauseButton.IsVisible = _cancelButton.IsVisible = !job.IsFinished;
         _pauseButton.Text = job.Status == "paused" || job.Paused ? "▶ Folytatás" : "⏸ Szünet";
+        _cancelButton.IsEnabled = _pauseButton.IsEnabled = !job.CancelRequested;
+        _cancelButton.Text = job.CancelRequested ? "Megszakítás folyamatban…" : "✖ Megszakítás";
 
         var result = MatchResultView.From(job.Result);
         _result = result;
