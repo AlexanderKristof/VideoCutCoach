@@ -110,8 +110,47 @@ def tiled_detect(detector, img, tile=640, overlap=0.25):
     return Detections(xyxy[keep], conf[keep], cls[keep], full.names)
 
 
-def prelabel_images(backend, roles, image_paths, images_root, conf, ball_conf, tile=0):
+def fit_grass_model(image_paths, n=30):
+    """Videónként tanult fűmodell a képek egy mintájából (a nézősor-szűréshez)."""
+    from pitch_filters import GrassModel
+    gm = GrassModel()
+    step = max(1, len(image_paths) // n)
+    for p in image_paths[::step]:
+        img = cv2.imread(p)
+        if img is not None:
+            gm.observe(img)
+    return gm
+
+
+def drop_spectators(boxes, img, grass_model):
+    """
+    A kerítés / reklámtábla előtti nézősor kiszűrése: a személy talppontja a fő fűterület felső
+    széléhez (a túlsó pályaszél menti sávhoz) túl közel van. A labda-dobozokat nem érinti.
+    Visszatér: (megtartott, eldobott darabszám).
+    """
+    from pitch_filters import grass_top_profile
+    m, sc = grass_model.mask(img)
+    top = grass_top_profile(m)
+    if top is None:
+        return boxes, 0
+    H = img.shape[0]
+    keep, dropped = [], 0
+    for b in boxes:
+        if b["cls"] != 0:
+            x1, y1, x2, y2 = b["xyxy"]
+            cx = int(min(m.shape[1] - 1, max(0, (x1 + x2) / 2 * sc)))
+            t = top[cx]
+            if not np.isnan(t) and y2 * sc < t + max(0.5 * (y2 - y1) * sc, 0.012 * H * sc):
+                dropped += 1
+                continue
+        keep.append(b)
+    return keep, dropped
+
+
+def prelabel_images(backend, roles, image_paths, images_root, conf, ball_conf, tile=0, spectators=False):
     items = []
+    gm = fit_grass_model(image_paths) if spectators else None
+    n_drop = 0
     for i, p in enumerate(image_paths):
         img = cv2.imread(p)
         if img is None:
@@ -119,8 +158,14 @@ def prelabel_images(backend, roles, image_paths, images_root, conf, ball_conf, t
         det = tiled_detect(backend.detector, img, tile) if tile else backend.detector.detect(img)
         if (i + 1) % 10 == 0:
             print(f"  {i + 1}/{len(image_paths)} kép")
+        boxes = boxes_from_detections(det, roles, conf, ball_conf)
+        if gm is not None:
+            boxes, d = drop_spectators(boxes, img, gm)
+            n_drop += d
         items.append({"file": os.path.relpath(p, images_root), "width": img.shape[1], "height": img.shape[0],
-                      "boxes": boxes_from_detections(det, roles, conf, ball_conf)})
+                      "boxes": boxes})
+    if gm is not None:
+        print(f"Nézősor-szűrés: {n_drop} doboz eldobva")
     return items
 
 
@@ -232,6 +277,8 @@ def main(argv=None):
     ap.add_argument("--min-track-len", type=int, default=3, help="videó: ennél rövidebb követés nem kerül be")
     ap.add_argument("--csempe", type=int, default=0, metavar="PX",
                     help="képes mód: csempés felismerés eredeti felbontáson (pl. 640) – a kicsi labdához; 0 = ki")
+    ap.add_argument("--nezo-szures", action="store_true",
+                    help="képes mód: a kerítés előtti nézősor kiszűrése (a fűterület felső széle alapján)")
     a = ap.parse_args(argv)
     formats = [f.strip() for f in a.format.split(",") if f.strip()]
     os.makedirs(a.out, exist_ok=True)
@@ -252,7 +299,7 @@ def main(argv=None):
         else:
             paths = sorted(p for p in glob.glob(os.path.join(root, "**", "*"), recursive=True)
                            if p.lower().endswith((".jpg", ".jpeg", ".png")))
-        items = prelabel_images(backend, roles, paths, root, a.conf, a.ball_conf, a.csempe)
+        items = prelabel_images(backend, roles, paths, root, a.conf, a.ball_conf, a.csempe, a.nezo_szures)
         write_outputs(items, a.out, root, formats)
     else:
         img_dir = os.path.join(a.out, "kepek")

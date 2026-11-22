@@ -33,7 +33,7 @@ python tools\export_training_frames.py D:\Veo\*.mp4 --out tanito --per-video 150
 
 ```bat
 REM a jelenlegi detektorral (ONNX, pl. YOLOX COCO, vagy egy korábbi saját modell)
-python tools\prelabel.py --images tanito --onnx models\yolox_s.onnx --out elocimke --format coco,labelstudio
+python tools\prelabel.py --images tanito --onnx models\yolox_s.onnx --csempe 640 --nezo-szures --out elocimke --format coco,labelstudio
 
 REM videóból, követéssel: az egyszeri téves dobozok kiesnek, a dobozok azonosítót kapnak
 python tools\prelabel.py --video meccs.mp4 --every 25 --start 600 --duration 300 --out elocimke_video
@@ -48,6 +48,11 @@ Importálás:
   *Actions → Upload annotations → COCO 1.0* → `elocimke/coco/annotations/train.json`.
 - **Label Studio**: a címkéző felület a `tools/dataset_formats.py` `write_labelstudio` leírása szerint;
   *Import* → `elocimke/labelstudio_tasks.json` (az előcímkék „predictions”-ként jelennek meg).
+
+- `--csempe 640`: csempés felismerés eredeti felbontáson – a kicsi, távoli labda és játékos így is meglesz
+  (lassabb, de az előcímkézés egyszeri munka).
+- `--nezo-szures`: a túlsó kerítés előtti nézősor automatikus kiszűrése (a fűterület felső széle alapján);
+  a közeli oldalvonalnál / kispadnál állókat kézzel kell törölni.
 
 Az ONNX COCO-modell `person` dobozai mind `player` címkét kapnak: a kapusokat és a bírókat kézzel kell
 átcímkézni, a pályán kívüli embereket (nézők, cserék, edzők) törölni.
