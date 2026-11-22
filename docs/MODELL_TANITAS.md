@@ -95,7 +95,7 @@ python tools\dataset_formats.py convert --from coco --input export\annotations.j
     --to yolo --out adat_yolo --val 0.15
 ```
 
-A COCO `category_id` itt az osztály sorszáma (0 = ball ... 3 = referee).
+A COCO `category_id` 1-től számoz (1 = ball ... 4 = referee; a CVAT a 0-t nem fogadja el). Ha egy keretrendszer 0-tól várja, add meg: `--coco-id-start 0`.
 
 ## 5. Tanítás – javasolt keretrendszerek (Apache-2.0)
 

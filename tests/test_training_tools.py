@@ -58,7 +58,7 @@ class DatasetFormatTests(unittest.TestCase):
         dfm.write_coco(items, out, os.path.join(self.tmp, "src"))
         data = _load(os.path.join(out, "annotations", "train.json"))
         self.assertEqual([c["name"] for c in data["categories"]], dfm.CLASSES)
-        self.assertEqual(data["categories"][0]["id"], 0)
+        self.assertEqual(data["categories"][0]["id"], 1)   # CVAT: a 0-s id "címke nélküli" lenne
         self.assertEqual(len(data["annotations"]), 18)
         a = data["annotations"][0]
         self.assertEqual(a["bbox"], [10.0, 20.0, 20.0, 50.0])

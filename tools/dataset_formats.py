@@ -8,7 +8,7 @@ Belső ábrázolás (képenként egy dict):
      "width": 1920, "height": 1080,
      "boxes": [{"cls": 2, "xyxy": [x1, y1, x2, y2], "score": 0.87 (opcionális), "track": 5 (opcionális)}]}
 
-Osztályok (a sorrend = osztály-sorszám, a COCO category_id is ez, 0-tól):
+Osztályok (a sorrend = osztály-sorszám; a COCO kimenetben a category_id ennél 1-gyel több – a CVAT így várja):
     0 ball (labda), 1 goalkeeper (kapus), 2 player (játékos), 3 referee (bíró)
 Az angol nevek a model_config.build_role_class_map() alapértelmezett álneveivel egyeznek, így a
 tanított modell beállítás nélkül is a helyes szerepkörökre képződik le (a magyar nevek is működnek).
@@ -161,7 +161,12 @@ def read_yolo(root, classes=None):
 
 
 # ====================================================================== COCO json
-def to_coco(items, classes=CLASSES, file_key=os.path.basename):
+def to_coco(items, classes=CLASSES, file_key=os.path.basename, id_start=1):
+    """
+    id_start: az első osztály category_id-ja. Alap 1 – a CVAT a 0-s category_id-t "címke nélkülinek"
+    veszi ("annotation has no label"), és a COCO/Roboflow is 1-től számoz. A beolvasás (read_coco)
+    mindkettőt kezeli (az id-k sorrendje szerint 0-tól folytonos osztály-sorszámra képez).
+    """
     images, anns = [], []
     for i, it in enumerate(items):
         images.append({"id": i + 1, "file_name": file_key(it["file"]), "width": int(it["width"]),
@@ -170,7 +175,7 @@ def to_coco(items, classes=CLASSES, file_key=os.path.basename):
             x1, y1, x2, y2 = _clip_box(b["xyxy"], it["width"], it["height"])
             if x2 <= x1 or y2 <= y1:
                 continue
-            a = {"id": len(anns) + 1, "image_id": i + 1, "category_id": int(b["cls"]),
+            a = {"id": len(anns) + 1, "image_id": i + 1, "category_id": int(b["cls"]) + id_start,
                  "bbox": [round(x1, 2), round(y1, 2), round(x2 - x1, 2), round(y2 - y1, 2)],
                  "area": round((x2 - x1) * (y2 - y1), 2), "iscrowd": 0}
             if b.get("score") is not None:
@@ -178,12 +183,13 @@ def to_coco(items, classes=CLASSES, file_key=os.path.basename):
             if b.get("track") is not None:
                 a["attributes"] = {"track_id": int(b["track"])}
             anns.append(a)
-    cats = [{"id": i, "name": n, "supercategory": "foci"} for i, n in enumerate(classes)]
+    cats = [{"id": i + id_start, "name": n, "supercategory": "foci"} for i, n in enumerate(classes)]
     return {"info": {"description": "Focielemző tanító adatkészlet"}, "licenses": [],
             "images": images, "annotations": anns, "categories": cats}
 
 
-def write_coco(items, out_dir, images_root=None, classes=CLASSES, splits=None, layout="flat", link=False):
+def write_coco(items, out_dir, images_root=None, classes=CLASSES, splits=None, layout="flat", link=False,
+               id_start=1):
     """
     layout:
       "flat"   – out_dir/annotations/<split>.json + out_dir/images/<split>/ (CVAT "COCO 1.0", D-FINE, YOLOX)
@@ -201,7 +207,7 @@ def write_coco(items, out_dir, images_root=None, classes=CLASSES, splits=None, l
         for it in its:
             _copy_image(images_root, it["file"], img_dir, link)
         with open(ann_path, "w", encoding="utf-8") as f:
-            json.dump(to_coco(its, classes), f, ensure_ascii=False)
+            json.dump(to_coco(its, classes, id_start=id_start), f, ensure_ascii=False)
     return out_dir
 
 
@@ -253,6 +259,26 @@ def write_labelstudio(items, out_path, image_url_prefix="/data/local-files/?d=",
     return out_path
 
 
+def fix_coco_ids(path, out=None):
+    """A 0-s category_id-val kezdődő COCO json átszámozása 1-től (CVAT "annotation has no label" hiba)."""
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    ids = sorted(c["id"] for c in data.get("categories", []))
+    if not ids or ids[0] >= 1:
+        print("Nincs mit javítani: a category_id-k már 1-től indulnak.")
+        return 0
+    shift = 1 - ids[0]
+    for c in data["categories"]:
+        c["id"] += shift
+    for a in data.get("annotations", []):
+        a["category_id"] += shift
+    out = out or path
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    print(f"Kész: {len(data.get('annotations', []))} doboz, a címkék 1-től számozva -> {out}")
+    return 0
+
+
 # ====================================================================== CLI
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Adatkészlet-formátumok átalakítása (YOLO txt <-> COCO json, Label Studio)")
@@ -267,7 +293,14 @@ def main(argv=None):
     c.add_argument("--val", type=float, default=0.0, help="validáló arány (videónként csoportosítva)")
     c.add_argument("--test", type=float, default=0.0)
     c.add_argument("--seed", type=int, default=0)
+    c.add_argument("--coco-id-start", type=int, default=1,
+                   help="COCO kimenet: az első osztály category_id-ja (alap 1; ha egy keretrendszer 0-tól várja: 0)")
+    fx = sub.add_parser("cvat-javit", help="régi (0-tól számozott) COCO json javítása CVAT-importhoz (1-től számoz)")
+    fx.add_argument("input", help="a COCO json (pl. elocimke/coco/annotations/train.json)")
+    fx.add_argument("--out", help="kimenet (alap: felülírja a bemenetet)")
     a = ap.parse_args(argv)
+    if a.cmd == "cvat-javit":
+        return fix_coco_ids(a.input, a.out)
     if a.src == "yolo":
         items, classes = read_yolo(a.input)
         root = a.input
@@ -278,7 +311,7 @@ def main(argv=None):
     if a.to == "yolo":
         write_yolo(items, a.out, root, classes, splits)
     elif a.to == "coco":
-        write_coco(items, a.out, root, classes, splits, layout=a.layout)
+        write_coco(items, a.out, root, classes, splits, layout=a.layout, id_start=a.coco_id_start)
     else:
         write_labelstudio(items, a.out, classes=classes)
     print(f"Kész: {len(items)} kép -> {a.out}")
