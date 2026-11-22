@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta
 from jose import jwt, JWTError
-from passlib.context import CryptContext
+import bcrypt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
@@ -15,14 +15,23 @@ SECRET_KEY = app_paths.load_or_create_secret_key()
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 1 hétig érvényes token
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
 
+def _password_bytes(password: str) -> bytes:
+    # A bcrypt legfeljebb 72 bájtot használ (a korábbi passlib-es hash-ek is így készültek);
+    # a bcrypt 5 a hosszabbra hibát dobna, ezért itt vágjuk le.
+    return (password or "").encode("utf-8")[:72]
+
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+    # Közvetlenül a bcrypt csomaggal (a passlib 1.7.4 a bcrypt 5-tel nem működik: minden
+    # regisztráció hibával elszállt). A régi passlib-es "$2b$…" hash-ek ugyanígy ellenőrizhetők.
+    return bcrypt.hashpw(_password_bytes(password), bcrypt.gensalt()).decode("ascii")
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
+    try:
+        return bcrypt.checkpw(_password_bytes(plain_password), (hashed_password or "").encode("ascii"))
+    except ValueError:
+        return False
 
 def create_access_token(data: dict) -> str:
     to_encode = data.copy()

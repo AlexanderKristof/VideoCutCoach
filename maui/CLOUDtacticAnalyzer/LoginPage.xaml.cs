@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Threading.Tasks;
 using Microsoft.Maui.Controls;
 using TacticalAnalyzer.Services;
@@ -67,9 +67,10 @@ public partial class LoginPage : ContentPage
 
             if (!success)
             {
+                var reason = _authService.LastError;
                 ShowError(isRegister
-                    ? "Sikertelen regisztráció (talán már foglalt ez az email cím?)."
-                    : "Hibás email cím vagy jelszó.");
+                    ? $"Sikertelen regisztráció: {reason ?? "ismeretlen ok"}"
+                    : reason ?? "Hibás email cím vagy jelszó.");
                 return;
             }
 

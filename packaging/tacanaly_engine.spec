@@ -61,7 +61,7 @@ if os.path.isfile(_h264):
 hiddenimports = list(APP_MODULES)
 hiddenimports += collect_submodules("uvicorn")          # loops / protocols / lifespan dinamikus import
 hiddenimports += [
-    "passlib.handlers.bcrypt", "bcrypt",                 # a passlib a sémát név szerint tölti be
+    "bcrypt",
     "jose", "jose.jwt", "email_validator",
     "multipart", "python_multipart",                     # Form(...) mezők
     "sqlalchemy.dialects.sqlite",

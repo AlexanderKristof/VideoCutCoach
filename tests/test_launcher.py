@@ -29,7 +29,7 @@ import engine_launcher as L
 import engine_control as C
 from jobs import JobManager
 
-SERVER_DEPS = ("fastapi", "uvicorn", "sqlalchemy", "jose", "passlib", "pydantic", "email_validator",
+SERVER_DEPS = ("fastapi", "uvicorn", "sqlalchemy", "jose", "bcrypt", "pydantic", "email_validator",
                "multipart", "cv2", "numpy")
 
 
