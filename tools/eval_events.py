@@ -40,8 +40,14 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 EVENT_TYPES = ("shot", "goal", "gk_save", "gk_conceded", "gk_goal_kick", "gk_long_ball", "gk_short_pass")
+# Labdás mezőny-események: külön értékelve, az "ÖSSZES" sor (és a régi küszöbök) csak az EVENT_TYPES-ra
+# vonatkozik. A szintetikus meccsben (synth_match) nincs bedobás / szöglet / szabadrúgás forgatókönyv.
+PLAY_TYPES = ("pass", "pass_failed", "interception", "kickoff")
+ALL_TYPES = EVENT_TYPES + PLAY_TYPES
 EVENT_LABELS = {"shot": "lövés", "goal": "gól", "gk_save": "védés", "gk_conceded": "kapott gól",
-                "gk_goal_kick": "kirúgás", "gk_long_ball": "kapus ívelés", "gk_short_pass": "kapus rövid passz"}
+                "gk_goal_kick": "kirúgás", "gk_long_ball": "kapus ívelés", "gk_short_pass": "kapus rövid passz",
+                "pass": "passz", "pass_failed": "sikertelen passz", "interception": "labdaszerzés",
+                "kickoff": "kezdőrúgás"}
 
 DEFAULT_CAMERA = (52.5, 74.0, 7.0)
 
@@ -231,7 +237,7 @@ def run_detector(mod, gt, frames):
     return det.events
 
 
-def score_events(detected, gt_events, tol, types=EVENT_TYPES):
+def score_events(detected, gt_events, tol, types=ALL_TYPES):
     """Eseménytípusonként mohó párosítás (legközelebbi időpont, max. tol mp) -> tp / det / gt / csapat."""
     res = {}
     for typ in types:
@@ -262,9 +268,11 @@ def add_scores(acc, res):
     return acc
 
 
-def totals(acc):
+def totals(acc, types=EVENT_TYPES):
     tot = {"gt": 0, "det": 0, "tp": 0, "team_ok": 0}
     for typ, v in acc.items():
+        if types is not None and typ not in types:
+            continue
         for k in tot:
             tot[k] += v[k]
     return tot
@@ -305,7 +313,7 @@ def format_table(results, title=None):
     lines.append(head)
     lines.append(f"{'':18s}" + "".join(f" | {'P':>5s} {'R':>5s} {'tp/det/gt':>10s}" for _ in levels))
     lines.append("-" * len(head))
-    for typ in list(EVENT_TYPES) + ["_összes"]:
+    for typ in list(EVENT_TYPES) + ["_összes"] + list(PLAY_TYPES):
         row = f"{(EVENT_LABELS.get(typ, typ) if typ != '_összes' else 'ÖSSZES'):18s}"
         for lvl in levels:
             v = totals(results[lvl]) if typ == "_összes" else results[lvl].get(typ, {"gt": 0, "det": 0, "tp": 0})

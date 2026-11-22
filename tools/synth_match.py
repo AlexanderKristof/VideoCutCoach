@@ -375,7 +375,7 @@ class MatchSim:
             receiver.run_until = self.t + T + 0.3
         return T
 
-    def _pass(self, owner, receiver, kind="pass", speed=None, height=0.0, aerial=False, lead=True):
+    def _pass(self, owner, receiver, kind="pass", speed=None, height=0.0, aerial=False, lead=True, gt=True):
         rng = self.rng
         rp = receiver.pos + (receiver.vel * 0.6 if lead else 0) + rng.normal(0, 1.0, 2)
         rp = np.clip(rp, [1.0, 1.0], [L - 1.0, W - 1.0])
@@ -384,6 +384,14 @@ class MatchSim:
             speed = float(np.clip(6.0 + d * 0.25, 7.0, 14.0)) * rng.uniform(0.9, 1.1)
         if kind == "pass" and receiver.team == owner.team:
             self.passes[_team_key(owner.team)] += 1
+        if gt and kind in ("pass", "backpass") and owner.role != "goalkeeper":
+            # ground truth: mezőny-passz csapattárshoz (pass) / az ellenfélhez (pass_failed + interception);
+            # a kapus kihozatala gk_* esemény, a kezdőrúgás kickoff (lásd _restart)
+            if receiver.team == owner.team:
+                self.emit("pass", owner.team, distance_m=round(d, 1))
+            else:
+                self.emit("pass_failed", owner.team, distance_m=round(d, 1))
+                self.emit("interception", receiver.team, t=self.t + max(0.25, d / speed))
         return self._release(kind, owner, rp, speed, height, receiver=receiver, aerial=aerial)
 
     def _shoot(self, owner, outcome):
@@ -645,7 +653,8 @@ class MatchSim:
             self.formation_mode = "play"
             if ph[0] == "kickoff":
                 self.next_phase()
-            self._pass(kicker, rec, lead=False)
+            self.emit("kickoff", team)
+            self._pass(kicker, rec, lead=False, gt=False)
             return
         if kind == "carry_goal_kick":
             self.ball_vis = False

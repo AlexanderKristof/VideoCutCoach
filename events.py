@@ -26,6 +26,13 @@ Zajtűrés (valódi detektor + homográfia kimenetéhez):
   * kirúgás: alapvonalon túlra került labda (nem gól) -> a labda az ötösön belül ≥ 1 mp-ig
     áll -> elrúgják; az esemény időpontja az elrúgás.
 
+Labdás mezőny-események (1. szakasz: minden labdás esemény csapatonként, kalapokba sorolva –
+EVENT_CATEGORIES): passz / sikertelen passz / labdaszerzés / szerelés / labdavezetés a megerősített
+birtoklási szakaszok egymásutánjából; beadás a szélső sávból a 16-osba; szöglet / bedobás /
+szabadrúgás / kezdőrúgás az álló labda helyéből és elrúgásából (bedobás álló labda nélkül is:
+oldalvonalon túl -> holtidő -> a vonal mellől a pályára). Kétes helyzetben nincs esemény; a valós
+felvételen még bizonytalan típusok "experimental": True jelölést kapnak (EXPERIMENTAL_TYPES).
+
 A modul nem függ torch/ultralytics/cv2 csomagtól, így önállóan tesztelhető.
 """
 
@@ -39,6 +46,73 @@ GK_EVENT_TYPES = (
     "gk_save", "gk_claim_cross", "gk_goal_kick", "gk_long_ball",
     "gk_short_pass", "gk_conceded", "gk_sweeper", "gk_positioning_error",
 )
+
+# Labdás (nem kapus) események – a meccs teljes eseménylistájához (1. szakasz: minden labdás esemény
+# felismerése és kategorizálása csapatonként)
+PLAY_EVENT_TYPES = (
+    "pass", "pass_failed", "cross", "throw_in", "corner", "free_kick", "kickoff", "tackle", "interception",
+    "dribble",
+)
+
+# Eseménytípus -> "kalap" (a felület ezek szerint csoportosít). Egyetlen helyen tartjuk.
+EVENT_CATEGORIES = {
+    "corner": "rogzitett", "free_kick": "rogzitett", "throw_in": "rogzitett", "kickoff": "rogzitett",
+    "gk_goal_kick": "rogzitett",
+    "shot": "befejezes", "goal": "befejezes",
+    "cross": "beadas",
+    "pass": "passz", "pass_failed": "passz",
+    "tackle": "labdaszerzes", "interception": "labdaszerzes",
+    "dribble": "labdavezetes",
+}
+for _t in GK_EVENT_TYPES:
+    EVENT_CATEGORIES.setdefault(_t, "kapus")
+
+CATEGORY_LABELS = {
+    "rogzitett": "Rögzített helyzetek", "befejezes": "Befejezések", "beadas": "Beadások",
+    "passz": "Passzok", "labdaszerzes": "Labdaszerzések", "labdavezetes": "Labdavezetés",
+    "kapus": "Kapus események", "egyeb": "Egyéb",
+}
+
+EVENT_LABELS = {
+    "shot": "Lövés", "goal": "Gól", "pass": "Passz", "pass_failed": "Sikertelen passz", "cross": "Beadás",
+    "throw_in": "Bedobás", "corner": "Szöglet", "free_kick": "Szabadrúgás", "kickoff": "Kezdőrúgás",
+    "tackle": "Szerelés", "interception": "Labdaszerzés (elfogott passz)", "dribble": "Labdavezetés / cselezés",
+    "gk_save": "Kapus védés", "gk_claim_cross": "Beadás elfogása", "gk_goal_kick": "Kirúgás",
+    "gk_long_ball": "Kapus ívelés", "gk_short_pass": "Kapus rövid passz", "gk_conceded": "Kapott gól",
+    "gk_sweeper": "Kapus kifutás", "gk_positioning_error": "Kapus helyezkedési hiba",
+}
+
+# Kísérleti (a valós, zajos felvételen még nem elég megbízható) típusok: az esemény "experimental": True
+# jelölést kap, a felület alapból elrejtheti / külön jelölheti. Lásd tools/replay_events.py.
+EXPERIMENTAL_TYPES = frozenset({"pass_failed", "tackle", "interception", "cross", "dribble"})
+
+# Típusonkénti klip-ablak (mp az esemény előtt, után) – ahol eltér az alapértelmezéstől
+_CLIP_WINDOWS = {
+    "pass": (2.0, 2.0), "pass_failed": (2.0, 3.0), "tackle": (3.0, 3.0), "interception": (3.0, 3.0),
+    "cross": (3.0, 4.0), "throw_in": (2.0, 5.0), "corner": (2.0, 7.0), "free_kick": (3.0, 7.0),
+    "kickoff": (1.0, 5.0), "dribble": (1.0, 2.0),
+}
+
+
+def event_category(typ):
+    """Az eseménytípus kalapja (EVENT_CATEGORIES), ismeretlen típusnál "egyeb"."""
+    return EVENT_CATEGORIES.get(typ, "kapus" if str(typ).startswith("gk_") else "egyeb")
+
+
+def annotate_categories(events):
+    """A 'category' mező pótlása (külső / régi eseménylistákhoz). Helyben módosít, a listát adja vissza."""
+    for ev in events or []:
+        if isinstance(ev, dict) and ev.get("type"):
+            ev.setdefault("category", event_category(ev["type"]))
+    return events
+
+
+# Eseménytípus -> a stats kulcsa (a statisztika a kiadott eseményeket számolja)
+_STAT_KEYS = {
+    "pass": "passes", "pass_failed": "passes_failed", "cross": "crosses", "tackle": "tackles",
+    "interception": "interceptions", "throw_in": "throw_ins", "corner": "corners",
+    "free_kick": "free_kicks", "kickoff": "kickoffs", "dribble": "dribbles",
+}
 
 _NEG_INF = float("-inf")
 
@@ -190,6 +264,7 @@ class EventConfig:
         self.min_distribution_m = 4.0
         self.distribution_timeout_s = 6.0
         self.distribution_lost_s = 3.5     # ennyi ideig várunk a levegőben "eltűnt" labdára
+        self.distribution_return_m = 15.0  # a legtávolabbi ponthoz képest ennyivel visszajött labda: a kihozatal vége
         self.gk_keep_radius_m = 2.5
         self.gk_release_radius_m = 3.0
         self.gk_hold_max_s = 8.0           # a kézben (láthatatlanul) tartott labda max. ideje
@@ -205,6 +280,59 @@ class EventConfig:
         # --- Kapus szabadrúgás (pl. les után): a kapus az álló labdához megy és elrúgja ---
         self.gk_free_kick_keeper_radius_m = 3.0
         self.gk_free_kick_max_line_dist_m = 35.0
+
+        # --- Labdabirtoklási szakaszok (passz / sikertelen passz / szerelés / labdaszerzés) ---
+        # Birtoklási minta: a labda (simított pozíció) a legközelebbi játékostól ctl_radius_m-en belül,
+        # lassú, a pályán belül, és a legközelebbi ellenfél nincs majdnem ugyanolyan közel (vitatott labda).
+        self.ctl_radius_m = 2.0
+        self.ctl_max_ball_speed_mps = 8.0
+        self.ctl_contest_margin_m = 0.4    # ennyin belül egyformán közeli ellenfél: vitatott, nem számít
+        self.ctl_min_samples = 3           # egy birtoklás ennyi mintától "megerősített"
+        self.ctl_min_span_s = 0.2          # ... és legalább ennyi ideig tart
+        self.ctl_gap_s = 1.0               # a birtokláson belül ennyi labda-kiesést tűrünk
+        self.ctl_same_player_m = 3.0       # ID-csere: ha a labda ennyin belül marad, ugyanaz a játékos vezeti
+        self.pass_min_m = 6.0              # a passz minimális hossza (rövidebb: cselezés / zaj)
+        self.pass_min_gap_s = 0.2
+        self.pass_max_gap_s = 4.0          # a passzadás és az átvétel között legfeljebb ennyi idő
+        self.pass_max_speed_mps = 40.0     # efölötti átlagsebesség: téves labda-ugrás
+        self.pass_dribble_m = 2.5          # a passzadó még a labdánál: cselezés, nem passz
+        self.pass_max_unseen_s = 1.5       # ennél hosszabb labda-kiesés a két birtoklás között: nem tudjuk, mi történt
+        self.pass_receive_s = 1.2          # az átvétel legfeljebb ennyivel azután, hogy a labda az átvétel helyére ért
+        self.pass_long_m = 30.0
+        self.pass_progressive_m = 10.0
+        self.pass_failed_min_m = 8.0       # ennél hosszabb úton az ellenfélhez kerülő labda: sikertelen passz
+        self.tackle_max_m = 4.0            # ennél rövidebb úton, közvetlen kontaktussal: szerelés
+        self.tackle_contact_m = 2.5        # a szerelő játékos ennyire volt a labdától az utolsó birtoklási mintánál
+        self.dribble_min_m = 10.0          # labdavezetés: a birtoklás alatt ennyit haladt a labda
+        self.dribble_min_s = 1.5
+
+        # --- Beadás (szélről a 16-os felé) ---
+        self.cross_final_third_m = 35.0    # a beadás a gólvonaltól ennyin belül induljon
+        self.cross_box_tol_m = 1.0         # a 16-os határán ennyi pozíciózajt tűrünk
+        self.cross_min_m = 8.0
+        self.cross_window_flight_s = 4.0   # az indítás után eddig kell a 16-osba érnie
+
+        # --- Rögzített helyzetek (szöglet, bedobás, szabadrúgás, kezdőrúgás) ---
+        self.restart_launch_dist_m = 3.0   # az álló labda ennyit mozdul el -> elrúgták / bedobták
+        self.restart_min_speed_mps = 5.0
+        self.restart_debounce_s = 3.0
+        self.restart_team_wait_s = 4.0     # ismeretlen végrehajtó csapat: eddig várunk a következő birtoklásra
+        self.restart_kicker_m = 2.5        # a végrehajtó játékos ennyin belül legyen az álló labdától
+        self.corner_radius_m = 3.5         # a szögletzászlótól ennyin belül álló labda: szöglet
+        self.corner_still_s = 1.0
+        self.touch_zone_m = 2.5            # az oldalvonaltól ennyin belül (vagy kívül) álló labda: bedobás
+        self.touch_out_margin_m = 0.5      # ennyivel az oldalvonalon túl: a labda elhagyta a pályát
+        self.throw_in_still_s = 0.8
+        self.throw_in_rest_alone_s = 1.5   # oldalvonalon túlra kerülés nélkül ennyi ideig álljon a labda
+        self.throw_in_min_dead_s = 3.0     # a pályára azonnal visszagurulás nem bedobás
+        self.throw_in_out_memory_s = 60.0
+        self.throw_in_max_dx_m = 25.0      # a bedobás helye a kimenetel helyétől
+        self.free_kick_still_s = 1.5
+        self.free_kick_dead_s = 3.0        # ennyi állás már biztosan holt labda (rövidebbnél más jel is kell)
+        self.free_kick_players_m = 15.0
+        self.free_kick_min_players = 2
+        self.free_kick_dangerous_m = 35.0  # ennyin belül az ellenfél kapujától: veszélyes szabadrúgás
+        self.kickoff_still_s = 1.0
 
         # --- Klip javaslat ---
         self.clip_pre_s = 4.0
@@ -237,6 +365,9 @@ class EventDetector:
             "goals": {"team1": 0, "team2": 0},
             "gk_events": {"team1": {}, "team2": {}},
         }
+        # a labdás események darabszáma csapatonként (pontosan a kiadott eseményeket számolja)
+        for key in _STAT_KEYS.values():
+            self.stats[key] = {"team1": 0, "team2": 0}
 
         self._raw = deque()              # elfogadott nyers labdaminták (t, x, y)
         self._cand = None                # alternatív labda-track jelölt (téves felvillanás vagy új labda)
@@ -269,6 +400,26 @@ class EventDetector:
         self._held_seq = None            # (team, n, t) – a kapus kamera-sugarán látott labda
         self._dist = None
         self._dist_started = []          # (t, team) – kapus-kihozatalok indulása (gól-jelölt elvetéséhez)
+        # --- labdabirtoklási szakaszok (passz / szerelés) ---
+        self._tid_team = {}              # track_id -> [1. csapat szavazat, 2. csapat szavazat]
+        self._ctl = None                 # az aktuális (esetleg még meg nem erősített) birtoklás
+        self._ctl_last = None            # az utolsó megerősített birtoklás
+        self._ctl_break_t = _NEG_INF     # játékmegszakítás / lövés / rögzített helyzet ideje (passz-lánc vége)
+        self._ctl_foreign_t = _NEG_INF   # utolsó meg nem erősített ellenfél-érintés ideje
+        self._flight = None              # a labda útja az utolsó megerősített birtoklás vége óta (beadáshoz)
+        self._out_play_n = 0             # egymást követő, a pályán kívüli labdaminták
+        # --- rögzített helyzetek ---
+        self._touch_seq = None           # (oldal_y, n, t_első, x) – egymást követő minták az oldalvonalon túl
+        self._line_out = None            # oldalvonalon túlra került labda: {side, t, x, last_team}
+        self._sp_armed = None            # álló labda, végrehajtásra várva: {kind, x, y, t_still, ...}
+        self._sp_wait = None             # kiadott rögzített helyzet, a csapata még ismeretlen
+        self._sp_follow = None           # az utolsó rögzített helyzet (a következő birtoklás kimenetéhez)
+        self._last_restart_t = _NEG_INF
+        self._rest_free = None           # (rest objektum, szabad minták, összes) – a labda mellett nincs játékos
+        self._prev_ball = None           # az előző elfogadott labdaminta (t, x, y)
+        self._ball_switch_t = _NEG_INF   # az utolsó labda-track váltás ideje (_feed_candidate)
+        self._unseen_max = 0.0           # a leghosszabb labda-kiesés az utolsó megerősített birtoklás óta
+        self._last_goal_team = None
         self._new = []
         self._last_t = None
 
@@ -312,6 +463,10 @@ class EventDetector:
         self._check_goal_kick(t, ball, speed)
         self._update_gk_possession(t, ball, speed, closest, cdist)
         self._check_sweeper(t)
+        self._update_restarts(t, ball, speed, closest, cdist, players)
+        self._update_control(t, ball, speed, closest, cdist, players)
+        if ball is not None:
+            self._prev_ball = (t, ball[0], ball[1])
 
         self._last_t = t
         return self._new
@@ -333,6 +488,11 @@ class EventDetector:
         if self._dist is not None:
             self._finish_distribution()
         self._gk_poss = None
+        self._close_flight(t, None, final=True)
+        if self._ctl_last is not None:
+            self._check_dribble(self._ctl_last)
+        if self._sp_wait is not None:
+            self._flush_restart(None)
         self._last_t = t
         return self._new
 
@@ -388,15 +548,29 @@ class EventDetector:
     # ------------------------------------------------------------ segédek
     def _emit(self, ev):
         t = ev["time"]
+        typ = ev["type"]
         ev["time"] = round(float(t), 2)
-        ev.setdefault("start_sec", round(max(0.0, t - self.cfg.clip_pre_s), 2))
-        ev.setdefault("end_sec", round(t + self.cfg.clip_post_s, 2))
+        pre, post = _CLIP_WINDOWS.get(typ, (self.cfg.clip_pre_s, self.cfg.clip_post_s))
+        ev.setdefault("start_sec", round(max(0.0, t - pre), 2))
+        ev.setdefault("end_sec", round(t + post, 2))
+        ev.setdefault("category", event_category(typ))
+        if typ in EXPERIMENTAL_TYPES:
+            ev.setdefault("experimental", True)
         self.events.append(ev)
         self._new.append(ev)
         team = ev.get("team")
-        if ev["type"].startswith("gk_") and team in self.stats["gk_events"]:
+        if typ.startswith("gk_") and team in self.stats["gk_events"]:
             bucket = self.stats["gk_events"][team]
-            bucket[ev["type"]] = bucket.get(ev["type"], 0) + 1
+            bucket[typ] = bucket.get(typ, 0) + 1
+        key = _STAT_KEYS.get(typ)
+        if key is not None and team in self.stats[key]:
+            self.stats[key][team] += 1
+        if typ == "goal":
+            self._last_goal_team = team
+        if typ in ("shot", "goal", "gk_goal_kick", "gk_long_ball", "gk_short_pass", "gk_save",
+                   "gk_claim_cross", "gk_conceded"):
+            # a lövés / gól / kapus-kihozatal megszakítja a mezőny-passzláncot
+            self._ctl_break_t = max(self._ctl_break_t, float(t))
         return ev
 
     def _goal_xs(self):
@@ -465,6 +639,7 @@ class EventDetector:
             self._raw.extend(c)
             self._cand = None
             self._bst = None
+            self._ball_switch_t = t   # új labda-track: a korábbi álló labdához kötött állapot érvénytelen
             return True
         return False
 
@@ -1306,6 +1481,14 @@ class EventDetector:
             "last_t": armed["t_still"], "still_t": None,
         }
         self._dist_started.append((armed["t_still"], team))
+        self._ctl_break_t = max(self._ctl_break_t, armed["t_still"])
+        self._ctl_last = None
+        self._sp_armed = None
+        self._line_out = None
+        self._last_restart_t = armed["t_still"]
+        if armed.get("kind") == "free_kick":
+            # A kapus szabadrúgása rögzített helyzetként is megjelenik (a kihozatal gk_* eseménye mellett)
+            self._emit_free_kick(armed["t_still"], (armed["x"], armed["y"]), team, by_keeper=True, keeper_tid=tid)
 
     # ------------------------------------------- kapus birtoklás / kihozatal
     def _update_gk_possession(self, t, ball, speed, closest, cdist):
@@ -1408,7 +1591,19 @@ class EventDetector:
             return
         if ball is not None:
             dd = math.hypot(ball[0] - d["p0"][0], ball[1] - d["p0"][1])
+            if dd > d["max_d"] + 3.0:
+                d["max_n"] = 1
+            elif dd >= d["max_d"] - 3.0:
+                d["max_n"] = d.get("max_n", 0) + 1
             d["max_d"] = max(d["max_d"], dd)
+            if (d.get("max_n", 0) >= 3 and d["max_d"] >= cfg.min_distribution_m
+                    and dd < d["max_d"] - cfg.distribution_return_m):
+                # A labda (a nem látott átvétel után) jóval a legtávolabbi pontja elől jön vissza: a kihozatal
+                # hossza a legtávolabbi (legalább három mintával alátámasztott) pont, nem a mostani helyzet
+                # (valós hiba: az 50 m-es kapus-ívelés 31 m-es rövid passznak látszott).
+                d["end_d"] = d["max_d"]
+                self._finish_distribution()
+                return
             d["end_d"] = dd
             d["last_t"] = t
             slow = speed is None or speed <= cfg.possession_max_ball_speed_mps
@@ -1547,6 +1742,598 @@ class EventDetector:
                 "desc": f"Kapus kifutás – {_keeper_label(k['team'], k['tid'])}, "
                         f"{abs(x - goal_x):.0f} m-re a gólvonaltól, {sp:.1f} m/s",
             })
+
+    # ================================================== labdás mezőny-események
+    # Birtoklási szakaszok: egy szakasz ugyanannak a csapatnak (és – ID-cserét tűrve – ugyanannak a
+    # játékosnak) az egymást követő birtoklási mintái. Egy szakasz csak ctl_min_samples minta után
+    # "megerősített"; két egymást követő megerősített szakaszból dől el a passz / sikertelen passz /
+    # szerelés. A zajos (egykamerás) bemenet miatt a pontosság fontosabb a felidézésnél: kétes
+    # helyzetben (vitatott labda, közbeeső ellenfél-érintés, cselezés, játékmegszakítás) nincs esemény.
+
+    def _attack_goal(self, team):
+        """A csapat által támadott kapu x-e (a mezőnyjátékosok átlagos helyzetéből, lásd defending_team)."""
+        return self.L if self.defending_team(0.0) == team else 0.0
+
+    def _in_box(self, p, goal_x, tol=0.0):
+        return abs(p[0] - goal_x) <= 16.5 + tol and abs(p[1] - self.W / 2.0) <= 20.16 + tol
+
+    def _zone_of(self, p, team):
+        """A pont a csapat saját vagy az ellenfél térfelén van (a csapat támadási iránya szerint)."""
+        return "ellenfel_terfel" if self._line_dist(p, self._attack_goal(team)) < self.L / 2.0 else "sajat_terfel"
+
+    def _player_team(self, p):
+        """A játékos csapata a követés eddigi többségi besorolásából (a képkockánkénti mezszín-besorolás
+        egy-egy kockán téveszthet); kevés / bizonytalan szavazatnál a képkocka szerinti besorolás.
+        A kapus csapata – mint a _update_keepers-ben – a védett kapuból (pályaoldalból) dől el."""
+        if p.get("is_keeper"):
+            return self.defending_team(0.0 if float(p["pitch_coords"][0]) < self.L / 2.0 else self.L)
+        tid = p.get("track_id")
+        v = self._tid_team.get(tid) if tid is not None else None
+        if v is not None and v[0] + v[1] >= 5:
+            if v[0] >= 2.0 * v[1]:
+                return "team1"
+            if v[1] >= 2.0 * v[0]:
+                return "team2"
+        return f"team{p.get('team_id', 1)}"
+
+    def _vote_teams(self, players):
+        for p in players:
+            tid = p.get("track_id")
+            try:
+                tm = int(p.get("team_id"))
+            except (TypeError, ValueError):
+                continue
+            if tid is None or tm not in (1, 2) or not p.get("team_known", True):
+                continue
+            v = self._tid_team.get(tid)
+            if v is None:
+                v = self._tid_team[tid] = [0.0, 0.0]
+            v[tm - 1] += 1.0
+            if v[0] + v[1] > 60.0:      # lassan felejt (újrahasznosított / cserélt ID)
+                v[0] *= 0.5
+                v[1] *= 0.5
+
+    def _update_control(self, t, ball, speed, closest, cdist, players):
+        cfg = self.cfg
+        self._vote_teams(players)
+        if ball is None:
+            return
+        pb = self._prev_ball
+        if pb is not None:
+            self._unseen_max = max(self._unseen_max, t - pb[0])
+        self._update_flight(t, ball)
+        x, y = ball
+        m = cfg.touch_out_margin_m
+        if x < -m or x > self.L + m or y < -m or y > self.W + m:
+            self._out_play_n += 1
+            if self._out_play_n >= 2:   # a labda elhagyta a pályát: a passzlánc megszakad
+                self._ctl_break_t = max(self._ctl_break_t, t)
+                self._close_flight(t, None)
+            return
+        self._out_play_n = 0
+        if closest is None or cdist > cfg.ctl_radius_m:
+            return
+        if speed is not None and speed > cfg.ctl_max_ball_speed_mps:
+            return
+        team = self._player_team(closest)
+        snap = []
+        for p in players:
+            px, py = p["pitch_coords"]
+            d = math.hypot(px - x, py - y)
+            if d > 12.0:
+                continue
+            pteam = self._player_team(p)
+            if p is not closest and pteam != team and d <= cdist + cfg.ctl_contest_margin_m:
+                return   # vitatott labda: egy ellenfél majdnem ugyanolyan közel
+            snap.append((p.get("track_id"), pteam, px, py))
+        tid = closest.get("track_id")
+        keeper = 1 if closest.get("is_keeper") else 0
+        ep = self._ctl
+        if ep is not None and ep["team"] == team and t - ep["t1"] <= cfg.ctl_gap_s and (
+                tid == ep["tid"] or math.hypot(x - ep["p1"][0], y - ep["p1"][1]) <= cfg.ctl_same_player_m):
+            ep["t1"] = t
+            ep["p1"] = ball
+            ep["n"] += 1
+            ep["tid"] = tid
+            ep["keeper_n"] += keeper
+            if ep is self._ctl_last:
+                self._unseen_max = 0.0
+        else:
+            last = self._ctl_last
+            if ep is not None and not ep["conf"] and last is not None and ep["team"] != last["team"]:
+                self._ctl_foreign_t = ep["t1"]   # rövid ellenfél-érintés (nem lett birtoklás)
+            ep = self._ctl = {"team": team, "tid": tid, "tid0": tid, "t0": t, "t1": t, "p0": ball, "p1": ball,
+                              "n": 1, "keeper_n": keeper, "conf": False}
+        ep["snap"] = snap
+        if not ep["conf"] and ep["n"] >= cfg.ctl_min_samples and ep["t1"] - ep["t0"] >= cfg.ctl_min_span_s - 1e-9:
+            ep["conf"] = True
+            prev = self._ctl_last
+            self._ctl_last = ep
+            ep["unseen_before"] = self._unseen_max
+            self._unseen_max = 0.0
+            self._on_new_control(t, prev, ep, players)
+
+    def _on_new_control(self, t, A, B, players):
+        """Új megerősített birtoklás (B) az előző (A) után: passz / sikertelen passz / szerelés / beadás."""
+        cfg = self.cfg
+        f = self._sp_follow
+        if f is not None:
+            self._sp_follow = None
+            if f.get("team") and B["t0"] - f["time"] <= 8.0:
+                f["retained"] = B["team"] == f["team"]   # a rögzített helyzet után a csapatnál maradt-e
+        if self._sp_wait is not None:
+            self._flush_restart(B["team"])
+        if A is None:
+            return
+        self._check_dribble(A)
+        fl = self._flight
+        if fl is not None and fl["ep"] is A and self._close_flight(t, B):
+            return   # beadás volt (a passz helyett)
+        if self._ctl_break_t >= A["t1"] - 0.5:
+            return   # közben játékmegszakítás / lövés / rögzített helyzet volt
+        if any(A["t1"] - 1.0 <= ts <= B["t0"] for ts, _ in self._dist_started):
+            return   # kapus-kihozatal (gk_* esemény)
+        ps = self._pending_shot
+        if (ps is not None and ps["t"] >= A["t1"] - 1.0) or self._goal_cand is not None:
+            return
+        gap = B["t0"] - A["t1"]
+        if gap > cfg.pass_max_gap_s or B.get("unseen_before", 0.0) > cfg.pass_max_unseen_s:
+            return
+        p1, p0 = A["p1"], B["p0"]
+        d = math.hypot(p0[0] - p1[0], p0[1] - p1[1])
+        if d / max(gap, 1e-3) > cfg.pass_max_speed_mps:
+            return   # téves labda-ugrás
+        t_arr = None
+        for rt, rx, ry in self._raw:
+            if rt > A["t1"] and math.hypot(rx - p0[0], ry - p0[1]) <= 3.0:
+                t_arr = rt
+                break
+        if t_arr is not None and B["t0"] - t_arr > cfg.pass_receive_s:
+            return   # a labda már korábban odaért, és ott állt / ott volt (nem követett játékosnál?): kétes
+        if A["tid"] is not None and A["tid"] in (B["tid0"], B["tid"]):
+            return   # ugyanaz a játékos (csapat-besorolás villogása / cselezés kieséssel)
+        if 2 * A["keeper_n"] > A["n"]:
+            return   # a kapus labdája: a kihozatalt a gk_* események írják le
+        if B["team"] == A["team"]:
+            if d < cfg.pass_min_m or gap < cfg.pass_min_gap_s or self._ctl_foreign_t > A["t1"] - 0.1:
+                return
+            for stid, steam, sx, sy in A["snap"]:
+                if stid is not None and stid == B["tid0"] and math.hypot(sx - p1[0], sy - p1[1]) <= cfg.pass_dribble_m:
+                    return   # az "átvevő" már a passz pillanatában a labdánál volt: cselezés
+            for p in players:
+                if p.get("track_id") == A["tid"]:
+                    px, py = p["pitch_coords"]
+                    if math.hypot(px - B["p1"][0], py - B["p1"][1]) <= cfg.pass_dribble_m:
+                        return   # a "passzadó" még mindig a labdánál: cselezés
+            self._emit_pass(A, B, d)
+        elif d >= cfg.pass_failed_min_m and gap >= cfg.pass_min_gap_s:
+            self._emit_pass_failed(A, B, d)
+        elif d <= cfg.tackle_max_m:
+            contact = any(steam == B["team"] and math.hypot(sx - p1[0], sy - p1[1]) <= cfg.tackle_contact_m
+                          for stid, steam, sx, sy in A["snap"])
+            if contact:
+                self._emit_tackle(A, B, d)
+
+    def _check_dribble(self, A):
+        """Labdavezetés: egy megerősített birtoklásban a labda legalább dribble_min_m-t haladt (kezdő- és
+        végpont között), legalább dribble_min_s ideig, mezőnyjátékosnál. Kísérleti (lásd EXPERIMENTAL_TYPES)."""
+        cfg = self.cfg
+        if A.get("dribble_checked"):
+            return
+        A["dribble_checked"] = True
+        if 2 * A["keeper_n"] > A["n"] or A["t1"] - A["t0"] < cfg.dribble_min_s:
+            return
+        d = math.hypot(A["p1"][0] - A["p0"][0], A["p1"][1] - A["p0"][1])
+        if d < cfg.dribble_min_m or A["n"] < 3 * cfg.ctl_min_samples:
+            return
+        team = A["team"]
+        atk = self._attack_goal(team)
+        gain = self._line_dist(A["p0"], atk) - self._line_dist(A["p1"], atk)
+        self._emit({
+            "type": "dribble", "time": A["t0"], "team": team, "player_track_id": A["tid0"],
+            "from_xy": [round(A["p0"][0], 1), round(A["p0"][1], 1)], "to_xy": [round(A["p1"][0], 1), round(A["p1"][1], 1)],
+            "distance_m": round(d, 1), "duration_s": round(A["t1"] - A["t0"], 1), "gain_m": round(gain, 1),
+            "progressive": gain >= cfg.pass_progressive_m, "zone": self._zone_of(A["p0"], team),
+            "end_sec": round(A["t1"] + 2.0, 2),
+            "desc": f"Labdavezetés – {_team_label(team)}, {d:.0f} m, {A['t1'] - A['t0']:.1f} mp"
+                    + (" (előre)" if gain >= cfg.pass_progressive_m else ""),
+        })
+
+    def _pass_fields(self, A, B, d, team):
+        atk = self._attack_goal(team)
+        p0, p1 = A["p1"], B["p0"]
+        gain = self._line_dist(p0, atk) - self._line_dist(p1, atk)
+        return {
+            "from_xy": [round(p0[0], 1), round(p0[1], 1)], "to_xy": [round(p1[0], 1), round(p1[1], 1)],
+            "distance_m": round(d, 1), "gain_m": round(gain, 1), "zone": self._zone_of(p0, team),
+            "is_long": d > self.cfg.pass_long_m, "progressive": gain >= self.cfg.pass_progressive_m,
+            "into_box": self._in_box(p1, atk) and not self._in_box(p0, atk),
+            "player_track_id": A["tid"], "receive_time": round(B["t0"], 2), "attack_goal_x": atk,
+        }
+
+    def _emit_pass(self, A, B, d):
+        team = A["team"]
+        ev = {"type": "pass", "time": A["t1"], "team": team}
+        ev.update(self._pass_fields(A, B, d, team))
+        ev["receiver_track_id"] = B["tid0"]
+        ev["end_sec"] = round(B["t0"] + 2.0, 2)
+        tags = [t for t, on in (("hosszú", ev["is_long"]), ("előre játszott", ev["progressive"]),
+                                ("a 16-osba", ev["into_box"])) if on]
+        ev["desc"] = (f"Passz – {_team_label(team)}, {d:.0f} m" + (f" ({', '.join(tags)})" if tags else "")
+                      + (", saját térfélről" if ev["zone"] == "sajat_terfel" else ", az ellenfél térfelén"))
+        self._emit(ev)
+
+    def _emit_pass_failed(self, A, B, d):
+        team = A["team"]
+        ev = {"type": "pass_failed", "time": A["t1"], "team": team, "won_by": B["team"]}
+        ev.update(self._pass_fields(A, B, d, team))
+        ev["receiver_track_id"] = B["tid0"]
+        ev["end_sec"] = round(B["t0"] + 3.0, 2)
+        ev["desc"] = (f"Sikertelen passz – {_team_label(team)}, {d:.0f} m, "
+                      f"az ellenfél ({_team_label(B['team'])}) szerezte meg")
+        self._emit(ev)
+        self._emit({
+            "type": "interception", "time": B["t0"], "team": B["team"], "player_track_id": B["tid0"],
+            "lost_by": team, "from_xy": ev["from_xy"], "to_xy": ev["to_xy"], "distance_m": ev["distance_m"],
+            "zone": self._zone_of(B["p0"], B["team"]), "pass_time": ev["time"],
+            "desc": f"Labdaszerzés (elfogott passz) – {_team_label(B['team'])}",
+        })
+
+    def _emit_tackle(self, A, B, d):
+        team = B["team"]
+        p = B["p0"]
+        self._emit({
+            "type": "tackle", "time": A["t1"], "team": team, "player_track_id": B["tid0"],
+            "lost_by": A["team"], "lost_by_track_id": A["tid"], "from_xy": [round(p[0], 1), round(p[1], 1)],
+            "distance_m": round(d, 1), "zone": self._zone_of(p, team),
+            "end_sec": round(B["t0"] + 3.0, 2),
+            "desc": f"Szerelés / labdaszerzés párharcban – {_team_label(team)}, "
+                    f"{'az ellenfél' if self._zone_of(p, team) == 'ellenfel_terfel' else 'a saját'} térfelén",
+        })
+
+    # ---------------------------------------------------------------- beadás
+    def _cross_origin(self, A):
+        """A birtoklás vége beadás-helyről (szélső sáv a 16-os szélességén kívül, utolsó harmad) történt-e."""
+        if 2 * A["keeper_n"] > A["n"]:
+            return False
+        p = A["p1"]
+        atk = self._attack_goal(A["team"])
+        return (0.0 <= p[0] <= self.L and 0.0 <= p[1] <= self.W and abs(p[1] - self.W / 2.0) > 20.16
+                and self._line_dist(p, atk) <= self.cfg.cross_final_third_m)
+
+    def _update_flight(self, t, ball):
+        A = self._ctl_last
+        if A is None:
+            self._flight = None
+            return
+        fl = self._flight
+        if fl is None or fl["ep"] is not A:
+            fl = self._flight = {"ep": A, "box_t": None, "box_pt": None}
+        if t <= A["t1"] + 1e-6 or fl["box_t"] is not None:
+            return
+        if t - A["t1"] > self.cfg.cross_window_flight_s:
+            return
+        if not self._cross_origin(A):
+            return
+        atk = self._attack_goal(A["team"])
+        if (self._in_box(ball, atk, self.cfg.cross_box_tol_m)
+                and math.hypot(ball[0] - A["p1"][0], ball[1] - A["p1"][1]) >= self.cfg.cross_min_m
+                and abs(ball[1] - self.W / 2.0) < abs(A["p1"][1] - self.W / 2.0) - 3.0):
+            fl["box_t"] = t
+            fl["box_pt"] = ball
+
+    def _close_flight(self, t, B, final=False):
+        """A labda útja az A birtoklás után lezárul (új birtoklás B, labda a pályán kívül, klip vége).
+        Ha szélről a 16-os felé indult és oda is ért: beadás. Visszatér: volt-e beadás."""
+        cfg = self.cfg
+        fl = self._flight
+        if fl is None or (B is not None and fl["ep"] is B):
+            return False
+        A = fl["ep"]
+        self._flight = None
+        if not self._cross_origin(A):
+            return False
+        atk = self._attack_goal(A["team"])
+        box_pt = fl["box_pt"]
+        if box_pt is None and B is not None and B["t0"] - A["t1"] <= cfg.cross_window_flight_s:
+            p = B["p0"]
+            if (self._in_box(p, atk, cfg.cross_box_tol_m)
+                    and math.hypot(p[0] - A["p1"][0], p[1] - A["p1"][1]) >= cfg.cross_min_m
+                    and abs(p[1] - self.W / 2.0) < abs(A["p1"][1] - self.W / 2.0) - 3.0):
+                box_pt = p
+        if box_pt is None:
+            return False
+        shot_after = False
+        for ev in reversed(self.events[-12:]):
+            if ev["type"] == "shot" and ev.get("team") == A["team"] and ev["time"] >= A["t1"] - 0.6:
+                if ev["time"] <= A["t1"] + 0.6:
+                    return False   # maga a "beadás" volt a lövés
+                shot_after = True
+        if B is not None:
+            completed = B["team"] == A["team"] or shot_after
+        elif shot_after:
+            completed = True
+        else:
+            completed = None if final else False
+        team = A["team"]
+        p0 = A["p1"]
+        side = "kozeli" if p0[1] > self.W / 2.0 else "tavoli"
+        res = {True: "sikeres", False: "sikertelen", None: "kimenetel ismeretlen"}[completed]
+        ev = {
+            "type": "cross", "time": A["t1"], "team": team, "player_track_id": A["tid"],
+            "from_xy": [round(p0[0], 1), round(p0[1], 1)], "to_xy": [round(box_pt[0], 1), round(box_pt[1], 1)],
+            "completed": completed, "side": side, "attack_goal_x": atk,
+            "desc": f"Beadás – {_team_label(team)} ({'közeli' if side == 'kozeli' else 'túlsó'} szélről, {res})",
+        }
+        if B is not None:
+            ev["receiver_track_id"] = B["tid0"]
+            ev["won_by"] = B["team"]
+        self._emit(ev)
+        return True
+
+    # =================================================== rögzített helyzetek
+    # Álló labda (self._rest) a pálya jellegzetes pontján -> felfegyverzés -> a labda elmozdul
+    # (restart_launch_dist_m, restart_min_speed_mps) -> esemény a végrehajtás pillanatában.
+    #   * középpont: kezdőrúgás; szögletzászló: szöglet; oldalvonal: bedobás; ötös: kirúgás (lásd fent);
+    #   * egyéb álló labda: szabadrúgás, ha valóban holt labda (elég hosszú állás / újra-megjelenés / nincs
+    #     a labdánál játékos) és vannak körülötte játékosok.
+    # A bedobás álló labda nélkül is felismerhető: oldalvonalon túlra kerülés -> legalább
+    # throw_in_min_dead_s holtidő -> a labda az oldalvonal mellől indulva a pályára kerül.
+
+    def _update_restarts(self, t, ball, speed, closest, cdist, players):
+        self._track_touch_out(t, ball)
+        if ball is not None:
+            r = self._rest
+            if r is not None:
+                rf = self._rest_free
+                if rf is None or rf[0] is not r:
+                    rf = self._rest_free = [r, 0, 0]
+                rf[2] += 1
+                if cdist is None or cdist > 1.2:
+                    rf[1] += 1
+            if self._sp_armed is not None:
+                self._advance_restart(t, ball, speed, closest, cdist, players)
+            else:
+                self._arm_restart(t, players)
+                if self._sp_armed is None:
+                    self._check_throw_in_reappear(t, ball)
+        w = self._sp_wait
+        if w is not None and t - w["t_launch"] > self.cfg.restart_team_wait_s:
+            self._flush_restart(None)
+
+    def _track_touch_out(self, t, ball):
+        if ball is None:
+            return
+        cfg = self.cfg
+        x, y = ball
+        m = cfg.touch_out_margin_m
+        side = 0.0 if y < -m else (self.W if y > self.W + m else None)
+        if side is None or not (-1.0 <= x <= self.L + 1.0):
+            self._touch_seq = None
+            lo = self._line_out
+            if lo is not None and t - lo["t"] > cfg.throw_in_out_memory_s:
+                self._line_out = None
+            return
+        ts = self._touch_seq
+        ts = (side, ts[1] + 1, ts[2], ts[3]) if (ts is not None and ts[0] == side) else (side, 1, t, x)
+        self._touch_seq = ts
+        if ts[1] < 2:
+            return
+        lo = self._line_out
+        if lo is None or lo["side"] != side or t - lo["t_last"] > 5.0:
+            last = self._ctl_last
+            last_team = last["team"] if (last is not None and 0.0 <= ts[2] - last["t1"] <= 4.0) else None
+            self._line_out = {"side": side, "t": ts[2], "t_last": t, "x": ts[3], "last_team": last_team}
+        else:
+            lo["t_last"] = t
+
+    def _restart_zone(self, p):
+        cfg = self.cfg
+        x, y = p
+        if math.hypot(x - self.L / 2.0, y - self.W / 2.0) <= cfg.goal_kickoff_radius_m:
+            return "kickoff", None
+        for gx in self._goal_xs():
+            for cy in (0.0, self.W):
+                if math.hypot(x - gx, y - cy) <= cfg.corner_radius_m:
+                    return "corner", gx
+        if x < -0.5 or x > self.L + 0.5:
+            return None, None
+        if y <= cfg.touch_zone_m or y >= self.W - cfg.touch_zone_m:
+            return "throw_in", None
+        if self._goal_area_of(p, cfg.goal_kick_area_tol_m) is not None:
+            return None, None   # kirúgás (lásd _check_goal_kick)
+        return "free_kick", None
+
+    def _arm_restart(self, t, players):
+        cfg = self.cfg
+        r = self._rest
+        if r is None or r["n"] < 3 or r["t_last"] < t - 1e-6:
+            return
+        dur = r["t_last"] - r["t0"]
+        if dur < min(cfg.throw_in_still_s, cfg.corner_still_s, cfg.kickoff_still_s):
+            return
+        if self._gk_armed is not None or self._dist is not None or self._goal_cand is not None:
+            return
+        gp = self._gk_poss
+        if gp is not None and t - gp["t_last"] <= 1.0:
+            return   # a kapusnál (kézben / lábnál) lévő labda
+        if r["t0"] <= self._last_restart_t + 0.5:
+            return   # ezt az álló labdát már végrehajtottnak vettük
+        cx, cy = r["sx"] / r["n"], r["sy"] / r["n"]
+        kind, gx = self._restart_zone((cx, cy))
+        if kind is None:
+            return
+        if kind == "kickoff" and dur < cfg.kickoff_still_s:
+            return
+        if kind == "corner" and dur < cfg.corner_still_s:
+            return
+        if kind == "throw_in":
+            lo = self._line_out
+            if dur < cfg.throw_in_still_s or (lo is None and dur < cfg.throw_in_rest_alone_s):
+                return
+        if kind == "free_kick":
+            if dur < cfg.free_kick_still_s:
+                return
+            ra = self._reappear
+            rf = self._rest_free
+            dead = (dur >= cfg.free_kick_dead_s
+                    or (ra is not None and abs(r["t0"] - ra[0]) <= 1.0)
+                    or (rf is not None and rf[0] is r and rf[2] >= 5 and rf[1] >= 0.6 * rf[2]))
+            if not dead:
+                return
+            near = sum(1 for p in players if math.hypot(p["pitch_coords"][0] - cx, p["pitch_coords"][1] - cy)
+                       <= cfg.free_kick_players_m)
+            if near < cfg.free_kick_min_players:
+                return
+        self._sp_armed = {"kind": kind, "x": cx, "y": cy, "goal_x": gx, "t_still": r["t_last"], "votes": {},
+                          "kicker": None}
+
+    def _advance_restart(self, t, ball, speed, closest, cdist, players):
+        cfg = self.cfg
+        a = self._sp_armed
+        if self._gk_armed is not None or self._ball_switch_t >= a["t_still"] - 1e-6:
+            # a kapus végzi el (kapus-szabadrúgás / kirúgás), vagy a labdakövetés másik labdára váltott
+            # (valós hiba: a lassan sodródó téves "álló labda" után a követő átugrott a valódira -> "elrúgás")
+            self._sp_armed = None
+            return
+        d = math.hypot(ball[0] - a["x"], ball[1] - a["y"])
+        dt = max(t - a["t_still"], 1e-3)
+        if d >= cfg.restart_launch_dist_m:
+            self._sp_armed = None
+            fast = d / dt >= cfg.restart_min_speed_mps or (speed is not None and speed >= cfg.restart_min_speed_mps)
+            # végrehajtó játékos kell az álló labdánál (a mellette senki nélkül álló "labda" többnyire téves
+            # felismerés: kúp, tartaléklabda, vonal-csillanás)
+            kicker = bool(a["votes"]) or any(
+                math.hypot(p["pitch_coords"][0] - a["x"], p["pitch_coords"][1] - a["y"]) <= cfg.restart_kicker_m
+                for p in players)
+            if fast and kicker and (dt <= 1.5 or (dt <= 4.0 and d >= 15.0)):
+                self._launch_restart(a["t_still"], a)
+            return
+        if d > 1.5 * cfg.goal_kick_still_radius_m:
+            if dt > 2.0:
+                self._sp_armed = None   # lassan elgurult: nem rögzített helyzet
+            return
+        a["t_still"] = t
+        if closest is not None and cdist is not None and cdist <= cfg.restart_kicker_m:
+            tm = self._player_team(closest)
+            a["votes"][tm] = a["votes"].get(tm, 0) + 1
+            a["kicker"] = closest.get("track_id")
+
+    def _check_throw_in_reappear(self, t, ball):
+        """Bedobás álló labda nélkül: oldalvonalon túl -> holtidő -> az oldalvonal mellől a pályára."""
+        cfg = self.cfg
+        lo = self._line_out
+        if lo is None:
+            return
+        side = lo["side"]
+        inside = ball[1] if side == 0.0 else self.W - ball[1]
+        if inside <= 4.0:
+            return
+        self._line_out = None
+        if t - lo["t"] < cfg.throw_in_min_dead_s:
+            return   # azonnal visszajött (vagy a levegőben lévő labda vetülete esett kívülre): nem bedobás
+        pb = self._prev_ball
+        if pb is None or t - pb[0] > 1.5:
+            return
+        pin = pb[2] if side == 0.0 else self.W - pb[2]
+        if pin > cfg.touch_zone_m + 1.0 or abs(pb[1] - lo["x"]) > cfg.throw_in_max_dx_m:
+            return   # a bedobás helyét nem láttuk
+        if math.hypot(ball[0] - pb[1], ball[1] - pb[2]) / max(t - pb[0], 1e-3) < cfg.restart_min_speed_mps * 0.6:
+            return
+        self._line_out = lo   # a _launch_restart innen veszi az utolsó érintő csapatát
+        self._launch_restart(pb[0], {"kind": "throw_in", "x": pb[1], "y": pb[2], "goal_x": None, "votes": {},
+                                     "kicker": None})
+
+    def _launch_restart(self, t0, a):
+        kind = a["kind"]
+        if t0 - self._last_restart_t < self.cfg.restart_debounce_s:
+            return
+        self._last_restart_t = t0
+        self._ctl_break_t = max(self._ctl_break_t, t0)
+        self._ctl_last = None
+        self._ctl = None
+        self._flight = None
+        votes = a.get("votes") or {}
+        vote_team = None
+        if votes:
+            best = max(votes.items(), key=lambda kv: kv[1])
+            if best[1] >= 2 and best[1] >= 0.6 * sum(votes.values()):
+                vote_team = best[0]
+        team, how = None, None
+        gx = a.get("goal_x")
+        if kind == "corner":
+            team, how = other_team(self.defending_team(gx, t0)), "palyaoldal"
+            self._out.pop(gx, None)
+        elif kind == "throw_in":
+            lo = self._line_out
+            if lo is not None and lo.get("last_team"):
+                team, how = other_team(lo["last_team"]), "utolso_erintes"
+            elif vote_team:
+                team, how = vote_team, "vegrehajto"
+            self._line_out = None
+        elif kind == "kickoff":
+            if self._last_goal_team and t0 - self._last_goal_t <= 120.0:
+                team, how = other_team(self._last_goal_team), "kapott_gol"
+            elif vote_team:
+                team, how = vote_team, "vegrehajto"
+        elif vote_team:
+            team, how = vote_team, "vegrehajto"
+        self._sp_wait = {"kind": kind, "t": t0, "pos": (a["x"], a["y"]), "goal_x": gx, "team": team,
+                         "how": how, "kicker": a.get("kicker"), "t_launch": self._last_t if self._last_t else t0}
+        if team is not None:
+            self._flush_restart(None)
+
+    def _flush_restart(self, fallback_team):
+        w = self._sp_wait
+        self._sp_wait = None
+        if w is None:
+            return
+        team, how = w["team"], w["how"]
+        if team is None and fallback_team is not None:
+            team, how = fallback_team, "kovetkezo_birtoklas"
+        kind = w["kind"]
+        if team is None and kind != "kickoff":
+            return   # ismeretlen végrehajtó csapat: inkább kihagyjuk
+        x, y = w["pos"]
+        side = "kozeli" if y > self.W / 2.0 else "tavoli"
+        base = {"time": w["t"], "team": team, "from_xy": [round(x, 1), round(y, 1)], "team_source": how,
+                "player_track_id": w["kicker"]}
+        tl = _team_label(team) if team else "ismeretlen csapat"
+        if kind == "free_kick":
+            ev = self._emit_free_kick(w["t"], (x, y), team, extra=base)
+        elif kind == "corner":
+            base.update({"type": "corner", "goal_x": w["goal_x"], "side": side,
+                         "desc": f"Szöglet – {tl} ({'közeli' if side == 'kozeli' else 'túlsó'} oldal)"})
+            ev = self._emit(base)
+        elif kind == "throw_in":
+            base.update({"type": "throw_in", "side": side, "zone": self._zone_of((x, y), team),
+                         "desc": f"Bedobás – {tl} ({'közeli' if side == 'kozeli' else 'túlsó'} oldalvonal, "
+                                 f"{'az ellenfél' if self._zone_of((x, y), team) == 'ellenfel_terfel' else 'a saját'} "
+                                 f"térfelén)"})
+            ev = self._emit(base)
+        else:
+            base.update({"type": "kickoff", "desc": f"Kezdőrúgás – {tl}"})
+            ev = self._emit(base)
+        self._sp_follow = ev
+
+    def _emit_free_kick(self, t, pos, team, by_keeper=False, keeper_tid=None, extra=None):
+        cfg = self.cfg
+        x, y = pos
+        atk = self._attack_goal(team)
+        dist_goal = math.hypot(atk - x, self.W / 2.0 - y)
+        dangerous = dist_goal <= cfg.free_kick_dangerous_m
+        penalty = abs(self._line_dist(pos, atk) - 11.0) <= 1.5 and abs(y - self.W / 2.0) <= 1.5
+        zone = self._zone_of(pos, team)
+        ev = dict(extra or {"time": t, "team": team, "from_xy": [round(x, 1), round(y, 1)]})
+        ev.update({"type": "free_kick", "zone": zone, "dangerous": dangerous, "is_penalty": penalty,
+                   "distance_to_goal_m": round(dist_goal, 1), "by_keeper": bool(by_keeper)})
+        if keeper_tid is not None:
+            ev["keeper_track_id"] = keeper_tid
+        kind = "Büntető" if penalty else ("Veszélyes szabadrúgás" if dangerous else "Szabadrúgás")
+        who = f" (kapus: {_keeper_label(team, keeper_tid)})" if by_keeper else ""
+        ev["desc"] = (f"{kind} – {_team_label(team)}{who}, {dist_goal:.0f} m-re az ellenfél kapujától, "
+                      f"{'az ellenfél' if zone == 'ellenfel_terfel' else 'a saját'} térfelén")
+        return self._emit(ev)
 
 
 class PositioningMonitor:
