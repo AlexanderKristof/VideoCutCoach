@@ -85,7 +85,9 @@ def run_clip(clip, out_dir, extra_args):
     res = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)
     elapsed = time.time() - t0
     events = re.findall(r"események \(\d+ db\): (.+events_\w+\.json)", res.stdout)
-    halves_sum = [summarize_half(p) for p in events if os.path.exists(p)]
+    # csak a félidőnkénti events_<id>.json (a match_events_* összesítőt kihagyjuk)
+    halves_sum = [summarize_half(p) for p in events
+                  if os.path.basename(p).startswith("events_") and os.path.exists(p)]
     return {"klip": os.path.basename(clip), "hossz_mp": round(dur, 1), "futasido_mp": round(elapsed, 1),
             "kilepesi_kod": res.returncode, "felidok": halves_sum,
             "hiba": None if res.returncode == 0 else res.stderr[-800:]}
