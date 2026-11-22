@@ -168,5 +168,92 @@ class GrassModelApiTests(unittest.TestCase):
         self.assertLess(g, 80)
 
 
+class TestGrassSpeed(unittest.TestCase):
+    """SEBESSÉG: a gyorsított fűmaszk (cv2-műveletek, táblázat-index) pixelre azonos a régi (bool
+    tömbös) számítással; a GrassMaskCache a köztes képkockákon az eltolt maszkot adja."""
+
+    @staticmethod
+    def _old_mask(gm, frame, scale=0.5):
+        small = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        sh = 8 - gm.LUT_BITS
+        b, g, r = [small[..., i].astype(np.uint32) >> sh for i in range(3)]
+        gm.labels(small[:2, :2].reshape(-1, 3))          # a táblázat felépítése
+        lab = gm._lut[(b << (2 * gm.LUT_BITS)) | (g << gm.LUT_BITS) | r]
+        raw = (lab > 0) & (lab < gm.WEAK)
+        solid = (lab == 1) | (lab == 2)
+        dense = solid & (cv2.blur(solid.astype(np.float32), (5, 5)) >= 0.7)
+        near = cv2.dilate(dense.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+        extra = (lab == gm.WEAK) & near
+        h, w = raw.shape
+        dens = cv2.blur(raw.astype(np.float32), (gm.DENS_WIN, gm.DENS_WIN))
+        rawd = cv2.dilate(raw.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+        core = np.where((dens >= gm.DENS_MIN) & rawd, 255, 0).astype(np.uint8)
+        n, cc, stats, _ = cv2.connectedComponentsWithStats(core, connectivity=8)
+        if n > 2:
+            keep = np.zeros(n, bool)
+            for i in range(1, n):
+                y0, hh, area = stats[i, cv2.CC_STAT_TOP], stats[i, cv2.CC_STAT_HEIGHT], stats[i, cv2.CC_STAT_AREA]
+                keep[i] = (y0 + hh > int(h * 0.55) and area >= 0.002 * h * w) or area >= 0.2 * h * w
+            core = np.where(keep[cc], 255, 0).astype(np.uint8)
+        zone = cv2.dilate(core, np.ones((5, 5), np.uint8)) > 0
+        mask = np.where((raw | extra) & zone, 255, 0).astype(np.uint8)
+        k = max(5, (int(h / 60) // 2) * 2 + 1)
+        return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))), lab
+
+    def test_fast_mask_and_labels_match_reference(self):
+        for cond, deg in (("árnyék", {"arnyek": 0.4}), ("nap", {"nap": 1.0}), ("esti", {"esti": True})):
+            res = render([30, 150], deg, 7.0)
+            img = res[1]["frame"]
+            gm = GrassModel()
+            for _ in range(3):
+                gm.observe(img)
+            self.assertTrue(gm.ready)
+            small = cv2.resize(img, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+            ref_mask, ref_lab = self._old_mask(gm, img)
+            self.assertTrue(np.array_equal(gm.labels(small), ref_lab), cond)
+            # a nem kép alakú (N, 3) bemenet a régi úton
+            px = small.reshape(-1, 3)[::97]
+            self.assertTrue(np.array_equal(gm.labels(px), ref_lab.reshape(-1)[::97]), cond)
+            m, sc = gm.mask(img)
+            self.assertEqual(sc, 0.5)
+            self.assertTrue(np.array_equal(m, ref_mask), (cond, int(np.count_nonzero(m != ref_mask))))
+
+    def test_box_count_matches_blur(self):
+        from pitch_filters import _box_count_ge
+        rng = np.random.default_rng(0)
+        m = np.where(rng.random((120, 160)) < 0.55, 255, 0).astype(np.uint8)
+        for win, frac in ((5, 0.5), (5, 0.7), (3, 0.4)):
+            ref = cv2.blur((m > 0).astype(np.float32), (win, win)) >= frac
+            self.assertTrue(np.array_equal(_box_count_ge(m, win, frac) > 0, ref), (win, frac))
+
+    def test_mask_cache_shifts_between_updates(self):
+        from pitch_filters import GrassMaskCache
+        calls = []
+        base = np.zeros((100, 200), np.uint8)
+        base[60:, :] = 255
+
+        def compute(frame):
+            calls.append(1)
+            return base.copy(), 0.5
+
+        cache = GrassMaskCache(compute, every=3)
+        m0, _ = cache.get(None, np.array([0.0, 0.0]))
+        # a kamera 20 px-t "lefelé" mozdult (teljes felbontás) -> a maszk 10 px-lel lejjebb kerül
+        m1, s1 = cache.get(None, np.array([0.0, 20.0]))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(s1, 0.5)
+        self.assertEqual(int(np.argmax(m1[:, 0] > 0)), 70)
+        cache.get(None, np.array([0.0, 20.0]))
+        self.assertEqual(len(calls), 1)
+        cache.get(None, np.array([0.0, 20.0]))         # every = 3: újraszámolás
+        self.assertEqual(len(calls), 2)
+        cache.get(None, np.array([0.0, 200.0]))        # nagy ugrás: mindig újraszámol
+        self.assertEqual(len(calls), 3)
+        one = GrassMaskCache(compute, every=1)
+        for _ in range(3):
+            one.get(None, np.zeros(2))
+        self.assertEqual(len(calls), 6)                 # every = 1: a régi működés
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
