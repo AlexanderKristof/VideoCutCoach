@@ -47,6 +47,18 @@ def choose_h264_encoder(ffmpeg_bin=DEFAULT_FFMPEG):
     return name
 
 
+def software_h264_encoder(ffmpeg_bin=DEFAULT_FFMPEG):
+    """Szoftveres H.264 tartalék: libx264 (GPL ffmpeg) vagy – LGPL ffmpeg-ben – libopenh264."""
+    try:
+        import fast_cut
+        avail = fast_cut.list_encoders(ffmpeg_bin)
+        if avail and "libx264" not in avail and "libopenh264" in avail:
+            return "libopenh264"
+    except Exception:
+        pass
+    return "libx264"
+
+
 def encoder_args(name, width, height):
     if name == "h264_nvenc":
         return ["-c:v", name, "-preset", "p4", "-rc", "vbr", "-cq", "23", "-b:v", "0", "-pix_fmt", "yuv420p"]
@@ -114,14 +126,15 @@ class AnnotatedVideoWriter:
             except (BrokenPipeError, OSError, ValueError) as ex:
                 # a hardveres kódoló menet közben hibázott: újraindítás szoftveresen (a már írt rész elvész,
                 # de az elemzés nem áll le) – csak az elején érdemes, később csak naplózunk
-                if self.frames < 5 and self.encoder != "libx264" and not self.fallback_used:
+                sw_enc = software_h264_encoder(self.ffmpeg_bin)
+                if self.frames < 5 and self.encoder != sw_enc and not self.fallback_used:
                     try:
                         self.proc.kill()
                     except Exception:
                         pass
                     self.fallback_used = True
-                    self.encoder = "libx264"
-                    self.proc = self._start("libx264")
+                    self.encoder = sw_enc
+                    self.proc = self._start(sw_enc)
                     self.frames = 0
                     try:
                         self.proc.stdin.write(frame.tobytes())

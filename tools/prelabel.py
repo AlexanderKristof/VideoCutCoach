@@ -72,13 +72,53 @@ def boxes_from_detections(det, role_classes, conf=0.3, ball_conf=0.15):
     return out
 
 
-def prelabel_images(backend, roles, image_paths, images_root, conf, ball_conf):
+def tiled_detect(detector, img, tile=640, overlap=0.25):
+    """
+    Csempés felismerés eredeti felbontáson (a kicsi, távoli labdához és játékosokhoz): a teljes kép
+    felismerése + átfedő tile x tile csempék, a dobozok visszavetítve és osztályonként NMS-sel összefésülve.
+    """
+    from detection.detector_base import Detections, nms
+    h, w = img.shape[:2]
+    full = detector.detect(img)
+    step = max(1, int(tile * (1.0 - overlap)))
+    xs = list(range(0, max(1, w - tile) + 1, step)) or [0]
+    ys = list(range(0, max(1, h - tile) + 1, step)) or [0]
+    if xs[-1] + tile < w:
+        xs.append(max(0, w - tile))
+    if ys[-1] + tile < h:
+        ys.append(max(0, h - tile))
+    crops, offs = [], []
+    for y in ys:
+        for x in xs:
+            crops.append(img[y:y + tile, x:x + tile])
+            offs.append((x, y))
+    xyxy, conf, cls = [full.xyxy], [full.conf], [full.cls]
+    for d, (ox, oy) in zip(detector.detect_batch(crops), offs):
+        if len(d) == 0:
+            continue
+        b = d.xyxy.copy()
+        b[:, [0, 2]] += ox
+        b[:, [1, 3]] += oy
+        # a csempe szélén levágott (félbe vágott) alakok dobozait kihagyjuk – azokat a szomszéd csempe adja
+        ch, cw = tile if oy + tile <= h else h - oy, tile if ox + tile <= w else w - ox
+        inner = ((d.xyxy[:, 0] > 2) | (ox == 0)) & ((d.xyxy[:, 1] > 2) | (oy == 0)) & \
+                ((d.xyxy[:, 2] < cw - 2) | (ox + cw >= w)) & ((d.xyxy[:, 3] < ch - 2) | (oy + ch >= h))
+        xyxy.append(b[inner]); conf.append(d.conf[inner]); cls.append(d.cls[inner])
+    xyxy = np.concatenate(xyxy) if xyxy else np.zeros((0, 4), np.float32)
+    conf = np.concatenate(conf); cls = np.concatenate(cls)
+    keep = nms(xyxy, conf, 0.5, cls=cls)
+    return Detections(xyxy[keep], conf[keep], cls[keep], full.names)
+
+
+def prelabel_images(backend, roles, image_paths, images_root, conf, ball_conf, tile=0):
     items = []
-    for p in image_paths:
+    for i, p in enumerate(image_paths):
         img = cv2.imread(p)
         if img is None:
             continue
-        det = backend.detector.detect(img)
+        det = tiled_detect(backend.detector, img, tile) if tile else backend.detector.detect(img)
+        if (i + 1) % 10 == 0:
+            print(f"  {i + 1}/{len(image_paths)} kép")
         items.append({"file": os.path.relpath(p, images_root), "width": img.shape[1], "height": img.shape[0],
                       "boxes": boxes_from_detections(det, roles, conf, ball_conf)})
     return items
@@ -190,6 +230,8 @@ def main(argv=None):
     ap.add_argument("--start", type=float, default=0.0, help="videó: kezdés (mp)")
     ap.add_argument("--duration", type=float, default=None, help="videó: hossz (mp)")
     ap.add_argument("--min-track-len", type=int, default=3, help="videó: ennél rövidebb követés nem kerül be")
+    ap.add_argument("--csempe", type=int, default=0, metavar="PX",
+                    help="képes mód: csempés felismerés eredeti felbontáson (pl. 640) – a kicsi labdához; 0 = ki")
     a = ap.parse_args(argv)
     formats = [f.strip() for f in a.format.split(",") if f.strip()]
     os.makedirs(a.out, exist_ok=True)
@@ -210,7 +252,7 @@ def main(argv=None):
         else:
             paths = sorted(p for p in glob.glob(os.path.join(root, "**", "*"), recursive=True)
                            if p.lower().endswith((".jpg", ".jpeg", ".png")))
-        items = prelabel_images(backend, roles, paths, root, a.conf, a.ball_conf)
+        items = prelabel_images(backend, roles, paths, root, a.conf, a.ball_conf, a.csempe)
         write_outputs(items, a.out, root, formats)
     else:
         img_dir = os.path.join(a.out, "kepek")

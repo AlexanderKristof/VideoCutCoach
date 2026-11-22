@@ -55,6 +55,8 @@ KEY_WINDOW_MAX_SEC = 64.0
 AUDIO_COPY_CODECS = ("aac", "mp3", "ac3", "eac3", "alac")
 
 SW_ENCODERS = {"h264": "libx264", "hevc": "libx265"}
+# LGPL ffmpeg-ben nincs libx264/libx265: ilyenkor a Cisco OpenH264 a szoftveres tartalék (csak H.264)
+LGPL_SW_ENCODERS = {"h264": "libopenh264"}
 HW_ENCODERS = {"h264": ("h264_nvenc", "h264_qsv", "h264_amf"),
                "hevc": ("hevc_nvenc", "hevc_qsv", "hevc_amf")}
 
@@ -240,7 +242,7 @@ _enc_lock = threading.Lock()
 
 
 def _encoder_family(name):
-    if name in ("libx264",) or name.startswith("h264_"):
+    if name in ("libx264", "libopenh264") or name.startswith("h264_"):
         return "h264"
     if name in ("libx265",) or name.startswith("hevc_"):
         return "hevc"
@@ -298,9 +300,12 @@ def encoder_candidates(codec, ffmpeg_bin=None, override=None):
     if sw is None:
         return []
     choice = (override if override is not None else os.environ.get("FAST_CUT_ENCODER", "auto")).strip().lower()
+    available = list_encoders(ffmpeg_bin)
+    lgpl = LGPL_SW_ENCODERS.get(codec)
+    if available and sw not in available and lgpl and lgpl in available:
+        sw = lgpl  # LGPL ffmpeg: a szoftveres tartalék az OpenH264
     if choice in ("cpu", "software", "szoftver", "sw") or choice == sw:
         return [sw]
-    available = list_encoders(ffmpeg_bin)
     out = []
     if choice not in ("", "auto") and _encoder_family(choice) == codec:
         if choice in available and test_encoder(choice, ffmpeg_bin):
@@ -310,7 +315,7 @@ def encoder_candidates(codec, ffmpeg_bin=None, override=None):
     for name in HW_ENCODERS.get(codec, ()):
         if name not in out and name in available and test_encoder(name, ffmpeg_bin):
             out.append(name)
-    out.append(sw)
+    out.append(sw)  # szoftveres tartalék (LGPL buildben fent már OpenH264-re cserélve)
     return out
 
 
@@ -435,6 +440,9 @@ def _full_encoder_args(encoder, threads_args):
     """Teljes újrakódolás paraméterei (H.264, yuv420p – mint a korábbi pontos vágásnál)."""
     if encoder == "libx264":
         return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"] + threads_args
+    if encoder == "libopenh264":
+        # nincs CRF: minőség-vezérelt mód magas bitráta-plafonnal (1080p-hez bőven elég)
+        return ["-c:v", "libopenh264", "-rc_mode", "quality", "-b:v", "12M", "-pix_fmt", "yuv420p"] + threads_args
     if encoder == "h264_nvenc":
         return ["-c:v", encoder, "-preset", "p4", "-rc", "vbr", "-cq", "21", "-b:v", "0", "-pix_fmt", "yuv420p"]
     if encoder == "h264_qsv":

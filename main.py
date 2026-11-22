@@ -42,7 +42,7 @@ from pitch_tracker import PitchTracker, parse_calib_points, draw_pitch_overlay a
 from ball_tracker import BallTracker, draw_ball_state  # labdakövetés (Kálmán + jelölt-pontozás)
 from ball_crops import BallCropSearch  # LABDA-KIVÁGÁS: natív felbontású labda-felismerés
 from stage_timer import StageTimer  # PROFILOZÁS: szakaszonkénti időmérés
-from video_writer import AnnotatedVideoWriter  # KIMENETI KÓDOLÁS: hardveres H.264, író szál
+from video_writer import AnnotatedVideoWriter, choose_h264_encoder, encoder_args as video_writer_encoder_args  # KIMENETI KÓDOLÁS: hardveres H.264, író szál
 from pitch_filters import BoundaryCrowdFilter  # NÉZŐ A TÚLSÓ PÁLYASZÉLEN (kalibráció nélkül)
 
 Base.metadata.create_all(bind=engine)
@@ -1283,8 +1283,8 @@ async def burn_drawings_endpoint(
         process = subprocess.Popen([
             "ffmpeg.exe", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
             "-s", f"{width}x{height}", "-pix_fmt", "bgr24", "-r", str(fps),
-            "-i", "-", "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p", output_path
-        ], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            "-i", "-", *video_writer_encoder_args(choose_h264_encoder("ffmpeg.exe"), width, height), output_path
+        ], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)  # LGPL-barát kódolóválasztás
 
         f_idx = 0
         while cap.isOpened():
