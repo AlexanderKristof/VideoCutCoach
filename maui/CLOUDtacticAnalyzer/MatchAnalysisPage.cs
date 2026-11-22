@@ -137,28 +137,21 @@ public class MatchAnalysisPage : ContentPage
     private readonly VerticalStackLayout _resultBox = new() { Spacing = 10, IsVisible = false };
     private string? _playerSource;
 
-    private static readonly (string Key, string Label, Func<MatchEvent, bool> Match)[] TypeFilters =
-    {
-        ("all", "Minden esemény", _ => true),
-        ("goals_shots", "Gólok és lövések", e => e.Type is "goal" or "shot"),
-        ("gk", "Kapus események (mind)", e => e.IsGoalkeeper),
-        ("gk_save", "Kapus védés", e => e.Type == "gk_save"),
-        ("gk_claim_cross", "Beadás leszedése", e => e.Type == "gk_claim_cross"),
-        ("gk_goal_kick", "Kirúgás", e => e.Type == "gk_goal_kick"),
-        ("gk_long_ball", "Kapus hosszú labda", e => e.Type == "gk_long_ball"),
-        ("gk_short_pass", "Kapus rövid passz", e => e.Type == "gk_short_pass"),
-        ("gk_conceded", "Kapott gól", e => e.Type == "gk_conceded"),
-        ("gk_sweeper", "Kapus kifutás", e => e.Type == "gk_sweeper"),
-        ("other", "Egyéb", e => !e.IsGoalkeeper && e.Type is not ("goal" or "shot")),
-    };
+    /// <summary>Kalap-szűrő: (kulcs vagy null = mind, felirat) – a betöltött események darabszámával.</summary>
+    private List<(string? Key, string Label)> _categoryOptions = new() { (null, "Minden kalap") };
+    /// <summary>Típus-szűrő a kiválasztott kalapon belül (passznál saját / ellenfél térfél külön is).</summary>
+    private List<(string Label, Func<MatchEvent, bool> Match)> _typeOptions = new() { ("Minden típus", _ => true) };
+    private readonly Picker _categoryFilter = new() { Title = "Kalap", TextColor = Colors.White, WidthRequest = 230 };
+    private readonly CheckBox _showExperimental = new() { IsChecked = false };
 
     public MatchAnalysisPage()
     {
         Title = "Meccs elemzés";
         BackgroundColor = Bg;
 
-        _typeFilter.ItemsSource = TypeFilters.Select(f => f.Label).ToList();
-        _typeFilter.SelectedIndex = 0;
+        RebuildCategoryOptions();
+        _categoryFilter.SelectedIndexChanged += (_, _) => { RebuildTypeOptions(); ApplyFilter(); };
+        _showExperimental.CheckedChanged += (_, _) => { RebuildCategoryOptions(); ApplyFilter(); };
         _teamFilter.ItemsSource = new List<string> { "Mindkét csapat", TeamNames.Team1, TeamNames.Team2 };
         _teamFilter.SelectedIndex = 0;
         _halfFilter.ItemsSource = new List<string> { "Teljes meccs", "1. félidő", "2. félidő" };
@@ -285,7 +278,9 @@ public class MatchAnalysisPage : ContentPage
         });
         _resultBox.Children.Add(new ScrollView { Orientation = ScrollOrientation.Horizontal, Content = _videoButtons });
         _resultBox.Children.Add(Header("Események"));
-        _resultBox.Children.Add(Row(_typeFilter, _teamFilter, _halfFilter));
+        _resultBox.Children.Add(Row(_categoryFilter, _typeFilter, _teamFilter, _halfFilter));
+        _resultBox.Children.Add(Check(_showExperimental,
+            "Kísérleti események is (sikertelen passz, szerelés, labdaszerzés, beadás, labdavezetés – még bizonytalan felismerés)"));
         _resultBox.Children.Add(Row(selectAll, selectNone, _eventCount));
         _resultBox.Children.Add(_eventList);
         _resultBox.Children.Add(_exportButton);
@@ -675,6 +670,7 @@ public class MatchAnalysisPage : ContentPage
             }
             catch { /* régebbi motor: nincs /feedback – a lista ítéletek nélkül is használható */ }
             LoadTeamNames();
+            RebuildCategoryOptions();
             ApplyFilter();
         }
         catch (Exception ex)
@@ -717,15 +713,59 @@ public class MatchAnalysisPage : ContentPage
         if (_result is not null) ShowHeatmaps(_result);
     }
 
+    private bool PassesExperimental(EventItem item) =>
+        _showExperimental.IsChecked || !item.Event.Experimental || item.IsManual || item.Verdict is not null;
+
+    /// <summary>A kalap-választó újraépítése a betöltött események darabszámával (az üres kalapok is látszanak).</summary>
+    private void RebuildCategoryOptions()
+    {
+        var prev = _categoryOptions.ElementAtOrDefault(Math.Max(0, _categoryFilter.SelectedIndex)).Key;
+        var shown = _allEvents.Where(PassesExperimental).ToList();
+        _categoryOptions = new() { (null, $"Minden kalap ({shown.Count})") };
+        foreach (var (key, label) in EventCategories.All)
+        {
+            var n = shown.Count(e => e.Event.Category == key);
+            if (n > 0 || key != "egyeb") _categoryOptions.Add((key, $"{label} ({n})"));
+        }
+        _categoryFilter.ItemsSource = _categoryOptions.Select(c => c.Label).ToList();
+        _categoryFilter.SelectedIndex = Math.Max(0, _categoryOptions.FindIndex(c => c.Key == prev));
+        RebuildTypeOptions();
+    }
+
+    private void RebuildTypeOptions()
+    {
+        var cat = _categoryOptions.ElementAtOrDefault(Math.Max(0, _categoryFilter.SelectedIndex)).Key;
+        var prev = _typeOptions.ElementAtOrDefault(Math.Max(0, _typeFilter.SelectedIndex)).Label;
+        _typeOptions = new() { ("Minden típus", _ => true) };
+        var types = _allEvents.Where(PassesExperimental).Select(e => e.Event)
+            .Where(e => cat is null || e.Category == cat).Select(e => e.Type).Distinct()
+            .OrderBy(t => EventLabels.Label(t)).ToList();
+        foreach (var t in types)
+        {
+            var tt = t;
+            _typeOptions.Add(($"{EventLabels.Icon(tt)} {EventLabels.Label(tt)}", e => e.Type == tt));
+            if (tt is "pass" or "pass_failed")
+            {
+                _typeOptions.Add(($"   {EventLabels.Label(tt)} – saját térfélen", e => e.Type == tt && e.Zone == "sajat_terfel"));
+                _typeOptions.Add(($"   {EventLabels.Label(tt)} – ellenfél térfelén", e => e.Type == tt && e.Zone == "ellenfel_terfel"));
+            }
+        }
+        _typeFilter.ItemsSource = _typeOptions.Select(o => o.Label).ToList();
+        _typeFilter.SelectedIndex = Math.Max(0, _typeOptions.FindIndex(o => o.Label == prev));
+    }
+
     private void ApplyFilter()
     {
-        var type = TypeFilters[Math.Max(0, _typeFilter.SelectedIndex)].Match;
+        var cat = _categoryOptions.ElementAtOrDefault(Math.Max(0, _categoryFilter.SelectedIndex)).Key;
+        var type = _typeOptions.ElementAtOrDefault(Math.Max(0, _typeFilter.SelectedIndex)).Match ?? (_ => true);
         var team = _teamFilter.SelectedIndex switch { 1 => "team1", 2 => "team2", _ => null };
         var half = _halfFilter.SelectedIndex switch { 1 => 1, 2 => 2, _ => 0 };
         _visibleEvents.Clear();
         foreach (var item in _allEvents)
         {
             var e = item.Event;
+            if (!PassesExperimental(item)) continue;
+            if (cat is not null && e.Category != cat) continue;
             if (!type(e)) continue;
             if (team is not null && e.Team != team) continue;
             if (half != 0 && e.Half != half) continue;

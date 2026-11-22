@@ -103,6 +103,14 @@ public sealed class MatchEvent
     [JsonPropertyName("half_label")] public string? HalfLabel { get; set; }
     [JsonPropertyName("match_clock")] public string? MatchClock { get; set; }
     [JsonPropertyName("full_match_sec")] public double? FullMatchSec { get; set; }
+    [JsonPropertyName("category")] public string? CategoryRaw { get; set; }
+    [JsonPropertyName("experimental")] public bool? ExperimentalRaw { get; set; }
+    /// <summary>Passznál / szabadrúgásnál: "sajat_terfel" vagy "ellenfel_terfel".</summary>
+    [JsonPropertyName("zone")] public string? Zone { get; set; }
+
+    /// <summary>A kalap (events.py EVENT_CATEGORIES); régi eredményfájlnál a típusból számolva.</summary>
+    public string Category => !string.IsNullOrEmpty(CategoryRaw) ? CategoryRaw! : EventCategories.Of(Type);
+    public bool Experimental => ExperimentalRaw ?? EventCategories.IsExperimental(Type);
 
     public string Label => EventLabels.Label(Type);
     /// <summary>A visszajelzés kulcsa – egyezik a feedback.py event_key()-ével ("shot@634.20").</summary>
@@ -118,7 +126,7 @@ public sealed class MatchEvent
     public string Subtitle =>
         $"🎬 {VideoTimeLabel} a videóban" +
         (string.IsNullOrEmpty(MatchClock) ? "" : $"  •  ⏱ {MatchClock} meccsidő{(string.IsNullOrEmpty(HalfLabel) ? "" : $" ({HalfLabel})")}") +
-        $"  •  {Desc}";
+        $"  •  {EventCategories.Label(Category)}{(Experimental ? " (kísérleti)" : "")}  •  {Desc}";
 
     /// <summary>Klip-időablak az eredeti videóban (ha az eseménynek nincs saját ablaka: idő −5 / +4 mp).</summary>
     public (double Start, double End) ClipWindow(double pre = 5, double post = 4)
@@ -180,6 +188,43 @@ public static class EventLabels
     public static IReadOnlyList<(string Type, string Label)> All =>
         Map.Where(kv => kv.Key != "gk_positioning_error").Select(kv => (kv.Key, $"{kv.Value.Icon} {kv.Value.Label}")).ToList();
     public static string Icon(string type) => Map.TryGetValue(type, out var v) ? v.Icon : "•";
+}
+
+/// <summary>Esemény-kalapok (egyezik az events.py EVENT_CATEGORIES / CATEGORY_LABELS értékeivel).</summary>
+public static class EventCategories
+{
+    public static readonly IReadOnlyList<(string Key, string Label)> All = new List<(string, string)>
+    {
+        ("rogzitett", "🚩 Rögzített helyzetek"),
+        ("befejezes", "🎯 Befejezések"),
+        ("beadas", "↗ Beadások"),
+        ("passz", "➡ Passzok"),
+        ("labdaszerzes", "✋ Labdaszerzések"),
+        ("labdavezetes", "🏃 Labdavezetés"),
+        ("kapus", "🧤 Kapus események"),
+        ("egyeb", "• Egyéb"),
+    };
+
+    private static readonly Dictionary<string, string> Map = new()
+    {
+        ["corner"] = "rogzitett", ["free_kick"] = "rogzitett", ["throw_in"] = "rogzitett",
+        ["kickoff"] = "rogzitett", ["gk_goal_kick"] = "rogzitett",
+        ["shot"] = "befejezes", ["goal"] = "befejezes",
+        ["cross"] = "beadas",
+        ["pass"] = "passz", ["pass_failed"] = "passz",
+        ["tackle"] = "labdaszerzes", ["interception"] = "labdaszerzes",
+        ["dribble"] = "labdavezetes",
+    };
+
+    /// <summary>A valós felvételen még bizonytalan típusok (events.py EXPERIMENTAL_TYPES).</summary>
+    private static readonly HashSet<string> ExperimentalTypes = new() { "pass_failed", "tackle", "interception", "cross", "dribble" };
+
+    public static string Of(string type) =>
+        Map.TryGetValue(type, out var c) ? c : type.StartsWith("gk_", StringComparison.Ordinal) ? "kapus" : "egyeb";
+
+    public static bool IsExperimental(string type) => ExperimentalTypes.Contains(type);
+
+    public static string Label(string key) => All.FirstOrDefault(c => c.Key == key).Label ?? key;
 }
 
 /// <summary>Edzői visszajelzés egy meccsre (feedback.py): ítéletek + kézzel felvett hiányzó események.</summary>
