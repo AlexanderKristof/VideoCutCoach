@@ -502,6 +502,7 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
     if auto_teams_enabled(config):
         team_clf = TeamClassifier(grass_lower=grass_lower, grass_upper=grass_upper,
                                   swap_teams=config.get("swap_teams", False),
+                                  reference_colors=config.get("reference_team_colors"),
                                   grass_model=grass_model)  # ADAPTÍV FŰ: fű-kiszűrés + megvilágítás-korrekció
     # --- AUTO CSAPAT VÉGE ---
 

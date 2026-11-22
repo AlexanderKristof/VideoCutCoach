@@ -33,7 +33,7 @@ import math
 from collections import deque
 
 TEAM_LABELS = {"team1": "1. csapat", "team2": "2. csapat"}
-KEEPER_LABELS = {"team1": "Hazai kapus", "team2": "Vendég kapus"}
+KEEPER_LABELS = {"team1": "1. csapat kapusa", "team2": "2. csapat kapusa"}
 
 GK_EVENT_TYPES = (
     "gk_save", "gk_claim_cross", "gk_goal_kick", "gk_long_ball",
@@ -242,6 +242,9 @@ class EventDetector:
         self._cand = None                # alternatív labda-track jelölt (téves felvillanás vagy új labda)
         self._bst = None                 # simított labdaállapot: {t, pos, vel, speed, sv, reliable}
         self._keepers = {}               # csapat -> {team, tid, hist, pos, last_t, last_sweep}
+        # a mezőnyjátékosok átlagos x-e csapatonként (melyik csapat melyik kaput védi); {team: [átlag, n]}
+        self._side_x = {"team1": [0.0, 0], "team2": [0.0, 0]}
+        self._side_left = None           # a legutóbb eldöntött bal kaput védő csapat
         self._poss = None                # (tid, team, is_keeper, t)
         self._poss_hist = deque()        # (t, team, tid) – birtoklási minták az utolsó 3 mp-ből
         self._last_shot_t = _NEG_INF
@@ -334,17 +337,38 @@ class EventDetector:
         return self._new
 
     def defending_team(self, goal_x, t=None):
-        """Az adott kaput védő csapat: elsődlegesen a kapus-trackek alapján, különben a konfigurált irány szerint."""
-        votes = {}
-        for k in self._keepers.values():
-            if t is not None and t - k["last_t"] > 60.0:
+        """
+        Az adott kaput védő csapat: a mezőnyjátékosok átlagos helyzetéből (a bal kaput az a csapat védi,
+        amelyiknek a játékosai átlagosan balrább állnak), elég minta híján a konfigurált irány szerint.
+        A kapus mezszíne itt NEM számít: a kapus meze gyakran az ellenfél színéhez hasonlít, ezért a
+        mezszín szerinti besorolás a valós felvételen rossz csapatot adott a kapusnak.
+        """
+        left = self._left_team()
+        return left if goal_x == 0.0 else other_team(left)
+
+    def _left_team(self):
+        (m1, n1), (m2, n2) = self._side_x["team1"], self._side_x["team2"]
+        if n1 >= 50 and n2 >= 50 and abs(m1 - m2) >= 2.0:
+            self._side_left = "team1" if m1 < m2 else "team2"
+        if self._side_left is not None:
+            return self._side_left
+        return "team1" if self.cfg.team1_attacks_right else "team2"
+
+    def _update_sides(self, players):
+        """A mezőnyjátékosok átlagos x-e csapatonként (lassan felejtő átlag: kb. az utolsó pár perc)."""
+        for p in players:
+            if p.get("is_keeper") or not p.get("team_known", True):
                 continue
-            if self._keeper_goal(k) == goal_x:
-                votes[k["team"]] = votes.get(k["team"], 0) + len(k["hist"])
-        if votes:
-            return max(votes.items(), key=lambda kv: kv[1])[0]
-        left_defender = "team1" if self.cfg.team1_attacks_right else "team2"
-        return left_defender if goal_x == 0.0 else other_team(left_defender)
+            team = f"team{p.get('team_id')}"
+            st = self._side_x.get(team)
+            if st is None:
+                continue
+            x = float(p["pitch_coords"][0])
+            if not (0.0 <= x <= self.L):
+                continue
+            st[1] += 1
+            a = 1.0 / st[1] if st[1] < 2000 else 1.0 / 2000
+            st[0] += a * (x - st[0])
 
     def keeper_team_near(self, coords, t=None, max_dist=5.0):
         """A megadott pozícióhoz legközelebbi ismert kapus csapata (vagy None)."""
@@ -498,11 +522,14 @@ class EventDetector:
     # ------------------------------------------------------------ kapusok
     def _update_keepers(self, t, players):
         cfg = self.cfg
+        self._update_sides(players)
         by_team = {}
         for p in players:
             if not p.get("is_keeper"):
                 continue
-            by_team.setdefault(f"team{p.get('team_id', 1)}", []).append(p)
+            # a kapus csapata a védett kapuból (pályaoldalból) dől el, nem a mezszínéből
+            side_goal = 0.0 if float(p["pitch_coords"][0]) < self.L / 2.0 else self.L
+            by_team.setdefault(self.defending_team(side_goal), []).append(p)
         for team, cands in by_team.items():
             k = self._keepers.get(team)
             if k is None:

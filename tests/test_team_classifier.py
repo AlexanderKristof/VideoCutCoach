@@ -91,13 +91,13 @@ def make_crop(rng, kit, h=None, shorts=(30, 30, 30), occluder=None, corrupt=Fals
 
 
 def simulate(kit_a, kit_b, seconds=30.0, hz=8.0, seed=0, with_pitch=True, extras=True,
-             occlusion_rate=0.15, swap=False):
+             occlusion_rate=0.15, swap=False, reference=None):
     """
     22 + bíró meccs-szimuláció. A csapat (kit_a) a bal térfélen, B a jobbon, kapusok a két kapunál.
     Visszatér: (classifier, rekordok listája (valódi szerep, valódi csapat, eredmény, t))
     """
     rng = np.random.default_rng(seed)
-    clf = tc.TeamClassifier(grass_lower=GRASS_LO, grass_upper=GRASS_HI, swap_teams=swap)
+    clf = tc.TeamClassifier(grass_lower=GRASS_LO, grass_upper=GRASS_HI, swap_teams=swap, reference_colors=reference)
     people = []
     for i in range(10):
         people.append(dict(tid=i + 1, kit=KITS[kit_a], role="player", team="A", x=rng.uniform(15, 55), y=rng.uniform(5, 63)))
@@ -230,6 +230,21 @@ def test_swap_teams():
     acc = _accuracy(recs, clf.fit_seconds + 1.0, {"A": 2, "B": 1})
     assert acc > 0.95, acc
     assert clf.team_colors()["team2"][0] > 150
+
+
+def test_reference_colours_keep_team_identity():
+    """2. félidő: a csapat-számozás az 1. félidő mezszíneiből – akár volt térfélcsere, akár nem
+    (valós próba: két szakasz ugyanabból a félidőből, a feltételezett csere megfordította a csapatokat)."""
+    first, _ = simulate("red", "white", seed=3)
+    ref = first.team_colors()                      # team1 = piros (bal oldal), team2 = fehér
+    # nincs csere: a piros továbbra is bal oldalon – a swap_teams=True ellenére is team1 marad
+    clf, recs = simulate("red", "white", seed=8, swap=True, reference=ref)
+    assert clf.order_by == "reference", clf.order_by
+    assert _accuracy(recs, clf.fit_seconds + 1.0, {"A": 1, "B": 2}) > 0.95
+    # volt csere: a fehér van bal oldalon, de a piros akkor is team1
+    clf2, recs2 = simulate("white", "red", seed=9, reference=ref)
+    assert _accuracy(recs2, clf2.fit_seconds + 1.0, {"A": 2, "B": 1}) > 0.95
+    assert clf2.team_colors()["team1"][0] > 150 and clf2.team_colors()["team1"][1] < 100
 
 
 def test_late_extras_and_no_extras_in_warmup():

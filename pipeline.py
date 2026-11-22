@@ -576,6 +576,11 @@ def run_match_pipeline(video_path, options=None, progress=None, funcs=None, out_
             # térfélcsere után ez a másik csapat lenne, ezért a sorrendet is megfordítjuk,
             # így a "team1" mindkét félidőben ugyanaz a csapat marad.
             cfg["swap_teams"] = not analysis_config.get("swap_teams", False)
+            # Ha az 1. félidő mezszínei megvannak, a csapat-azonosság a mezszínből dől el (a swap_teams
+            # helyett) – így a "team1" akkor is ugyanaz marad, ha a megadott 2. szakaszban nem volt csere.
+            ref = (half_data.get("first_half") or {}).get("team_colors")
+            if ref:
+                cfg["reference_team_colors"] = ref
         # A kézi kalibráció csak abban a félidőben érvényes, amelyikben a képe készült;
         # a másik félidőben a pályavonalakból automatikusan kalibrálunk.
         calib_points = opts["calib_points"]

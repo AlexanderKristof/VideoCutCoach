@@ -441,6 +441,19 @@ def test_engine_integration():
     check(r["dist_from_goal_m"] == 2.0 and abs(r["bisector_offset_m"]) < 0.01, r)
 
 
+def test_keeper_team_from_defended_goal_not_kit_colour():
+    """Valós hiba: a bal kaput védő kapus meze az ellenfél színéhez hasonlított, ezért a mezszín
+    szerint a 2. csapatba került, és az ívelése a másik csapatnál jelent meg. A kapus csapata a
+    védett kapuból (a mezőnyjátékosok átlagos helyzetéből) dől el."""
+    s = Sim()
+    outfield = [P(10 + i, 1, 25.0 + 2 * i, 20.0 + 4 * i) for i in range(5)] + \
+               [P(20 + i, 2, 70.0 + 2 * i, 20.0 + 4 * i) for i in range(5)]
+    gk = P(1, 2, 3.0, 34.0, keeper=True)          # mezszín szerint 2. csapat, de a bal kaput védi
+    s.hold(3.0, (40.0, 30.0), outfield + [gk])
+    check(s.det.defending_team(0.0) == "team1" and s.det.defending_team(105.0) == "team2", s.det._side_x)
+    check("team1" in s.det._keepers and s.det._keepers["team1"]["tid"] == 1, list(s.det._keepers))
+
+
 def test_positioning_monitor():
     from events import PositioningMonitor
     m = PositioningMonitor(offset_m=2.5, min_s=1.5, ball_max_dist_m=30.0, debounce_s=20.0)

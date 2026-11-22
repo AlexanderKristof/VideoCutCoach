@@ -187,7 +187,7 @@ class _Track:
 
 
 class TeamClassifier:
-    def __init__(self, grass_lower=None, grass_upper=None, swap_teams=False, grass_model=None,
+    def __init__(self, grass_lower=None, grass_upper=None, swap_teams=False, grass_model=None, reference_colors=None,
                  fit_seconds=12.0, max_fit_samples=1500, min_fit_samples=60,
                  refit_step=150, sample_interval_sec=0.2, k=7,
                  merge_ratio=0.8, min_team_tracks=2.5, min_part_frac=0.04, outlier_z=4.0, spread_floor=0.04,
@@ -198,6 +198,10 @@ class TeamClassifier:
         self.grass_upper = grass_upper
         self.grass_model = grass_model     # adaptív fűmodell (ha van, a HSV tartomány helyett)
         self.swap_teams = bool(swap_teams)
+        # Az előző félidő mezszínei ({"team1": [r,g,b], "team2": [r,g,b]}): ha megvannak, a csapat-számozás a
+        # mezszín-egyezésből dől el (nem a pályaoldalból + swap_teams) – így a "team1" akkor is ugyanaz a
+        # csapat marad, ha a 2. félidőnek megadott szakaszban valójában nem volt térfélcsere.
+        self.reference_colors = reference_colors if isinstance(reference_colors, dict) else None
         self.fit_seconds = fit_seconds
         self.max_fit_samples = max_fit_samples
         self.min_fit_samples = min_fit_samples
@@ -420,7 +424,15 @@ class TeamClassifier:
             self.order_by = "pitch_x"
         else:
             self.order_by = "size"
-        if self.swap_teams:
+        ref = self.reference_colors
+        if ref and ref.get("team1") is not None and ref.get("team2") is not None:
+            r1, r2 = np.asarray(ref["team1"], np.float64), np.asarray(ref["team2"], np.float64)
+            c0, c1 = (np.asarray(_lab_to_rgb(np.median(LAB[labels == ids[j]], axis=0)), np.float64) for j in team_idx)
+            if np.linalg.norm(c0 - r2) + np.linalg.norm(c1 - r1) < np.linalg.norm(c0 - r1) + np.linalg.norm(c1 - r2):
+                team_idx = team_idx[::-1]
+                mean_x = mean_x[::-1]
+            self.order_by = "reference"
+        elif self.swap_teams:
             team_idx = team_idx[::-1]
             mean_x = mean_x[::-1]
 
