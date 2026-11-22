@@ -76,7 +76,9 @@ from pitch_filters import build_grass_mask, is_full_range
 
 PITCH_LENGTH = 105.0
 PITCH_WIDTH = 68.0
-DEFAULT_GRASS_HSV = (np.array([30, 40, 40]), np.array([85, 255, 255]))
+# alacsony napnál a napos fű sárgás (H ~ 20), árnyékban zöldebb (H ~ 35–45); a másik (műfüves) pályát
+# a main_grass_mask árnyalat-szűrője választja le
+DEFAULT_GRASS_HSV = (np.array([18, 35, 30]), np.array([85, 255, 255]))
 
 STATUS_OK = "ok"
 STATUS_LOST = "elveszett"
@@ -302,11 +304,70 @@ def _boxes_mask(shape, boxes, scale, pad_ratio=0.15, pad_px=3):
     return m
 
 
-def detect_line_mask(small_bgr, grass_mask=None, box_mask=None, hsv=None, min_tophat=22, max_sat=140):
+def main_grass_mask(hsv, grass, tol=14.0, max_tol=24.0, min_keep=0.5):
+    """
+    A saját pálya füve: a kép alsó sávjának (a kamerához közeli, biztosan a mi pályánk) fűszínéből
+    tanult árnyalat (hue) körüli pixelek. A kerítés mögötti másik (pl. műfüves, kékesebb zöld) pálya
+    vagy a fasor fűszínű, de eltérő árnyalatú – a vonalai így nem zavarják a kalibrációt.
+    Ha a tanult árnyalat a fűnek kevesebb mint min_keep részét tartaná meg (pl. a kép alja nem fű),
+    a bemeneti maszk marad. Visszatér: maszk (255 = a saját pálya füve).
+    """
+    if grass is None:
+        return None
+    h, w = grass.shape[:2]
+    y0 = int(h * 0.6)
+    band_g = grass[y0::2, ::2]
+    band_h = hsv[y0::2, ::2, 0]
+    sel = band_g > 0
+    if np.count_nonzero(sel) < 0.15 * sel.size:
+        return grass
+    hue = band_h[sel].astype(np.float32)
+    med = float(np.median(hue))
+    mad = float(np.median(np.abs(hue - med))) * 1.4826
+    t = min(max_tol, max(tol, 3.0 * mad))
+    hh = hsv[:, :, 0].astype(np.int16)
+    good = (np.abs(hh - med) <= t).astype(np.uint8) * 255
+    m = cv2.bitwise_and(grass, good)
+    k = max(5, (int(h / 60) // 2) * 2 + 1)
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    m = cv2.bitwise_and(m, grass)
+    # apró, leszakadt foltok (fasor, lelátó fűszínű részei) nélkül
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    if n > 2:
+        area = stats[:, cv2.CC_STAT_AREA].astype(np.float64)
+        area[0] = 0
+        keep = area >= max(0.01 * h * w, 0.05 * area.max())
+        keep[0] = False
+        m = np.where(keep[lab], 255, 0).astype(np.uint8)
+    if np.count_nonzero(m) < min_keep * max(1, np.count_nonzero(grass)):
+        return grass
+    return m
+
+
+def _glare_mask(mn, k):
+    """Beégett, nagy kiterjedésű fényfoltok (reflektor, napcsillanás): ezek közelében nincs megbízható vonal."""
+    bright = (mn >= 235).astype(np.uint8) * 255
+    if not bright.any():
+        return None
+    # csak a VASTAG foltok (a k/2 átmérőjű erózió után is megmaradó részek): a beégett, de vékony
+    # pályavonal így nem esik ki
+    ke = _odd(max(3, k // 2))
+    core = cv2.erode(bright, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ke, ke)))
+    if not core.any():
+        return None
+    return cv2.dilate(core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1, 2 * k + 1)))
+
+
+def detect_line_mask(small_bgr, grass_mask=None, box_mask=None, hsv=None, min_tophat=22, max_sat=140,
+                     min_tophat_floor=8, adaptive=True):
     """
     Fehér pályavonal-pixelek: világos, alacsony telítettségű, vékony struktúra a füvön.
     - a színcsatornák minimuma (fehérnél mind magas, fűnél a piros/kék alacsony),
     - top-hat (a kernelnél vékonyabb világos részek maradnak meg),
+    - a küszöb helyi (adaptive): a fű top-hat 'zajszintjéhez' igazodik (sötét, esti / borús
+      felvételen a vonal kontrasztja kicsi, a fix küszöb alatt maradna) – legfeljebb min_tophat,
+      legalább min_tophat_floor,
+    - a beégett, nagy fényfoltok (reflektor, csillanás) környéke kimarad,
     - telítettség-küszöb, fűzóna (tágítva, hogy a szélső vonal is benne legyen),
     - a játékos-/labdadobozok kitakarva.
     """
@@ -317,7 +378,18 @@ def detect_line_mask(small_bgr, grass_mask=None, box_mask=None, hsv=None, min_to
     th = cv2.morphologyEx(mn, cv2.MORPH_TOPHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
     if hsv is None:
         hsv = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2HSV)
-    mask = ((th >= min_tophat) & (hsv[:, :, 1] <= max_sat)).astype(np.uint8) * 255
+    if adaptive:
+        # helyi zajszint: a (levágott) top-hat átlaga nagy ablakban; a ritka vonalpixelek alig emelik
+        kb = _odd(max(15, w / 12))
+        loc = cv2.boxFilter(np.minimum(th, 30).astype(np.float32), -1, (kb, kb))
+        thr = np.clip(1.6 * loc + 3.0, min_tophat_floor, min_tophat)
+        line = th.astype(np.float32) >= thr
+    else:
+        line = th >= min_tophat
+    mask = (line & (hsv[:, :, 1] <= max_sat)).astype(np.uint8) * 255
+    glare = _glare_mask(mn, k)
+    if glare is not None:
+        mask[glare > 0] = 0
     if grass_mask is not None:
         kd = _odd(max(3, w / 300))
         zone = cv2.dilate(grass_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kd, kd)))
@@ -384,9 +456,12 @@ def _keep_thin_components(mask, min_len=8, max_half_width=4.5):
 class _LineField:
     """A vonalmaszk távolság-transzformáltja és gradiense (egy képkockára)."""
 
-    def __init__(self, line_mask):
+    def __init__(self, line_mask, observable=None):
         self.mask = line_mask
         self.h, self.w = line_mask.shape[:2]
+        # ahol egyáltalán látszhatna vonal (fű körülötte, nincs kitakarva): a takart / nem füves helyre
+        # (nézők a túlsó oldalvonalon, reklámtábla, játékos) eső modellpont nem ronthatja a pontosságot
+        self.observable = observable
         inv = cv2.compare(line_mask, 0, cv2.CMP_EQ)       # 255, ahol nincs vonal
         self.D = cv2.distanceTransform(inv, cv2.DIST_L2, 5).astype(np.float32)
         self.gx = cv2.Sobel(self.D, cv2.CV_32F, 1, 0, ksize=3) / 8.0
@@ -420,6 +495,14 @@ class _LineField:
 
     def dist(self, uv):
         return _bilinear(self.D, uv[:, 0], uv[:, 1])
+
+    def observable_at(self, uv):
+        """Megfigyelhető-e a pont (bool tömb); observable nélkül minden pont az."""
+        if self.observable is None:
+            return np.ones(len(uv), bool)
+        x = np.clip(np.round(uv[:, 0]).astype(np.int32), 0, self.w - 1)
+        y = np.clip(np.round(uv[:, 1]).astype(np.int32), 0, self.h - 1)
+        return self.observable[y, x] > 0
 
 
 def _cost(field, G, P, tau, wts=None):
@@ -588,6 +671,8 @@ def evaluate_fit(field, G, pts, tangents=None, step=0.5):
     (súlyozott) hány %-a van 2 px-en belül vonalpixelhez; lefedettség: lásd line_recall."""
     uv, wz = project_points(G, pts)
     vis = field.inside(uv, wz, margin=2.0)
+    if vis.any():
+        vis[vis] = field.observable_at(uv[vis])
     n = int(np.count_nonzero(vis))
     if n == 0:
         return 0.0, 0.0, 0
@@ -600,49 +685,136 @@ def evaluate_fit(field, G, pts, tangents=None, step=0.5):
 # Automatikus kezdeti kalibráció
 # ---------------------------------------------------------------------------
 
+def camera_homographies(pans, tilts, focal_px, img_w, img_h, cam_pos):
+    """
+    camera_ground_homography vektorizálva (roll = 0): az összes (tilt, pan) párra egyszerre.
+    Visszatér: (len(tilts) * len(pans), 3, 3) tömb, a sorrend tilt-külső, pan-belső ciklus.
+    """
+    p = np.radians(np.asarray(pans, np.float64))
+    t = np.radians(np.asarray(tilts, np.float64))
+    T, Pn = np.meshgrid(t, p, indexing="ij")
+    T, Pn = T.ravel(), Pn.ravel()
+    sp, cp, st, ct = np.sin(Pn), np.cos(Pn), np.sin(T), np.cos(T)
+    z = np.zeros_like(sp)
+    R = np.stack([np.stack([cp, sp, z], 1), np.stack([-st * sp, st * cp, ct], 1),
+                  np.stack([sp * ct, -cp * ct, st], 1)], 1)                # (N, 3, 3), sorok: jobbra, le, előre
+    C = np.asarray(cam_pos, np.float64)
+    M = np.concatenate([R[:, :, 0:1], R[:, :, 1:2], -(R @ C)[:, :, None]], axis=2)
+    K = camera_K(focal_px, img_w, img_h)
+    return K[None] @ M
+
+
+def default_camera_positions(length=PITCH_LENGTH, width=PITCH_WIDTH):
+    """
+    A kamerahely-hipotézisek: a közeli oldalvonal mögött, a felezővonaltól ±40 m-en belül
+    (amatőr pályán a Veo gyakran nem a felezővonalnál áll, hanem pl. a 16-os vonalában),
+    0–15 m-re az oldalvonal mögött, 4–15 m magasan. Visszatér: [(x, y, z), ...] (z = -magasság).
+    """
+    return [c for group in default_hypothesis_groups(length, width) for c in group[0]]
+
+
+def default_hypothesis_groups(length=PITCH_LENGTH, width=PITCH_WIDTH):
+    """
+    A hipotézisrács csoportjai: [(kamerahelyek, pásztázási szögek, dőlések, látószögek), ...].
+    A felezővonalnál álló kamerát (a Veo ajánlása, a leggyakoribb) sűrű rács fedi le, a felezővonaltól
+    13–40 m-re álló kamerát ritkább (a magasságot, a távolságot és a pontos helyet a finomítás –
+    refine_camera, 7 szabadsági fok – igazítja; a rács csak kiindulópont).
+    """
+    mid = [(length / 2, width + 4.0, -6.0), (length / 2, width + 10.0, -9.0)]
+    off = [(length / 2 + dx, width + 6.0, -8.0) for dx in (-13.0, 13.0, -27.0, 27.0, -40.0, 40.0)]
+    return [
+        (mid, np.arange(-60.0, 60.1, 2.0), np.arange(4.0, 32.1, 2.0), (85.0, 72.0, 62.0, 53.0, 45.0, 37.0)),
+        (off, np.arange(-72.0, 72.1, 3.0), np.arange(3.0, 30.1, 3.0), (80.0, 62.0, 48.0, 37.0, 29.0)),
+    ]
+
+
+_COARSE_CACHE = {}
+
+
+def _coarse_points(step):
+    if step not in _COARSE_CACHE:
+        _COARSE_CACHE[step] = pitch_model_points(step)
+    return _COARSE_CACHE[step]
+
+
+def _downscaled_field(field, factor=2):
+    """A vonalmaszk kicsinyített változata (a durva hipotézis-pontozáshoz; a vékony vonal megmarad)."""
+    if factor <= 1:
+        return field
+    w, h = max(8, field.w // factor), max(8, field.h // factor)
+    m = cv2.resize(field.mask, (w, h), interpolation=cv2.INTER_AREA)
+    obs = None if field.observable is None else \
+        cv2.resize(field.observable, (w, h), interpolation=cv2.INTER_NEAREST)
+    return _LineField(np.where(m > 0, 255, 0).astype(np.uint8), obs)
+
+
 def auto_calibrate(field, img_w, img_h, pts_coarse, pts_fine, max_candidates=12,
                    pans=None, tilts=None, hfovs=None, cam_positions=None, min_visible=60, px=1.0,
-                   tangents=None):
+                   tangents=None, time_budget=None, coarse_factor=2, min_refine=5):
     """
     Kamera-hipotézisek rácskeresése a vonalmaszk távolság-transzformáltján.
     img_w, img_h: a feldolgozási kép mérete (field mérete).
     Visszatér: (G, info) – G None, ha egyik hipotézis sem elég jó.
-    Feltevés: a kamera a felezővonal vonalában áll, a közeli (y = 68) oldalvonal
-    mögött (Veo ajánlott elhelyezése); a pálya 180°-os szimmetriája miatt a
-    túloldali kamera ugyanígy írható le.
+    Feltevés: a kamera a közeli (y = 68) oldalvonal mögött áll, a felezővonaltól legfeljebb ~40 m-re
+    (default_camera_positions); a pálya 180°-os szimmetriája miatt a túloldali kamera ugyanígy írható le.
+    A durva pontozás kicsinyített vonalmaszkon fut (coarse_factor), a jelöltek finomítása legfeljebb
+    time_budget másodpercig (None: nincs korlát) – a legjobb pontszámú jelöltek kerülnek sorra először.
     """
-    pans = np.arange(-60.0, 60.1, 2.0) if pans is None else np.asarray(pans, float)
-    tilts = np.arange(4.0, 32.1, 2.0) if tilts is None else np.asarray(tilts, float)
-    hfovs = (85.0, 72.0, 62.0, 53.0, 45.0, 37.0) if hfovs is None else hfovs
-    cam_positions = ((PITCH_LENGTH / 2, PITCH_WIDTH + 4.0, -6.0),
-                     (PITCH_LENGTH / 2, PITCH_WIDTH + 10.0, -9.0)) if cam_positions is None else cam_positions
+    import time as _time
+    t0 = _time.perf_counter()
+    if pts_coarse is None:
+        pts_coarse = _coarse_points(3.0)      # a durva pontozáshoz ritkább mintavétel is elég (gyorsabb)
+    if cam_positions is None and pans is None and tilts is None and hfovs is None:
+        groups = default_hypothesis_groups()
+    else:
+        groups = [(default_camera_positions() if cam_positions is None else cam_positions,
+                   np.arange(-60.0, 60.1, 2.0) if pans is None else np.asarray(pans, float),
+                   np.arange(4.0, 32.1, 2.0) if tilts is None else np.asarray(tilts, float),
+                   (85.0, 72.0, 62.0, 53.0, 45.0, 37.0) if hfovs is None else hfovs)]
+    cam_positions = [c for g in groups for c in g[0]]
+    cf = max(1, int(coarse_factor))
+    cfield = _downscaled_field(field, cf)
+    sx, sy = cfield.w / float(img_w), cfield.h / float(img_h)
+    Sc = np.array([[sx, 0, 0], [0, sy, 0], [0, 0, 1.0]])
     hyps = []
     Gs = []
-    for cp in cam_positions:
-        for hf in hfovs:
-            f = 0.5 * img_w / math.tan(math.radians(hf) / 2)
-            for t in tilts:
-                for p in pans:
-                    Gs.append(camera_ground_homography(p, t, f, img_w, img_h, cp))
-                    hyps.append((float(p), float(t), float(hf), cp))
-    Gs = np.array(Gs)                                  # (K, 3, 3)
+    ci = -1
+    for g_pos, pans, tilts, hfovs in groups:
+        for cp in g_pos:
+            ci += 1
+            for hf in hfovs:
+                f = 0.5 * img_w / math.tan(math.radians(hf) / 2)
+                Gs.append(Sc[None] @ camera_homographies(pans, tilts, f, img_w, img_h, cp))
+                for t in tilts:
+                    for p in pans:
+                        hyps.append((float(p), float(t), float(hf), ci))
+    Gs = np.concatenate(Gs, axis=0)                     # (K, 3, 3), a kicsinyített képre
     # A durva pontozás is súlyoz: képbeli mintatávolság × a vonal látható szélessége
     # (lásd _point_weights), különben a nagy látószögű, távoli vonalakat mutató
     # hipotézisek nyernének. A pontosság mellett a 'lefedettség' (a felismert
     # vonalhossz mekkora részét magyarázza a hipotézis) is számít.
-    scores = _score_hypotheses(field, Gs, pts_coarse, img_w, img_h, px=px, min_visible=min_visible)
+    scores = _score_hypotheses(cfield, Gs, pts_coarse, cfield.w, cfield.h, px=px * sx,
+                               min_visible=max(20, min_visible // 2))
     order = np.argsort(-scores)
     chosen = []
     for k in order:
         if scores[k] <= 0 or len(chosen) >= max_candidates:
             break
-        p, t, hf, cp = hyps[k]
-        if any(abs(p - c[0]) <= 4 and abs(t - c[1]) <= 4 and c[3] == cp for c in (hyps[j] for j in chosen)):
+        p, t, hf, ci = hyps[k]
+        if any(abs(p - c[0]) <= 4 and abs(t - c[1]) <= 4 and c[3] == ci for c in (hyps[j] for j in chosen)):
             continue
         chosen.append(k)
+    t_score = _time.perf_counter() - t0
     best = None
+    refined = 0
     for k in chosen:
-        p, t, hf, cp = hyps[k]
+        # legalább min_refine jelölt mindig sorra kerül (a gép terhelésétől független eredmény);
+        # utána az időkorlát dönt
+        if time_budget is not None and refined >= min_refine and _time.perf_counter() - t0 > time_budget:
+            break
+        refined += 1
+        p, t, hf, ci = hyps[k]
+        cp = cam_positions[ci]
         f0 = 0.5 * img_w / math.tan(math.radians(hf) / 2)
         theta0 = np.array([p, t, 0.0, f0, cp[0], cp[1], cp[2]], np.float64)
         G1, _ = refine_camera(field, theta0, img_w, img_h, pts_fine, tangents,
@@ -657,12 +829,23 @@ def auto_calibrate(field, img_w, img_h, pts_coarse, pts_fine, max_candidates=12,
         fit = 2 * prec * rec / max(prec + rec, 1e-9)
         if best is None or fit > best[0]:
             best = (fit, G1, prec, rec, n, hyps[k], float(scores[k]))
-    info = {"hypotheses": len(Gs), "candidates": len(chosen)}
+    if best is not None:
+        # a legjobb jelölt végső, szűkebb tűrésű finomítása (csak ha nem rontja az illeszkedést)
+        Gp, _ = refine_homography(field, best[1], pts_fine, taus=tuple(v * px for v in (2.0, 1.0)), iters=10,
+                                  tangents=tangents)
+        if Gp is not None:
+            prec, rec, n = evaluate_fit(field, Gp, pts_fine, tangents)
+            fit = 2 * prec * rec / max(prec + rec, 1e-9)
+            if fit >= best[0] - 0.005:
+                best = (fit, Gp, prec, rec, n) + best[5:]
+    info = {"hypotheses": len(Gs), "candidates": len(chosen), "refined": refined,
+            "t_score": t_score, "t_total": _time.perf_counter() - t0}
     if best is None:
         return None, info
     fit, G1, prec, rec, n, hyp, cs = best
     info.update({"fit": fit, "precision": prec, "recall": rec, "n_visible": n,
-                 "pan": hyp[0], "tilt": hyp[1], "hfov": hyp[2], "coarse_score": cs})
+                 "pan": hyp[0], "tilt": hyp[1], "hfov": hyp[2], "cam": tuple(cam_positions[hyp[3]]),
+                 "coarse_score": cs})
     if not _plausible(G1, img_w, img_h):
         info["reason"] = "valószínűtlen geometria"
         return None, info
@@ -670,10 +853,12 @@ def auto_calibrate(field, img_w, img_h, pts_coarse, pts_fine, max_candidates=12,
 
 
 CAMERA_PRIOR = {
-    # Veo ajánlás: a felezővonal vonalában, az oldalvonal mögött, 3–10 m magasan
-    "x": (PITCH_LENGTH / 2, 12.0),      # (várható érték, szórás) méterben
-    "y_min": PITCH_WIDTH + 1.0, "y_max": PITCH_WIDTH + 25.0,
-    "h_min": 2.5, "h_max": 15.0,
+    # Veo ajánlás: a felezővonal vonalában, az oldalvonal mögött, 3–10 m magasan. Amatőr pályán a
+    # kamera gyakran máshol áll (pl. a 16-os vonalában), ezért x-ben csak a ±x_range sávon kívül büntetünk.
+    "x": (PITCH_LENGTH / 2, 12.0),      # (várható érték, szórás a sávon kívül) méterben
+    "x_range": 45.0,
+    "y_min": PITCH_WIDTH + 0.0, "y_max": PITCH_WIDTH + 25.0,
+    "h_min": 2.5, "h_max": 16.0,
 }
 
 
@@ -691,7 +876,7 @@ def refine_camera(field, theta, img_w, img_h, pts, tangents=None, taus=(16.0, 8.
 
     def prior_res(th):
         cp = CAMERA_PRIOR
-        r = [(th[4] - cp["x"][0]) / cp["x"][1], th[2] / 3.0]
+        r = [max(0.0, abs(th[4] - cp["x"][0]) - cp.get("x_range", 0.0)) / cp["x"][1], th[2] / 3.0]
         y, hgt = th[5], -th[6]
         r.append(max(0.0, cp["y_min"] - y, y - cp["y_max"]) / 2.0)
         r.append(max(0.0, cp["h_min"] - hgt, hgt - cp["h_max"]) / 1.0)
@@ -1219,6 +1404,7 @@ def _score_hypotheses(field, Gs, pts_coarse, img_w, img_h, px=1.0, min_visible=6
     """
     tau = 10.0 * px
     Q = np.maximum(0.0, 1.0 - field.D / tau).astype(np.float32)   # közelségi térkép (1 = vonalon)
+    OBS = None if getattr(field, "observable", None) is None else field.observable > 0
     step_c = _coarse_step(pts_coarse)
     tan_c = pitch_model_tangents(step_c)
     nrm_c = np.column_stack([-tan_c[:, 1], tan_c[:, 0]])
@@ -1249,6 +1435,8 @@ def _score_hypotheses(field, Gs, pts_coarse, img_w, img_h, px=1.0, min_visible=6
         vis = (wz > 1e-6) & (u >= 0) & (u <= img_w - 1) & (v >= 0) & (v <= img_h - 1)
         ui = np.where(vis, u, 0).astype(np.int32)
         vi = np.where(vis, v, 0).astype(np.int32)
+        if OBS is not None:
+            vis &= OBS[vi, ui]
         q = np.where(vis, Q[vi, ui], 0.0)
         tx, ty = (ut - u) / d_off, (vt - v) / d_off
         nx, ny = (un - u) / d_off, (vn - v) / d_off
@@ -1529,7 +1717,7 @@ class PitchTracker:
     """
 
     def __init__(self, frame_size, grass_lower=None, grass_upper=None, H0=None, proc_width=640,
-                 line_width=960, refine_every=3, auto_init=True, auto_init_every=50, auto_init_max_every=250, max_lost=15,
+                 line_width=960, refine_every=3, auto_init=True, auto_init_every=50, auto_init_max_every=500, max_lost=15,
                  relocalize_after=75, min_conf=0.35, refine_gain=0.5):
         self.W, self.H = int(frame_size[0]), int(frame_size[1])
         self.s = min(1.0, float(proc_width) / max(1, self.W))
@@ -1545,9 +1733,14 @@ class PitchTracker:
         self.px = self.wl / 640.0                          # pixel-küszöbök léptéke
         if grass_lower is None or grass_upper is None or is_full_range(np.asarray(grass_lower), np.asarray(grass_upper)):
             grass_lower, grass_upper = DEFAULT_GRASS_HSV
-        self.grass_lower = np.asarray(grass_lower)
-        self.grass_upper = np.asarray(grass_upper)
+        # sosem szűkebb a tág alaptartománynál (a napos / sötét fű is benne legyen); a saját pálya füvét
+        # a main_grass_mask választja ki a kép alsó sávjának árnyalatából
+        self.grass_lower = np.minimum(np.asarray(grass_lower), DEFAULT_GRASS_HSV[0])
+        self.grass_upper = np.maximum(np.asarray(grass_upper), DEFAULT_GRASS_HSV[1])
         self.refine_every = max(1, int(refine_every))
+        self.main_grass_only = True   # a kerítés mögötti másik pálya füvét / vonalait kizárjuk (main_grass_mask)
+        # képre égetett feliratok helye (relatív x0, y0, x1, y1) – a vonalkeresés kihagyja (Veo logó: jobb alsó sarok)
+        self.overlay_regions = [(0.86, 0.87, 1.0, 1.0)]
         self.auto_init = auto_init
         self.auto_init_every = max(1, int(auto_init_every))
         self.auto_init_max_every = max(self.auto_init_every, int(auto_init_max_every))
@@ -1570,7 +1763,15 @@ class PitchTracker:
         self.pose_floor = (0.25, 0.25, 0.25, 1.5)   # (fok, fok, fok, 100·ln f) – lásd _check_pose
         self.keyframe_gap = 25       # legalább ennyi képkocka két kulcskép között (kamerahely-becslés)
         self.max_keyframes = 10
-        self.reloc_every = 8         # újrapozicionálási kísérletek gyakorisága
+        self.reloc_every = 8         # újrapozicionálási kísérletek gyakorisága (sikertelenség után ritkul)
+        self.reloc_max_every = 60    # ... legfeljebb ennyi képkockánként
+        self._reloc_wait = self.reloc_every
+        self.wide_reloc = False      # tág (pan ±75°, zoom 0,5–2×) újrapozicionálás kell (pl. kézi előzetes után)
+        # --- automatikus kalibráció költségkorlátja ---
+        self.auto_time_budget = 1.0  # mp / próbálkozás (a jelöltek finomítása ennyi után leáll)
+        self.promise_every = 25      # sikertelen próbálkozás után ennyi képkockánként gyors 'ígéretes-e' vizsgálat
+        self._fail_long = None       # a legutóbbi sikertelen próbálkozás vonalhossza (n_long)
+        self.manual_prior = None     # kézi kalibrációból becsült kamerahely (elvesztéskor ezt használjuk)
         self.reloc_max_fails = 4     # ennyi sikertelen újrapozicionálás után teljes automatikus kalibráció
         self.reloc_fails = 0
         # --- állapot ---
@@ -1601,11 +1802,33 @@ class PitchTracker:
             self.set_calibration(H0)
 
     # --- kalibráció -------------------------------------------------------
-    def set_calibration(self, H_full, source="kézi"):
-        """Kézi (vagy külső) kalibráció beállítása az aktuális képkockára: H teljes felbontású kép -> pálya."""
+    def set_calibration(self, H_full, source="kézi", as_prior=False):
+        """
+        Kézi (vagy külső) kalibráció beállítása az aktuális képkockára: H teljes felbontású kép -> pálya.
+        as_prior=True: a kalibráció egy MÁSIK (pl. percekkel későbbi) képkockán készült – a kamerahely
+        ebből is ismert (a Veo nem mozdul), az állás viszont nem: az első képkockákon tág
+        újrapozicionálás keresi meg (pan ±75°, zoom 0,5–2×) a rögzített kamerahellyel.
+        """
         if H_full is None:
             return
         H_full = np.asarray(H_full, np.float64)
+        if as_prior:
+            fit = fit_camera_to_homography(H_full, self.W, self.H)
+            if fit is None or not camera_plausible(fit[0], fit[1], fit[2]):
+                self.last_info = {"prior": "a kézi kalibráció nem írható le rögzített kamerával – kihagyva"}
+                return
+            x, C, info = fit
+            self.source = source
+            self._set_pose(x, C, P=np.diag([5.0, 2.0, 0.5, 10.0]) ** 2, C_sigma=5.0)
+            self.manual_prior = self.C.copy()
+            self.conf = 0.0
+            self.lost = 0
+            self.bad_streak = 4                       # az első képkockán újrapozicionálás
+            self.since_verified = self.stale_frames + 1
+            self.wide_reloc = True
+            self.last_reloc_try = -10 ** 9
+            self.last_info = {"camera_fit": info, "prior": True}
+            return
         self.source = source
         self.lost = 0
         self.bad_streak = 0
@@ -1617,6 +1840,8 @@ class PitchTracker:
             x, C, info = fit
             # a kézi kalibráció pontatlansága: a kamerahely néhány méteres, az állás tized fokos hibájú lehet
             self._set_pose(x, C, P=np.diag([0.3, 0.3, 0.3, 2.0]) ** 2, C_sigma=5.0)
+            if source == "kézi":
+                self.manual_prior = self.C.copy()
             self.last_info = {"camera_fit": info}
         else:
             self.mode = "homográfia"
@@ -1677,16 +1902,34 @@ class PitchTracker:
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
         hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
         grass, _ = build_grass_mask(hsv, self.grass_lower, self.grass_upper, scale=1.0)
+        if self.main_grass_only:
+            grass = main_grass_mask(hsv, grass)
         return small, gray, hsv, grass
 
     def _line_field(self, frame, small, hsv, grass, box_mask, boxes):
         """Vonalmaszk + távolság-transzformált a vonal-felbontáson."""
         if (self.wl, self.hl) == (self.ws, self.hs):
-            return _LineField(detect_line_mask(small, grass, box_mask, hsv))
-        img = cv2.resize(frame, (self.wl, self.hl), interpolation=cv2.INTER_AREA) if self.sl < 1.0 else frame
-        g = None if grass is None else cv2.resize(grass, (self.wl, self.hl), interpolation=cv2.INTER_NEAREST)
-        bm = _boxes_mask(img.shape, boxes, self.sl)
-        return _LineField(detect_line_mask(img, g, bm))
+            mask = detect_line_mask(small, grass, box_mask, hsv)
+        else:
+            img = cv2.resize(frame, (self.wl, self.hl), interpolation=cv2.INTER_AREA) if self.sl < 1.0 else frame
+            g = None if grass is None else cv2.resize(grass, (self.wl, self.hl), interpolation=cv2.INTER_NEAREST)
+            bm = _boxes_mask(img.shape, boxes, self.sl)
+            mask = detect_line_mask(img, g, bm)
+        h, w = mask.shape[:2]
+        obs = None
+        if grass is not None:
+            g = grass if grass.shape[:2] == (h, w) else cv2.resize(grass, (w, h), interpolation=cv2.INTER_NEAREST)
+            kd = _odd(max(3, w / 120))
+            obs = cv2.dilate(g, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kd, kd)))
+            bm = box_mask if box_mask.shape[:2] == (h, w) else _boxes_mask((h, w), boxes, self.sl)
+            obs[bm > 0] = 0
+        for x0, y0, x1, y1 in self.overlay_regions:
+            # képre égetett felirat (pl. a Veo logó a jobb alsó sarokban): nem pályavonal
+            sl = (slice(int(y0 * h), int(math.ceil(y1 * h))), slice(int(x0 * w), int(math.ceil(x1 * w))))
+            mask[sl] = 0
+            if obs is not None:
+                obs[sl] = 0
+        return _LineField(mask, obs)
 
     def _feature_mask(self, grass, box_mask):
         if grass is None:
@@ -1762,25 +2005,35 @@ class PitchTracker:
                 else:
                     self._refine(field, q, wide=self.lost > 0)
             if self.mode == "kamera" and (self.bad_streak >= 4 or self.lost > self.max_lost) \
-                    and self.frame_idx - self.last_reloc_try >= self.reloc_every:
+                    and self.frame_idx - self.last_reloc_try >= self._reloc_wait:
                 if field is None:
                     field = self._line_field(frame, small, hsv, grass, box_mask, boxes)
                 self._relocalize(field, q)
             if self.lost > self.relocalize_after or (self.mode == "kamera" and self.bad_streak > self.relocalize_after):
-                # Tartósan elveszett: újra kell kalibrálni (automatikusan, ha engedélyezett)
-                self._reset()
+                if self.mode == "kamera" and self.manual_prior is not None:
+                    # Kézi kalibráció van: a kamerahely ismert, nem dobjuk el – tág újrapozicionálás
+                    # (a rögzített kamerahellyel) a globális automatikus kalibráció helyett
+                    self._enter_prior_search()
+                else:
+                    # Tartósan elveszett: újra kell kalibrálni (automatikusan, ha engedélyezett)
+                    self._reset()
 
-        # 3) Automatikus kezdeti kalibráció
-        if self.G is None and self.auto_init and (
-                self.last_auto_try is None or self.frame_idx - self.last_auto_try >= self._auto_wait):
-            self.last_auto_try = self.frame_idx
-            if field is None:
-                field = self._line_field(frame, small, hsv, grass, box_mask, boxes)
-            if not self.try_auto_calibrate(field, q):
-                # Sikertelen próbálkozás után ritkábban próbáljuk (drága: ~1–2 mp)
-                self._auto_wait = min(self.auto_init_max_every, int(self._auto_wait * 1.5))
-            else:
-                self._auto_wait = self.auto_init_every
+        # 3) Automatikus kezdeti kalibráció – exponenciális visszalépéssel (sikertelen próbálkozás után
+        # egyre ritkábban, legfeljebb auto_init_max_every képkockánként), de ha a kép 'ígéretes'
+        # (lényegesen több hosszú vonal látszik, mint a legutóbbi sikertelen próbálkozáskor), azonnal
+        if self.G is None and self.auto_init:
+            since = None if self.last_auto_try is None else self.frame_idx - self.last_auto_try
+            due = since is None or since >= self._auto_wait
+            if not due and since >= self.promise_every and since % self.promise_every == 0:
+                if field is None:
+                    field = self._line_field(frame, small, hsv, grass, box_mask, boxes)
+                if self._looks_promising(field):
+                    due = True
+                    q["auto_promising"] = True
+            if due:
+                if field is None:
+                    field = self._line_field(frame, small, hsv, grass, box_mask, boxes)
+                self._auto_attempt(field, q)
 
         q["lost"] = self.lost
         q["conf"] = round(float(self.conf), 3)
@@ -1813,8 +2066,45 @@ class PitchTracker:
         self.conf = 0.0
         self.lost = 0
         self.bad_streak = 0
-        self.last_auto_try = None       # azonnal próbálkozhat az automatikus kalibrációval
-        self._auto_wait = self.auto_init_every
+        self.wide_reloc = False
+        self.last_auto_try = None       # azonnal próbálkozhat egyszer az automatikus kalibrációval;
+        # a visszalépés szintje (self._auto_wait) megmarad: a sikertelen próbálkozások nem halmozódnak
+
+    def _looks_promising(self, field):
+        """Olcsó előszűrő (csak a vonalmaszk): érdemes-e a visszalépési idő előtt újra próbálkozni."""
+        need = 150.0 * self.px
+        if self._fail_long is not None:
+            need = max(need, 1.4 * self._fail_long)
+        return field.n_long >= need
+
+    def _auto_attempt(self, field, q, cam_positions=None):
+        """Egy automatikus kalibrációs próbálkozás + a visszalépési ütemezés frissítése."""
+        self.last_auto_try = self.frame_idx
+        ok = self.try_auto_calibrate(field, q, cam_positions=cam_positions)
+        if ok:
+            self._auto_wait = self.auto_init_every
+            self._fail_long = None
+            if self.mode == "kamera":
+                # ugyanazon a képkockán a fizikai kameramodell vonal-illesztése is (pontosabb kiindulás)
+                conf = self.conf
+                self._check_pose(field, {} if q is None else q)
+                self.conf = max(self.conf, min(conf, 0.75))
+        else:
+            # sikertelen: legközelebb kétszer ennyi idő múlva (drága: ~0,5–1 mp), legfeljebb auto_init_max_every
+            self._auto_wait = min(self.auto_init_max_every, int(self._auto_wait * 2))
+            self._fail_long = field.n_long
+        if q is not None:
+            q["auto_wait"] = self._auto_wait
+        return ok
+
+    def _enter_prior_search(self):
+        """Elveszett követés kézi kalibrációval: a kamerahely marad, tág újrapozicionálás kezdődik."""
+        self.lost = self.max_lost + 1          # 'elveszett' státusz, de nem dobjuk el a kamerát
+        self.bad_streak = 4
+        self.conf = min(self.conf, 0.2)
+        self.wide_reloc = True
+        if self.P is not None:
+            self.P = np.diag([5.0, 2.0, 0.5, 10.0]) ** 2
 
     # --- fizikai kameramodell ---------------------------------------------
     def _propagate_pose(self, gray, q):
@@ -2003,10 +2293,15 @@ class PitchTracker:
     def _relocalize(self, field, q):
         """Elveszett / rossz illesztés: (pan, tilt, zoom) keresés a predikció körül, rögzített kamerahellyel."""
         self.last_reloc_try = self.frame_idx
-        wide = self.bad_streak > 20 or self.lost > 3 * self.max_lost
-        cands = search_pose(field, self.x, self.C, self.W, self.H, self.SL, self.pts_coarse, px=self.px,
-                            pan_half=60.0 if wide else 25.0, pan_step=2.0 if wide else 1.5,
-                            tilt_half=6.0 if wide else 4.0)
+        if self.wide_reloc:
+            cands = search_pose(field, self.x, self.C, self.W, self.H, self.SL, self.pts_coarse, px=self.px,
+                                pan_half=75.0, pan_step=2.5, tilt_half=8.0, tilt_step=1.5,
+                                zooms=(0.5, 0.65, 0.8, 1.0, 1.25, 1.55, 2.0), top_k=8)
+        else:
+            wide = self.bad_streak > 20 or self.lost > 3 * self.max_lost
+            cands = search_pose(field, self.x, self.C, self.W, self.H, self.SL, self.pts_coarse, px=self.px,
+                                pan_half=60.0 if wide else 25.0, pan_step=2.0 if wide else 1.5,
+                                tilt_half=6.0 if wide else 4.0)
         best = None
         weak = np.diag([1.0 / 20.0 ** 2, 1.0 / 5.0 ** 2, 1.0 / 2.0 ** 2, 1.0 / 20.0 ** 2])
         for score, x0 in cands:
@@ -2030,14 +2325,24 @@ class PitchTracker:
                   and info["n_visible"] >= 100 and _plausible(G, self.wl, self.hl))
         if not ok:
             self.reloc_fails += 1
-            if self.reloc_fails >= self.reloc_max_fails and self.auto_init:
+            # sikertelen újrapozicionálás után ritkábban próbálkozunk (ne vigye el a futásidőt)
+            self._reloc_wait = min(self.reloc_max_every, int(math.ceil(self._reloc_wait * 1.5)))
+            due = self.last_auto_try is None or self.frame_idx - self.last_auto_try >= self._auto_wait
+            if self.reloc_fails >= self.reloc_max_fails and self.auto_init and due:
                 # A rögzített kamerahellyel nem található jó állás: lehet, hogy maga a kamerahely
-                # (a kalibráció) rossz – teljes automatikus kalibráció (kamerahely-hipotézisekkel)
+                # (a kalibráció) rossz – automatikus kalibráció. Kézi kalibrációnál csak a kézi
+                # kalibrációból ismert kamerahely körül (a kézi pontok megbízhatóbbak a globális keresésnél).
                 self.reloc_fails = 0
-                q["relocalize"]["auto"] = self.try_auto_calibrate(field, q)
+                cams = None
+                if self.manual_prior is not None:
+                    c = self.manual_prior
+                    cams = [tuple(c), (c[0] - 5.0, c[1], c[2]), (c[0] + 5.0, c[1], c[2])]
+                q["relocalize"]["auto"] = self._auto_attempt(field, q, cam_positions=cams)
                 return q["relocalize"]["auto"]
             return False
         self.reloc_fails = 0
+        self._reloc_wait = self.reloc_every
+        self.wide_reloc = False
         self.x = y
         self.v = np.zeros(4)
         self.P = np.diag([0.1, 0.1, 0.1, 0.5]) ** 2
@@ -2113,9 +2418,10 @@ class PitchTracker:
             self.lost = 0        # a vonalak megerősítették a helyzetet
         return accepted
 
-    def try_auto_calibrate(self, field, q=None):
-        G, info = auto_calibrate(field, self.wl, self.hl, self.pts_coarse, self.pts_fine, px=self.px,
-                                  tangents=self.tan_fine)
+    def try_auto_calibrate(self, field, q=None, cam_positions=None):
+        G, info = auto_calibrate(field, self.wl, self.hl, _coarse_points(3.0), self.pts_fine, px=self.px,
+                                  tangents=self.tan_fine, time_budget=self.auto_time_budget,
+                                  cam_positions=cam_positions)
         self.last_info = info
         ok = G is not None and info.get("precision", 0) >= 0.6 and info.get("recall", 0) >= 0.45 \
             and info.get("n_visible", 0) >= 100

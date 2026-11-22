@@ -314,6 +314,14 @@ def create_pitch_tracker(video_file, width, height, fps, start_sec, calib_points
     msg = "BE, kézi kalibráció a klip elején"
     calib_t = config.get("calib_time_sec")
     k = int(round((calib_t - start_sec) * fps)) if calib_t is not None else 0
+    if k > 20 * fps:
+        # Messze (> 20 mp) a klip elejétől: a visszaszámolás sodródna és lassú lenne – a kalibrációból
+        # csak a (rögzített) kamerahelyet vesszük át, az állást a követő keresi meg (pitch_tracker.py)
+        tracker.set_calibration(H0, as_prior=True)
+        ok = tracker.manual_prior is not None
+        return tracker, (f"BE, kézi kalibráció {calib_t:.2f} mp-nél: " +
+                         ("kamerahely átvéve, az állást a követő keresi" if ok else
+                          "nem írható le rögzített kamerával -> automatikus kalibráció"))
     if k > 0:
         cap2 = cv2.VideoCapture(video_file)
         read_count = [0]

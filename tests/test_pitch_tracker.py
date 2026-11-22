@@ -493,6 +493,86 @@ def test_overlay_draws_inside_frame():
     pt.draw_pitch_overlay(frame, None)   # nincs H: nem rajzol, nem hibázik
 
 
+def test_main_grass_rejects_other_pitch():
+    """A kerítés mögötti, eltérő árnyalatú (műfüves) pálya füve és vonalai nem számítanak a saját pályához."""
+    h, w = 360, 640
+    hsv = np.zeros((h, w, 3), np.uint8)
+    hsv[:] = (0, 0, 200)                       # ég / épület
+    hsv[150:, :] = (40, 180, 70)               # saját fű (olajzöld)
+    hsv[100:140, 50:400] = (76, 140, 110)      # másik pálya (kékeszöld)
+    grass, _ = pt.build_grass_mask(hsv, *pt.DEFAULT_GRASS_HSV, scale=1.0)
+    main = pt.main_grass_mask(hsv, grass)
+    assert np.count_nonzero(grass[100:140, 50:400]) > 0.9 * 40 * 350
+    assert np.count_nonzero(main[105:135, 60:390]) == 0
+    assert np.count_nonzero(main[170:, :]) > 0.95 * (h - 170) * w
+
+
+def test_glare_blob_removed_thin_line_kept():
+    """Vastag, beégett fényfolt (reflektor) környékén nincs 'vonal', a beégett vékony vonal megmarad."""
+    h, w = 540, 960
+    img = np.zeros((h, w, 3), np.uint8)
+    img[:] = (40, 90, 50)
+    cv2.circle(img, (300, 300), 40, (255, 255, 255), -1)          # fényfolt
+    cv2.line(img, (500, 100), (900, 480), (255, 255, 255), 3)      # beégett vonal
+    m = pt.detect_line_mask(img)
+    assert np.count_nonzero(m[230:370, 230:370]) == 0
+    assert np.count_nonzero(m[200:400, 600:800]) > 100
+
+
+def test_auto_calibration_backoff_is_bounded():
+    """Sikertelen automatikus kalibráció: a próbálkozások ritkulnak (exponenciális visszalépés)."""
+    w, h = 960, 540
+    rng = np.random.default_rng(0)
+    img = np.clip(np.full((h, w, 3), (55, 135, 60), np.float32) + rng.normal(0, 6, (h, w, 3)), 0, 255).astype(np.uint8)
+    tracker = pt.PitchTracker((w, h), auto_init=True)
+    tries = []
+    for i in range(1200):
+        _, q = tracker.update(img, [])
+        if "auto_init" in q:
+            tries.append(i)
+    gaps = np.diff(tries)
+    assert len(tries) <= 6, tries                    # 0, 50, 150, 350, 750 (+ legfeljebb egy)
+    assert np.all(gaps[1:] >= gaps[:-1]), tries
+    assert tracker._auto_wait == tracker.auto_init_max_every
+
+
+def test_manual_calibration_as_prior_relocalizes():
+    """Későbbi képkockán készült kézi kalibráció: a kamerahelyet átveszi, az állást megkeresi."""
+    tex = make_texture()
+    w, h = 1280, 720
+    _, H_cal, _ = render_frame(tex, 25.0, 15.0, 1000.0, None, w, h)        # a kalibráció képe (másik irány)
+    frame, H_true, _ = render_frame(tex, -12.0, 17.0, 1050.0, None, w, h)  # a klip eleje
+    tracker = pt.PitchTracker((w, h), auto_init=False)
+    tracker.set_calibration(H_cal, as_prior=True)
+    assert tracker.manual_prior is not None and tracker.mode == "kamera"
+    H, q = tracker.update(frame, [])
+    if H is not None:                                  # már az első képkockán megtalálta: legyen jó
+        assert reprojection_error_m(H, H_true)[0] < 1.0
+    for _ in range(6):
+        H, q = tracker.update(frame, [])
+    err, _ = reprojection_error_m(tracker.current_H(), H_true)
+    print(f"  kézi előzetesből: {q['status']}, hiba {err:.2f} m")
+    assert err < 1.0, (q, err)
+
+
+def test_real_veo_frames_if_available():
+    """Valódi Veo mintaképek (ha vannak: VALOS_MINTA_DIR vagy <repo>/minta): a jól látható nézeteken kalibrál."""
+    d = os.environ.get("VALOS_MINTA_DIR") or os.path.join(ROOT, "minta")
+    names = ["kep_005.jpg", "kep_046.jpg", "kep_057.jpg", "kep_081.jpg", "kep_082.jpg", "kep_089.jpg"]
+    paths = [os.path.join(d, n) for n in names if os.path.exists(os.path.join(d, n))]
+    if len(paths) < len(names):
+        print("  (kihagyva: nincsenek valódi mintaképek)")
+        return
+    ok = 0
+    for p in paths:
+        img = cv2.imread(p)
+        tracker = pt.PitchTracker((img.shape[1], img.shape[0]), auto_init=True)
+        _, q = tracker.update(img, [])
+        ok += int(bool(q.get("auto_init", {}).get("accepted")))
+    print(f"  valódi képek: {ok}/{len(paths)} kalibrálva")
+    assert ok >= len(paths) - 1, ok
+
+
 if __name__ == "__main__":
     tests = [(name, fn) for name, fn in sorted(globals().items()) if name.startswith("test_") and callable(fn)]
     t_all = time.perf_counter()

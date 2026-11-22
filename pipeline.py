@@ -60,6 +60,8 @@ ANALYSIS_DEFAULTS = {
 # A teljes folyamat saját beállításai
 PIPELINE_DEFAULTS = {
     "expected_half_min": 45.0,
+    # a 2. félidő saját kézi kalibrációja (ha a szünetben odébb tették a kamerát; tools/kalibracio.py --felido 2)
+    "calib2_points": "", "calib2_pitch_points": "", "calib2_time_sec": None,
     "use_person_count": False,
     "skip_cut": False,
     "padding_sec": 5.0,
@@ -565,10 +567,16 @@ def run_match_pipeline(video_path, options=None, progress=None, funcs=None, out_
         # A kézi kalibráció csak abban a félidőben érvényes, amelyikben a képe készült;
         # a másik félidőben a pályavonalakból automatikusan kalibrálunk.
         calib_points = opts["calib_points"]
+        if key == "second_half" and opts.get("calib2_points"):
+            # külön 2. félidős kalibráció (pl. a szünetben odébb tett kamera)
+            calib_points = opts["calib2_points"]
+            cfg["calib_pitch_points"] = opts.get("calib2_pitch_points", "")
+            cfg["calib_time_sec"] = opts.get("calib2_time_sec")
         ct = cfg.get("calib_time_sec")
         if calib_points and ct is not None and not (h["start_sec"] <= float(ct) <= h["end_sec"]):
             calib_points = ""
-        elif calib_points and ct is None and key == "second_half" and cfg.get("dynamic_homography", True):
+        elif calib_points and ct is None and key == "second_half" and not opts.get("calib2_points") \
+                and cfg.get("dynamic_homography", True):
             calib_points = ""  # idő nélküli kalibráció = az 1. félidő eleje
         label = f"{HALF_LABELS[key]} elemzése"
         progress(pos, label)
