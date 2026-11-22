@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 import math
 
-from events import EventDetector, EventConfig, GK_EVENT_TYPES
+from events import EventDetector, EventConfig, GK_EVENT_TYPES, annotate_categories
 
 class TacticalEngine:
     def __init__(self, pitch_length=105.0, pitch_width=68.0, team1_attacks_right=True, event_config=None):
@@ -17,23 +17,16 @@ class TacticalEngine:
 
         self.player_trajectories = {}
         self.ball_trajectory = []
-        self.possession_history = []
 
         # Esemény-detektor (lövés, gól, kapus események) – lásd events.py
         cfg = event_config or EventConfig()
         cfg.team1_attacks_right = bool(team1_attacks_right)
         self.event_detector = EventDetector(cfg, pitch_length, pitch_width)
 
-        # A lövés/gól/kapus statisztikák ugyanazok a dict objektumok, mint a detektorban (nincs külön szinkron)
-        det_stats = self.event_detector.stats
-        self.stats = {
-            "passes": {"team1": 0, "team2": 0},
-            "tackles": {"team1": 0, "team2": 0},
-            "shots": det_stats["shots"],
-            "shots_on_target": det_stats["shots_on_target"],
-            "goals": det_stats["goals"],
-            "gk_events": det_stats["gk_events"]
-        }
+        # A statisztikák ugyanazok a dict objektumok, mint a detektorban (nincs külön szinkron). A passzok /
+        # szerelések stb. a detektor KIADOTT eseményeit számolják (korábban itt egy külön, naiv számlálás
+        # futott, ami nem egyezett az eseménylistával).
+        self.stats = self.event_detector.stats
 
     @property
     def events(self):
@@ -60,6 +53,7 @@ class TacticalEngine:
             if ev.get("type") in GK_EVENT_TYPES and team in self.stats["gk_events"]:
                 bucket = self.stats["gk_events"][team]
                 bucket[ev["type"]] = bucket.get(ev["type"], 0) + 1
+        annotate_categories(external_events)
         return sorted(list(external_events) + list(self.event_detector.events), key=lambda e: e["time"])
 
     def compute_homography(self, src_points):
@@ -154,44 +148,10 @@ class TacticalEngine:
                 real_ball = real_ball_coords
                 self.ball_trajectory.append((real_ball[0], real_ball[1], timestamp))
 
-        if real_ball and current_frame_players:
-            self._evaluate_possession_and_events(real_ball, current_frame_players, timestamp)
-
         # Esemény-detektálás minden képkockán (játékosok nélkül is: a lövés/gól a labdán múlik)
         self.event_detector.update(timestamp, real_ball, current_frame_players)
 
         return current_frame_players, real_ball
-
-    def _evaluate_possession_and_events(self, ball_xy, players, timestamp):
-        bx, by = ball_xy
-        closest_player = None
-        min_dist = 999.0
-
-        for p in players:
-            px, py = p['pitch_coords']
-            dist = math.hypot(px - bx, py - by)
-            if dist < min_dist:
-                min_dist = dist
-                closest_player = p
-
-        # Labdabirtoklás küszöb: 1.5 méter
-        if closest_player and min_dist <= 1.5:
-            tid = closest_player['track_id']
-            team = f"team{closest_player['team_id']}"
-
-            if not self.possession_history:
-                self.possession_history.append((tid, team, timestamp))
-            else:
-                last_tid, last_team, last_time = self.possession_history[-1]
-                if last_team == team and last_tid != tid:
-                    if (timestamp - last_time) > 0.5:
-                        self.stats["passes"][team] += 1
-                        self.possession_history.append((tid, team, timestamp))
-                elif last_team != team:
-                    self.stats["tackles"][team] += 1
-                    self.possession_history.append((tid, team, timestamp))
-
-        # A lövés/gól/kapus események detektálása az EventDetector-ban történik (events.py)
 
     def analyze_goalkeeper(self, gk_coords, ball_coords):
         """Kiszámítja a kapus szögfelezőjét és az ideális pozíciótól mért eltérést méterben."""

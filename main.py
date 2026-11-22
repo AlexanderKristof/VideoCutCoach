@@ -570,6 +570,8 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
         nonlocal fed_engine_events, fed_timeline_events
         engine_events = engine_instance.event_detector.events
         for ev in engine_events[fed_engine_events:]:
+            if ev.get("category") in REVIEW_SKIP_CATEGORIES:
+                continue   # a sok passz / labdavezetés ne gyártson egy-egy ellenőrző lapot
             review.add_event(ev)
         fed_engine_events = len(engine_events)
         for ev in timeline_events[fed_timeline_events:]:
@@ -1268,6 +1270,9 @@ async def get_frame_time_endpoint(video_path: str = Form(...), time_sec: float =
         cv2.imwrite(os.path.join(CLIPS_DIR, filename), frame)
         return {"status": "success", "frame_url": f"/clips/{filename}"}
     return {"status": "error"}
+
+# Az ellenőrző (review) lapok ezekhez a kalapokhoz nem készülnek (túl sok esemény, kis egyenkénti érték)
+REVIEW_SKIP_CATEGORIES = ("passz", "labdavezetes")
 
 GK_TIMELINE_TYPES = ("gk_save", "gk_claim_cross", "gk_goal_kick", "gk_long_ball", "gk_short_pass",
                      "gk_conceded", "gk_sweeper", "gk_positioning_error")

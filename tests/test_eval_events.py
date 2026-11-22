@@ -32,6 +32,12 @@ THRESHOLDS = {
     ("kozepes", "shot"): (0.9, 0.55),
     ("kozepes", "goal"): (0.9, 0.75),
     ("kozepes", "gk_goal_kick"): (0.9, 0.6),
+    # labdás mezőny-események (2026-11: gt P=1.00 R=0.90, kozepes P=0.99 R=0.78; a sikertelen passz és a
+    # kezdőrúgás GT-je kevés / a szimulátorban a kezdőrúgó messze áll a labdától, ezért ott csak pontosság)
+    ("gt", "pass"): (0.95, 0.8),
+    ("kozepes", "pass"): (0.9, 0.65),
+    ("gt", "kickoff"): (0.95, 0.5),
+    ("kozepes", "pass_failed"): (0.8, 0.3),
 }
 
 

@@ -23,6 +23,7 @@ import time
 import uuid
 
 from jobs import JobCancelled
+from events import event_category
 
 # ------------------------------------------------------------------
 # A /cut-raw hangolási paraméterei, ugyanazokkal az alapértékekkel.
@@ -69,7 +70,8 @@ PIPELINE_DEFAULTS = {
     # kézi félidőhatárok (mp vagy pp:mm / ó:pp:mm); ha mind a négy megvan, nincs felismerés
     "first_start": "", "first_end": "", "second_start": "", "second_end": "",
     "heatmaps": True,
-    # vesszővel elválasztva: goalkeepers (kapusonként egy videó), highlights (gólok + lövések); üres = nincs
+    # vesszővel elválasztva: goalkeepers (kapusonként egy videó), highlights (gólok + lövések),
+    # setpieces (szögletek + szabadrúgások, alapból nincs bekapcsolva); üres = nincs
     "compilations": "goalkeepers,highlights",
     "clip_pre_sec": 5.0,
     "clip_post_sec": 4.0,
@@ -78,13 +80,14 @@ PIPELINE_DEFAULTS = {
 
 ALL_DEFAULTS = {**ANALYSIS_DEFAULTS, **PIPELINE_DEFAULTS}
 
-COMPILATION_KINDS = ("goalkeepers", "highlights")
+COMPILATION_KINDS = ("goalkeepers", "highlights", "setpieces")
 
 # Egyezik a main.py GK_TIMELINE_TYPES / GK_TEAM_NAMES értékeivel (a teszt ellenőrzi)
 GK_TIMELINE_TYPES = ("gk_save", "gk_claim_cross", "gk_goal_kick", "gk_long_ball", "gk_short_pass",
                      "gk_conceded", "gk_sweeper", "gk_positioning_error")
 GK_TEAM_NAMES = {"team1": "Hazai Kapus", "team2": "Vendég Kapus"}
 HIGHLIGHT_TYPES = ("goal", "shot")
+SETPIECE_TYPES = ("corner", "free_kick")
 
 # A 2. félidő követési azonosítóinak eltolása az összesített pályákban
 # (a követő félidőnként újraindul, az azonosítók ütköznének)
@@ -360,6 +363,8 @@ def merge_half_events(half_data, halves, expected_half_min, cut_offsets=None):
         clock_offset = 0.0 if idx == 1 else float(expected_half_min) * 60.0
         for ev in data.get("events") or []:
             e = dict(ev)
+            if e.get("type"):
+                e.setdefault("category", event_category(e["type"]))   # régebbi eseményfájlokhoz is
             t = float(e.get("time", 0.0))
             in_half = max(0.0, t - h["start_sec"])
             e["half"] = idx
@@ -638,8 +643,11 @@ def run_match_pipeline(video_path, options=None, progress=None, funcs=None, out_
     result["match_events_url"] = _url(match_events_path, out_dir)
     result["event_count"] = len(events)
     result["event_counts"] = {}
+    result["category_counts"] = {}
     for ev in events:
         result["event_counts"][ev.get("type", "?")] = result["event_counts"].get(ev.get("type", "?"), 0) + 1
+        cat = ev.get("category", "egyeb")
+        result["category_counts"][cat] = result["category_counts"].get(cat, 0) + 1
     result["kesz_reszek"].append("esemenyek")
     _publish(progress, result)
     progress(bounds["merge"][1], "Események összefésülve")
@@ -687,6 +695,12 @@ def run_match_pipeline(video_path, options=None, progress=None, funcs=None, out_
                 tasks.append(("highlights", "Osszefoglalo", items))
             else:
                 warnings.append("Összefoglaló: nincs gól vagy lövés esemény.")
+        if "setpieces" in compilations:
+            items = _clip_items(events, SETPIECE_TYPES)
+            if items:
+                tasks.append(("setpieces", "Rogzitett helyzetek", items))
+            else:
+                warnings.append("Rögzített helyzetek: nincs szöglet vagy szabadrúgás esemény.")
         c0, c1 = bounds["clips"]
         for i, (name, title, items) in enumerate(tasks):
             lo = c0 + (c1 - c0) * i / len(tasks)

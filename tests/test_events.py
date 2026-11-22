@@ -479,6 +479,352 @@ def test_positioning_monitor():
     check(not any(res), "távoli labdánál nincs helyezkedési hiba")
 
 
+# --------------------------------------------- labdás mezőny-események
+# Háttér-játékosok a pálya szélén (y≈64-66): a csapatok térfele a mezőnyjátékosok átlagos x-éből dől el
+# (az 1. csapat balra áll -> a jobb, x=105 kaput támadja). A labda útjától messze vannak.
+BG = [P(201, 1, 10, 66), P(202, 1, 20, 65), P(203, 1, 30, 66), P(211, 2, 75, 66), P(212, 2, 85, 65),
+      P(213, 2, 95, 66)]
+
+
+def _field(*extra):
+    return list(BG) + list(extra)
+
+
+def test_completed_pass_fields():
+    s = Sim()
+    a, b = P(7, 1, 40.0, 30.0), P(8, 1, 55.0, 34.0)
+    opp = P(30, 2, 60.0, 20.0)
+    pl = _field(a, b, opp)
+    s.hold(1.0, (40.5, 30.0), pl)
+    s.move((40.5, 30.0), (54.5, 34.0), 12.0, lambda q: pl)
+    s.hold(1.0, (54.5, 34.0), pl)
+    s.finalize()
+    passes = s.of_type("pass")
+    check(len(passes) == 1, s.det.events)
+    ev = passes[0]
+    check(ev["team"] == "team1" and ev["category"] == "passz", ev)
+    check(13.0 <= ev["distance_m"] <= 16.0 and ev["progressive"] and not ev["is_long"] and not ev["into_box"], ev)
+    check(ev["zone"] == "sajat_terfel" and ev["player_track_id"] == 7 and ev["receiver_track_id"] == 8, ev)
+    check(abs(ev["time"] - 1.0) < 0.2 and ev["start_sec"] < ev["time"] < ev["end_sec"], ev)
+    check(ev["from_xy"][0] < ev["to_xy"][0], ev)
+    check(s.det.stats["passes"]["team1"] == 1 and s.det.stats["passes"]["team2"] == 0, s.det.stats)
+    check(not s.of_type("pass_failed") and not s.of_type("tackle") and not s.of_type("shot"), s.det.events)
+
+
+def test_long_pass_into_box_and_chain_counts():
+    """Passzlánc: A -> B (hosszú, a 16-osba) -> C (vissza): 2 passz, a statisztika a kiadott eseményeket számolja."""
+    s = Sim()
+    a, b, c = P(7, 1, 58.0, 20.0), P(8, 1, 92.0, 48.0), P(9, 1, 80.0, 52.0)
+    pl = _field(a, b, c)
+    s.hold(1.0, (58.5, 20.0), pl)
+    s.move((58.5, 20.0), (91.5, 48.0), 20.0, lambda q: pl)
+    s.hold(1.0, (91.5, 48.0), pl)
+    s.move((91.5, 48.0), (80.5, 52.0), 10.0, lambda q: pl)
+    s.hold(1.0, (80.5, 52.0), pl)
+    s.finalize()
+    passes = s.of_type("pass")
+    check(len(passes) == 2, s.det.events)
+    check(passes[0]["is_long"] and passes[0]["into_box"] and passes[0]["zone"] == "ellenfel_terfel", passes[0])
+    check(not passes[1]["progressive"] and passes[1]["gain_m"] < 0, passes[1])
+    check(s.det.stats["passes"]["team1"] == len(passes), s.det.stats)
+    check(not s.of_type("shot"), s.of_type("shot"))
+
+
+def test_ball_to_opponent_is_failed_pass_not_pass():
+    """Hosszú labda két különböző csapat játékosa között: nem sikeres passz, hanem sikertelen + labdaszerzés."""
+    s = Sim()
+    a, opp = P(7, 1, 40.0, 30.0), P(31, 2, 62.0, 40.0)
+    pl = _field(a, opp)
+    s.hold(1.0, (40.5, 30.0), pl)
+    s.move((40.5, 30.0), (61.5, 40.0), 14.0, lambda q: pl)
+    s.hold(1.0, (61.5, 40.0), pl)
+    s.finalize()
+    check(not s.of_type("pass"), s.of_type("pass"))
+    pf = s.of_type("pass_failed")
+    check(len(pf) == 1 and pf[0]["team"] == "team1" and pf[0]["won_by"] == "team2", pf)
+    it = s.of_type("interception")
+    check(len(it) == 1 and it[0]["team"] == "team2" and it[0]["category"] == "labdaszerzes", it)
+    check(s.det.stats["passes_failed"]["team1"] == 1 and s.det.stats["interceptions"]["team2"] == 1, s.det.stats)
+
+
+def test_dribble_with_dropouts_and_id_switch_is_not_pass():
+    """Cselezés 20 m-en, labda-kiesésekkel és track-ID cserével: nincs passz."""
+    s = Sim()
+    x = 30.0
+    i = 0
+    while x < 50.0:
+        tid = 7 if x < 40.0 else 77            # a követő új azonosítót ad a játékosnak
+        pl = _field(P(tid, 1, x - 0.6, 30.0), P(40, 2, x + 8.0, 40.0))
+        ball = None if (i % 12) in (5, 6, 7, 8) else (x, 30.0)   # ~0,16 mp-es kiesések
+        s.step(ball, pl)
+        x += 5.0 * DT
+        i += 1
+    s.hold(1.0, (50.0, 30.0), _field(P(77, 1, 49.4, 30.0), P(40, 2, 58.0, 40.0)))
+    s.finalize()
+    check(not s.of_type("pass") and not s.of_type("pass_failed") and not s.of_type("tackle"), s.det.events)
+
+
+def test_dribble_event_and_short_carry_is_not():
+    """Labdavezetés: 15 m-es, 3 mp-es vezetés -> dribble (kísérleti); 2 m-es igazgatás nem."""
+    s = Sim()
+    x = 30.0
+    while x < 45.0:
+        s.step((x, 30.0), _field(P(7, 1, x - 0.6, 30.0)))
+        x += 5.0 * DT
+    s.hold(1.0, (45.0, 30.0), _field(P(7, 1, 44.4, 30.0), P(8, 1, 60.0, 30.0)))
+    s.move((45.0, 30.0), (59.5, 30.0), 12.0, lambda q: _field(P(7, 1, 44.4, 30.0), P(8, 1, 60.0, 30.0)))
+    s.hold(1.0, (59.5, 30.0), _field(P(7, 1, 44.4, 30.0), P(8, 1, 60.0, 30.0)))
+    s.finalize()
+    dr = s.of_type("dribble")
+    check(len(dr) == 1 and dr[0]["team"] == "team1" and 13.0 <= dr[0]["distance_m"] <= 17.0, s.det.events)
+    check(dr[0]["experimental"] and dr[0]["category"] == "labdavezetes" and dr[0]["progressive"], dr)
+    check(len(s.of_type("pass")) == 1 and s.det.stats["dribbles"]["team1"] == 1, s.det.events)
+    s2 = Sim()
+    s2.hold(3.0, (40.5, 30.0), _field(P(7, 1, 40.0, 30.0)))
+    s2.move((40.5, 30.0), (42.5, 30.0), 1.0, lambda q: _field(P(7, 1, q[0] - 0.5, 30.0)))
+    s2.finalize()
+    check(not s2.of_type("dribble"), s2.det.events)
+
+
+def test_noisy_jitter_does_not_create_passes():
+    """±0,6 m-es labda-remegés két közeli csapattárs között, téves felvillanásokkal: nincs passz."""
+    import random
+    rng = random.Random(5)
+    s = Sim()
+    a, b, far = P(7, 1, 40.0, 30.0), P(8, 1, 44.0, 31.0), P(9, 1, 60.0, 20.0)
+    pl = _field(a, b, far)
+    for i in range(250):
+        if i % 37 == 0:
+            ball = (60.0 + rng.gauss(0, 0.3), 20.0 + rng.gauss(0, 0.3))   # egykockás téves felvillanás
+        elif rng.random() < 0.3:
+            ball = None
+        else:
+            ball = (40.6 + rng.gauss(0, 0.6), 30.0 + rng.gauss(0, 0.6))
+        s.step(ball, pl)
+    s.finalize()
+    check(not s.of_type("pass") and not s.of_type("pass_failed"), s.det.events)
+
+
+def test_tackle():
+    s = Sim()
+    a = P(7, 1, 50.0, 30.0)
+    opp = P(31, 2, 52.0, 30.0)
+    pl = _field(a, opp)
+    s.hold(1.0, (50.5, 30.0), pl)
+    s.move((50.5, 30.0), (52.4, 30.0), 4.0, lambda q: pl)
+    opp2 = P(31, 2, 54.0, 31.0)
+    s.move((52.4, 30.0), (54.4, 31.0), 3.0, lambda q: _field(a, opp2))
+    s.hold(1.0, (54.4, 31.0), _field(a, opp2))
+    s.finalize()
+    tk = s.of_type("tackle")
+    check(len(tk) == 1 and tk[0]["team"] == "team2" and tk[0]["lost_by"] == "team1", s.det.events)
+    check(not s.of_type("pass_failed") and not s.of_type("pass"), s.det.events)
+    check(s.det.stats["tackles"]["team2"] == 1, s.det.stats)
+
+
+def test_throw_in_after_ball_out_with_rest():
+    s = Sim()
+    a = P(7, 1, 40.0, 60.0)
+    thrower, mate = P(31, 2, 42.0, 69.0), P(32, 2, 45.0, 55.0)
+    s.hold(1.0, (40.5, 60.0), _field(a, mate))
+    s.move((40.5, 60.0), (41.0, 69.7), 8.0, lambda q: _field(a, mate))   # az oldalvonalon túlra
+    s.hold(4.0, None, _field(a, mate, thrower))
+    s.hold(1.5, (42.0, 68.6), _field(a, mate, thrower))                  # a labda a vonalon, dobásra kész
+    s.move((42.0, 68.6), (45.0, 55.5), 10.0, lambda q: _field(a, mate, thrower))
+    s.hold(1.0, (45.0, 55.5), _field(a, mate, thrower))
+    s.finalize()
+    ti = s.of_type("throw_in")
+    check(len(ti) == 1 and ti[0]["team"] == "team2" and ti[0]["team_source"] == "utolso_erintes", s.det.events)
+    check(ti[0]["category"] == "rogzitett" and ti[0]["side"] == "kozeli" and abs(ti[0]["time"] - 7.7) < 0.3, ti)
+    check(not s.of_type("pass") and not s.of_type("free_kick"), s.det.events)
+    check(s.det.stats["throw_ins"]["team2"] == 1, s.det.stats)
+
+
+def test_throw_in_without_rest_reappears_from_touchline():
+    s = Sim()
+    a = P(7, 2, 60.0, 5.0)
+    thrower, mate = P(11, 1, 62.0, -0.5), P(12, 1, 63.0, 14.0)
+    s.hold(1.0, (60.5, 5.0), _field(a, mate))
+    s.move((60.5, 5.0), (61.0, -1.5), 8.0, lambda q: _field(a, mate))    # a túlsó oldalvonalon túlra
+    s.hold(5.0, None, _field(a, mate, thrower))
+    s.step((62.0, 0.3), _field(a, mate, thrower))                         # a dobás pillanata (egy minta)
+    s.move((62.0, 0.3), (63.0, 13.5), 11.0, lambda q: _field(a, mate, thrower))
+    s.hold(1.0, (63.0, 13.5), _field(a, mate, thrower))
+    s.finalize()
+    ti = s.of_type("throw_in")
+    check(len(ti) == 1 and ti[0]["team"] == "team1" and ti[0]["side"] == "tavoli", s.det.events)
+
+
+def test_ball_out_and_straight_back_is_not_throw_in():
+    s = Sim()
+    a, b = P(7, 1, 40.0, 62.0), P(8, 1, 44.0, 50.0)
+    pl = _field(a, b)
+    s.hold(1.0, (40.5, 62.0), pl)
+    s.move((40.5, 62.0), (41.0, 69.2), 9.0, lambda q: pl)
+    s.move((41.0, 69.2), (44.0, 50.5), 12.0, lambda q: pl)            # azonnal vissza (mérési zaj / téves "ki")
+    s.hold(1.5, (44.0, 50.5), pl)
+    s.finalize()
+    check(not s.of_type("throw_in"), s.of_type("throw_in"))
+
+
+def test_corner_after_defender_clears_over_goal_line():
+    s = Sim()
+    defender = P(31, 2, 95.0, 20.0)
+    gk = P(1, 2, 103.0, 34.0, keeper=True)
+    taker, head = P(9, 1, 104.0, 2.0), P(10, 1, 95.0, 34.0)
+    s.hold(1.0, (95.5, 20.0), _field(defender, gk, head))
+    s.move((95.5, 20.0), (106.0, 15.0), 12.0, lambda q: _field(defender, gk, head))
+    s.hold(3.0, None, _field(defender, gk, head, taker))
+    s.hold(2.0, (104.5, 0.8), _field(defender, gk, head, taker))
+    s.move((104.5, 0.8), (95.5, 34.0), 18.0, lambda q: _field(defender, gk, head, taker))
+    s.hold(1.0, (95.5, 34.0), _field(defender, gk, head, taker))
+    s.finalize()
+    co = s.of_type("corner")
+    check(len(co) == 1 and co[0]["team"] == "team1" and co[0]["goal_x"] == 105.0, s.det.events)
+    check(co[0]["side"] == "tavoli" and co[0]["category"] == "rogzitett" and co[0].get("retained") is True, co)
+    check(not s.of_type("goal") and not s.of_type("gk_goal_kick") and not s.of_type("throw_in"), s.det.events)
+    check(not s.of_type("cross") and not s.of_type("pass"), s.det.events)
+
+
+def test_dangerous_free_kick():
+    s = Sim()
+    kicker, mate = P(9, 1, 79.0, 30.0), P(10, 1, 90.0, 46.0)
+    wall = [P(31, 2, 88.0, 31.0), P(32, 2, 88.0, 32.0)]
+    pl = _field(kicker, mate, *wall)
+    s.hold(1.0, None, pl)
+    s.hold(3.2, (80.0, 30.0), pl)
+    s.move((80.0, 30.0), (89.5, 46.0), 15.0, lambda q: pl)
+    s.hold(1.0, (89.5, 46.0), pl)
+    s.finalize()
+    fk = s.of_type("free_kick")
+    check(len(fk) == 1 and fk[0]["team"] == "team1" and fk[0]["dangerous"], s.det.events)
+    check(fk[0]["zone"] == "ellenfel_terfel" and not fk[0]["is_penalty"] and fk[0]["distance_to_goal_m"] < 30, fk)
+    check(abs(fk[0]["time"] - 4.2) < 0.3 and not s.of_type("pass"), s.det.events)
+
+
+def test_slow_dribble_is_not_free_kick():
+    """A lábnál tartott, alig mozgó labda (játékos rajta) rövid ideig: nem szabadrúgás."""
+    s = Sim()
+    a, b = P(7, 1, 49.6, 30.0), P(8, 1, 62.0, 34.0)
+    pl = _field(a, b, P(31, 2, 55.0, 25.0))
+    s.hold(1.8, (50.0, 30.0), pl)
+    s.move((50.0, 30.0), (61.5, 34.0), 12.0, lambda q: pl)
+    s.hold(1.0, (61.5, 34.0), pl)
+    s.finalize()
+    check(not s.of_type("free_kick"), s.of_type("free_kick"))
+    check(len(s.of_type("pass")) == 1, s.det.events)
+
+
+def test_kickoff_event():
+    s = Sim()
+    kicker, mate = P(9, 2, 53.3, 34.0), P(10, 2, 62.0, 30.0)
+    pl = _field(kicker, mate, P(31, 1, 44.0, 34.0))
+    s.hold(2.0, (52.5, 34.0), pl)
+    s.move((52.5, 34.0), (61.5, 30.0), 10.0, lambda q: pl)
+    s.hold(1.0, (61.5, 30.0), pl)
+    s.finalize()
+    ko = s.of_type("kickoff")
+    check(len(ko) == 1 and ko[0]["team"] == "team2" and ko[0]["category"] == "rogzitett", s.det.events)
+    check(not s.of_type("pass") and not s.of_type("free_kick"), s.det.events)
+
+
+def test_kickoff_after_goal_is_conceding_team():
+    s = Sim()
+    att = P(7, 1, 87.5, 34)
+    gk = P(1, 2, 104.0, 41.0, keeper=True)
+    s.hold(1.0, (88.0, 34.0), [att, gk])
+    s.move((88.0, 34.0), (106.0, 34.5), 25.0, lambda b: [att, gk])
+    s.hold(3.0, (106.0, 34.5), [att, gk])
+    s.hold(4.0, None, [att, gk])
+    s.hold(2.0, (52.5, 34.0), [gk, P(30, 1, 53.0, 34.0)])        # a kezdőrúgás mellett (zajosan) 1. csapatos
+    s.move((52.5, 34.0), (45.0, 34.0), 10.0, lambda b: [gk])
+    s.hold(1.0, (45.0, 34.0), [gk])
+    s.finalize()
+    check(len(s.of_type("goal")) == 1, s.det.events)
+    ko = s.of_type("kickoff")
+    check(len(ko) == 1 and ko[0]["team"] == "team2" and ko[0]["team_source"] == "kapott_gol", ko)
+
+
+def test_cross_from_wing_completed():
+    s = Sim()
+    winger, striker = P(11, 1, 90.0, 5.5), P(9, 1, 99.0, 36.5)
+    gk = P(1, 2, 103.5, 34.0, keeper=True)
+    pl = _field(winger, striker, gk)
+    s.hold(1.0, (90.0, 5.0), pl)
+    s.move((90.0, 5.0), (99.0, 36.0), 18.0, lambda q: pl)
+    s.hold(1.0, (99.0, 36.0), pl)
+    s.finalize()
+    cr = s.of_type("cross")
+    check(len(cr) == 1 and cr[0]["team"] == "team1" and cr[0]["completed"] is True, s.det.events)
+    check(cr[0]["category"] == "beadas" and cr[0]["side"] == "tavoli", cr)
+    check(not s.of_type("pass"), "a beadás nem számít külön passznak")
+    check(s.det.stats["crosses"]["team1"] == 1, s.det.stats)
+
+
+def test_cross_claimed_by_keeper_is_unsuccessful():
+    s = Sim()
+    winger = P(11, 1, 88.0, 5.5)
+    gk = P(1, 2, 100.5, 32.5, keeper=True)
+    pl = _field(winger, gk)
+    s.hold(1.0, (88.0, 5.0), pl)
+    s.move((88.0, 5.0), (100.2, 32.4), 18.0, lambda q: pl)
+    s.hold(1.0, (100.2, 32.4), pl)
+    s.finalize()
+    cr = s.of_type("cross")
+    check(len(cr) == 1 and cr[0]["completed"] is False and cr[0]["won_by"] == "team2", s.det.events)
+    check(len(s.of_type("gk_claim_cross")) == 1 and not s.of_type("pass_failed"), s.det.events)
+
+
+def test_categories_on_all_events():
+    from events import EVENT_CATEGORIES, GK_EVENT_TYPES, PLAY_EVENT_TYPES, event_category
+    check(EVENT_CATEGORIES["gk_goal_kick"] == "rogzitett" and EVENT_CATEGORIES["gk_save"] == "kapus", EVENT_CATEGORIES)
+    for t in GK_EVENT_TYPES + PLAY_EVENT_TYPES + ("shot", "goal"):
+        check(event_category(t) in ("rogzitett", "befejezes", "beadas", "passz", "labdaszerzes", "labdavezetes",
+                                    "kapus"), t)
+    check(event_category("valami") == "egyeb", "ismeretlen típus")
+    s = Sim()
+    att = P(7, 1, 87.5, 34)
+    gk = P(1, 2, 104.0, 41.0, keeper=True)
+    s.hold(1.0, (88.0, 34.0), [att, gk])
+    s.move((88.0, 34.0), (106.0, 34.5), 25.0, lambda b: [att, gk])
+    s.hold(3.0, (106.0, 34.5), [att, gk])
+    s.finalize()
+    check(s.det.events and all(e.get("category") == event_category(e["type"]) for e in s.det.events), s.det.events)
+    check({e["category"] for e in s.det.events} >= {"befejezes", "kapus"}, s.det.events)
+
+
+def test_engine_stats_are_detector_stats():
+    try:
+        import numpy as np
+        from tactical_engine import TacticalEngine
+    except ImportError as ex:  # pragma: no cover
+        print(f"  (kihagyva: {ex})")
+        return
+    eng = TacticalEngine()
+    H = np.eye(3, dtype=np.float64)
+    t = 0.0
+
+    def dets(*pl):
+        return [{"track_id": p["track_id"], "team_id": p["team_id"], "is_keeper": False,
+                 "screen_foot": p["pitch_coords"]} for p in pl]
+    a, b = P(7, 1, 40.0, 30.0), P(8, 1, 55.0, 34.0)
+    for _ in range(25):
+        eng.update_tracks(0, t, dets(a, b), (40.5, 30.0), H)
+        t += DT
+    for i in range(1, 30):
+        f = min(1.0, i / 29.0)
+        eng.update_tracks(0, t, dets(a, b), (40.5 + 14.0 * f, 30.0 + 4.0 * f), H)
+        t += DT
+    for _ in range(25):
+        eng.update_tracks(0, t, dets(a, b), (54.5, 34.0), H)
+        t += DT
+    eng.finalize()
+    n = len([e for e in eng.events if e["type"] == "pass"])
+    check(n == 1 and eng.stats["passes"]["team1"] == n and eng.stats is eng.event_detector.stats, eng.stats)
+    merged = eng.merge_timeline([{"type": "gk_positioning_error", "time": 0.1, "team": "team1", "desc": "x"}])
+    check(merged[0]["category"] == "kapus", merged[0])
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failed = 0
