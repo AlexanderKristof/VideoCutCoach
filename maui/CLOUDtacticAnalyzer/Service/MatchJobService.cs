@@ -105,6 +105,8 @@ public sealed class MatchEvent
     [JsonPropertyName("full_match_sec")] public double? FullMatchSec { get; set; }
 
     public string Label => EventLabels.Label(Type);
+    /// <summary>A visszajelzés kulcsa – egyezik a feedback.py event_key()-ével ("shot@634.20").</summary>
+    public string FeedbackKey => $"{Type}@{Time.ToString("0.00", CultureInfo.InvariantCulture)}";
     public string Icon => EventLabels.Icon(Type);
     public bool IsGoalkeeper => Type.StartsWith("gk_", StringComparison.Ordinal);
     public string TeamLabel => Team switch { "team1" => "Hazai", "team2" => "Vendég", _ => "" };
@@ -153,7 +155,33 @@ public static class EventLabels
     };
 
     public static string Label(string type) => Map.TryGetValue(type, out var v) ? v.Label : type;
+
+    /// <summary>A kézzel felvehető eseménytípusok (kód, magyar név) – a "+ Hiányzó esemény" választólistája.</summary>
+    public static IReadOnlyList<(string Type, string Label)> All =>
+        Map.Where(kv => kv.Key != "gk_positioning_error").Select(kv => (kv.Key, $"{kv.Value.Icon} {kv.Value.Label}")).ToList();
     public static string Icon(string type) => Map.TryGetValue(type, out var v) ? v.Icon : "•";
+}
+
+/// <summary>Edzői visszajelzés egy meccsre (feedback.py): ítéletek + kézzel felvett hiányzó események.</summary>
+public sealed class FeedbackData
+{
+    [JsonPropertyName("items")] public List<FeedbackVerdict> Items { get; set; } = new();
+    [JsonPropertyName("missing")] public List<FeedbackMissing> Missing { get; set; } = new();
+}
+
+public sealed class FeedbackVerdict
+{
+    [JsonPropertyName("key")] public string Key { get; set; } = "";
+    [JsonPropertyName("verdict")] public string Verdict { get; set; } = "";
+}
+
+public sealed class FeedbackMissing
+{
+    [JsonPropertyName("id")] public string Id { get; set; } = "";
+    [JsonPropertyName("type")] public string Type { get; set; } = "";
+    [JsonPropertyName("time")] public double Time { get; set; }
+    [JsonPropertyName("team")] public string? Team { get; set; }
+    [JsonPropertyName("note")] public string? Note { get; set; }
 }
 
 public sealed class ExportedClip
@@ -378,6 +406,62 @@ public sealed class MatchJobService
         var list = evs.Deserialize<List<MatchEvent>>(JsonOptions) ?? new();
         list.Sort((a, b) => a.Time.CompareTo(b.Time));
         return list;
+    }
+
+    /// <summary>A motor állapota (GET /health) a kijelzéshez: melyik modell, melyik eszközön.</summary>
+    public async Task<string> GetEngineSummaryAsync(CancellationToken ct = default)
+    {
+        using var resp = await _http.GetAsync(U("/health"), ct);
+        using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync(ct));
+        var r = doc.RootElement;
+        string? S(string n) => r.TryGetProperty(n, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+        var loaded = r.TryGetProperty("model_loaded", out var ml) && ml.ValueKind == JsonValueKind.True;
+        var device = (S("device") ?? "…").ToUpperInvariant();
+        if (!loaded)
+            return $"🧠 Beállított modell: {S("model_configured") ?? "?"} (az első elemzéskor töltődik be) • eszköz: {device}";
+        var weights = S("model_weights") ?? "?";
+        var warn = weights.Contains("CPUExecutionProvider") && device == "CUDA"
+            ? "  ⚠ a modell processzoron fut (az onnxruntime-gpu nem működik)" : "";
+        return $"🧠 Modell: {weights} • eszköz: {device}{warn}";
+    }
+
+    public async Task<FeedbackData> GetFeedbackAsync(string eventsUrl, CancellationToken ct = default)
+    {
+        using var resp = await _http.GetAsync(U($"/feedback?events={Uri.EscapeDataString(eventsUrl)}"), ct);
+        var root = await ReadJsonAsync(resp, ct);
+        return root.GetProperty("feedback").Deserialize<FeedbackData>(JsonOptions) ?? new FeedbackData();
+    }
+
+    /// <summary>Egy automatikus esemény ítélete: "ok" (valódi), "hamis" (téves), vagy null (törlés).</summary>
+    public async Task SetVerdictAsync(string eventsUrl, MatchEvent ev, string? verdict, CancellationToken ct = default)
+    {
+        var body = JsonSerializer.Serialize(new
+        {
+            events = eventsUrl,
+            @event = new { type = ev.Type, time = ev.Time, team = ev.Team },
+            verdict = verdict ?? "",
+        });
+        using var content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
+        using var resp = await _http.PostAsync(U("/feedback"), content, ct);
+        await ReadJsonAsync(resp, ct);
+    }
+
+    public async Task<FeedbackMissing> AddMissingAsync(string eventsUrl, string type, double timeSec, string? team,
+        CancellationToken ct = default)
+    {
+        var body = JsonSerializer.Serialize(new { events = eventsUrl, missing = new { type, time = timeSec, team } });
+        using var content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
+        using var resp = await _http.PostAsync(U("/feedback"), content, ct);
+        var root = await ReadJsonAsync(resp, ct);
+        return root.GetProperty("item").Deserialize<FeedbackMissing>(JsonOptions)!;
+    }
+
+    public async Task RemoveMissingAsync(string eventsUrl, string id, CancellationToken ct = default)
+    {
+        var body = JsonSerializer.Serialize(new { events = eventsUrl, remove_missing = id });
+        using var content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
+        using var resp = await _http.PostAsync(U("/feedback"), content, ct);
+        await ReadJsonAsync(resp, ct);
     }
 
     /// <summary>A kiválasztott események kivágása háttérfeladatként (kind=export-clips); visszatér: job id.</summary>

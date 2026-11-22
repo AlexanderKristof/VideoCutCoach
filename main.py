@@ -1701,6 +1701,45 @@ from fastapi.responses import JSONResponse
 import pipeline
 from jobs import JobManager
 
+
+# ============================================================
+# EDZŐI VISSZAJELZÉS az automatikus eseményekre (✓ valódi / ✗ téves / + hiányzó) – feedback.py
+#   GET  /feedback?events=/clips/match_events_x.json
+#   POST /feedback  {"events": ..., "event": {...}, "verdict": "ok"|"hamis"|""}
+#   POST /feedback  {"events": ..., "missing": {"type", "time", "team", "note"}}
+#   POST /feedback  {"events": ..., "remove_missing": "<id>"}
+# ============================================================
+import feedback as _feedback
+
+
+@app.get("/feedback")
+async def get_feedback(events: str):
+    try:
+        return {"status": "success", "feedback": _feedback.load(CLIPS_DIR, events)}
+    except ValueError as ex:
+        return JSONResponse({"status": "error", "message": str(ex)}, status_code=400)
+
+
+@app.post("/feedback")
+async def post_feedback(request: Request):
+    try:
+        body = await request.json()
+        events = body.get("events")
+        if body.get("event") is not None:
+            data = _feedback.set_verdict(CLIPS_DIR, events, body["event"], body.get("verdict") or None)
+            return {"status": "success", "feedback": data}
+        if body.get("missing") is not None:
+            m = body["missing"]
+            item = _feedback.add_missing(CLIPS_DIR, events, m.get("type"), float(m.get("time", 0.0)),
+                                         m.get("team"), m.get("note", ""))
+            return {"status": "success", "item": item}
+        if body.get("remove_missing"):
+            return {"status": "success", "feedback": _feedback.remove_missing(CLIPS_DIR, events, body["remove_missing"])}
+        raise ValueError("Hiányzik: event + verdict, missing vagy remove_missing.")
+    except (ValueError, TypeError) as ex:
+        return JSONResponse({"status": "error", "message": str(ex)}, status_code=400)
+
+
 job_manager = JobManager(app_paths.jobs_dir(), max_workers=2)  # fejlesztői módban clips/jobs
 
 

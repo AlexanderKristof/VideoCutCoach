@@ -169,6 +169,18 @@ def serve(app, host="127.0.0.1", port=8000, sockets=None, on_started=None, log_c
 
 
 # ---------------------------------------------------------------- végpontok
+def configured_model(cfg):
+    """A beállított (még nem feltétlenül betöltött) modell rövid leírása – a program kijelzéséhez.
+    A modell lustán, az első elemzéskor töltődik be; addig ebből látszik, melyik lesz."""
+    if not isinstance(cfg, dict):
+        return None
+    kind = str(cfg.get("backend") or "ultralytics").lower()
+    if kind == "onnx":
+        return f"ONNX: {os.path.basename(str(cfg.get('onnx_path') or '?'))}"
+    w = cfg.get("weights") or f"{cfg.get('weights_cuda') or 'yolov8x.pt'} (GPU) / {cfg.get('weights_cpu') or 'yolov8n.pt'} (CPU)"
+    return f"{kind}: {w}"
+
+
 def health_info(engine):
     model_state = getattr(engine, "model_state", {}) or {}
     return {
@@ -179,6 +191,7 @@ def health_info(engine):
         "model_error": model_state.get("error"),
         "model_weights": getattr(engine, "model_weights", None),
         "device": getattr(engine, "device", None),
+        "model_configured": configured_model(getattr(engine, "model_cfg", None)),
         "ffmpeg": app_paths.find_ffmpeg(),
         "data_dir": os.path.abspath(app_paths.data_dir()),
         "mode": "app" if app_paths.app_mode() else "dev",

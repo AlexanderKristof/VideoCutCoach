@@ -10,9 +10,17 @@ namespace TacticalAnalyzer;
 public sealed class EventItem : INotifyPropertyChanged
 {
     private bool _selected;
-    public EventItem(MatchEvent ev) => Event = ev;
+    private string? _verdict;
+    public EventItem(MatchEvent ev, string? manualId = null)
+    {
+        Event = ev;
+        ManualId = manualId;
+    }
     public MatchEvent Event { get; }
-    public string Title => Event.Title;
+    /// <summary>Kézzel felvett (az automatikából kimaradt) esemény azonosítója, különben null.</summary>
+    public string? ManualId { get; }
+    public bool IsManual => ManualId is not null;
+    public string Title => IsManual ? $"➕ {Event.Label}{(string.IsNullOrEmpty(Event.TeamLabel) ? "" : " – " + Event.TeamLabel)} (kézzel felvett)" : Event.Title;
     public string Subtitle => Event.Subtitle;
 
     public bool Selected
@@ -20,6 +28,26 @@ public sealed class EventItem : INotifyPropertyChanged
         get => _selected;
         set { if (_selected == value) return; _selected = value; OnChanged(); }
     }
+
+    /// <summary>Edzői ítélet: "ok" (valódi), "hamis" (téves) vagy null (még nem nézte meg).</summary>
+    public string? Verdict
+    {
+        get => _verdict;
+        set
+        {
+            if (_verdict == value) return;
+            _verdict = value;
+            OnChanged();
+            OnChanged(nameof(OkColor));
+            OnChanged(nameof(WrongColor));
+            OnChanged(nameof(RowColor));
+        }
+    }
+
+    public Color OkColor => Verdict == "ok" ? Color.FromArgb("#2E7D32") : Color.FromArgb("#37474F");
+    public Color WrongColor => Verdict == "hamis" ? Color.FromArgb("#C62828") : Color.FromArgb("#37474F");
+    public Color RowColor => IsManual ? Color.FromArgb("#1B2A20") : Verdict == "hamis" ? Color.FromArgb("#2A1B1B")
+        : Verdict == "ok" ? Color.FromArgb("#1B2A1E") : Color.FromArgb("#1E1E1E");
 
     public event PropertyChangedEventHandler? PropertyChanged;
     private void OnChanged([CallerMemberName] string? name = null) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
@@ -84,6 +112,7 @@ public class MatchAnalysisPage : ContentPage
     // --- jobb oldal: kiválasztott elemzés
     private readonly Label _jobTitle = new() { Text = "Válassz ki egy elemzést, vagy indíts újat.", FontSize = 18, FontAttributes = FontAttributes.Bold, TextColor = Colors.White };
     private readonly Label _jobPhase = new() { TextColor = Muted };
+    private readonly Label _engineInfo = new() { TextColor = Color.FromArgb("#90CAF9"), FontSize = 12 };
     private readonly ProgressBar _jobProgress = new() { ProgressColor = Color.FromArgb("#E91E63"), IsVisible = false };
     private readonly Button _pauseButton = SmallButton("⏸ Szünet"), _cancelButton = SmallButton("✖ Megszakítás");
     private readonly Label _summary = new() { TextColor = Colors.White };
@@ -226,6 +255,15 @@ public class MatchAnalysisPage : ContentPage
         _resultBox.Children.Add(_warnings);
         _resultBox.Children.Add(Row(board, drawOnVideo, review));
         _resultBox.Children.Add(_player);
+        var addMissing = new Button { Text = "➕ Hiányzó esemény ide (a videó mostani pillanatára)", BackgroundColor = Color.FromArgb("#2E7D32") };
+        addMissing.Clicked += async (_, _) => await AddMissingHereAsync();
+        _resultBox.Children.Add(addMissing);
+        _resultBox.Children.Add(new Label
+        {
+            Text = "Ellenőrzés: a ✓ / ✗ gombokkal jelöld, melyik esemény valódi és melyik téves; ami kimaradt, azt a videón " +
+                   "odatekerve a ➕ gombbal vedd fel. A jelölések mentődnek, és ezekből mérjük, javul-e a felismerés.",
+            TextColor = Muted, FontSize = 12,
+        });
         _resultBox.Children.Add(new ScrollView { Orientation = ScrollOrientation.Horizontal, Content = _videoButtons });
         _resultBox.Children.Add(Header("Események"));
         _resultBox.Children.Add(Row(_typeFilter, _teamFilter, _halfFilter));
@@ -240,7 +278,7 @@ public class MatchAnalysisPage : ContentPage
         {
             Spacing = 8,
             Padding = 14,
-            Children = { _jobTitle, _jobPhase, _jobProgress, Row(_pauseButton, _cancelButton), _resultBox }
+            Children = { _engineInfo, _jobTitle, _jobPhase, _jobProgress, Row(_pauseButton, _cancelButton), _resultBox }
         };
 
         var grid = new Grid
@@ -282,16 +320,94 @@ public class MatchAnalysisPage : ContentPage
         title.SetBinding(Label.TextProperty, nameof(EventItem.Title));
         var sub = new Label { TextColor = Muted, FontSize = 12, LineBreakMode = LineBreakMode.TailTruncation };
         sub.SetBinding(Label.TextProperty, nameof(EventItem.Subtitle));
+
+        // Edzői ellenőrzés: ✓ valódi / ✗ téves (újra megnyomva visszavonja). Kézzel felvett eseménynél a ✗ törli.
+        var ok = new Button { Text = "✓", WidthRequest = 40, HeightRequest = 34, Padding = 0, FontSize = 16, TextColor = Colors.White };
+        ok.SetBinding(BackgroundColorProperty, nameof(EventItem.OkColor));
+        ok.SetBinding(IsVisibleProperty, nameof(EventItem.IsManual), converter: new InvertBool());
+        ok.Clicked += async (s, _) => { if ((s as BindableObject)?.BindingContext is EventItem it) await SetVerdictAsync(it, "ok"); };
+        var wrong = new Button { Text = "✗", WidthRequest = 40, HeightRequest = 34, Padding = 0, FontSize = 16, TextColor = Colors.White };
+        wrong.SetBinding(BackgroundColorProperty, nameof(EventItem.WrongColor));
+        wrong.Clicked += async (s, _) => { if ((s as BindableObject)?.BindingContext is EventItem it) await SetVerdictAsync(it, "hamis"); };
+        ToolTipProperties.SetText(ok, "Valódi esemény (helyes)");
+        ToolTipProperties.SetText(wrong, "Téves esemény (nem történt meg / nem ez volt)");
+
         var grid = new Grid
         {
-            ColumnDefinitions = { new ColumnDefinition(GridLength.Auto), new ColumnDefinition(GridLength.Star) },
+            ColumnDefinitions = { new ColumnDefinition(GridLength.Auto), new ColumnDefinition(GridLength.Star), new ColumnDefinition(GridLength.Auto) },
             Padding = new Thickness(4, 3),
-            BackgroundColor = Panel,
             Margin = new Thickness(0, 2),
         };
+        grid.SetBinding(BackgroundColorProperty, nameof(EventItem.RowColor));
         grid.Add(box, 0, 0);
         grid.Add(new VerticalStackLayout { Spacing = 1, Children = { title, sub } }, 1, 0);
+        grid.Add(new HorizontalStackLayout { Spacing = 4, VerticalOptions = LayoutOptions.Center, Children = { ok, wrong } }, 2, 0);
         return grid;
+    }
+
+    private sealed class InvertBool : IValueConverter
+    {
+        public object? Convert(object? value, Type targetType, object? parameter, System.Globalization.CultureInfo culture) => value is not true;
+        public object? ConvertBack(object? value, Type targetType, object? parameter, System.Globalization.CultureInfo culture) => value is not true;
+    }
+
+    private async Task SetVerdictAsync(EventItem item, string verdict)
+    {
+        if (_loadedEventsUrl is null) return;
+        try
+        {
+            if (item.IsManual)
+            {
+                if (!await DisplayAlertAsync("Törlés", "Törlöd ezt a kézzel felvett eseményt?", "Igen", "Nem")) return;
+                await _api.RemoveMissingAsync(_loadedEventsUrl, item.ManualId!);
+                _allEvents.Remove(item);
+                ApplyFilter();
+                return;
+            }
+            var newVerdict = item.Verdict == verdict ? null : verdict;   // újra megnyomva: visszavonás
+            await _api.SetVerdictAsync(_loadedEventsUrl, item.Event, newVerdict);
+            item.Verdict = newVerdict;
+            UpdateEventCount();
+        }
+        catch (Exception ex)
+        {
+            _eventCount.Text = $"A jelölés nem menthető: {ex.Message}";
+        }
+    }
+
+    private async Task AddMissingHereAsync()
+    {
+        if (_loadedEventsUrl is null) return;
+        var video = _result?.VideoPath ?? _currentJob?.VideoPath;
+        if (string.IsNullOrEmpty(video) || _playerSource != video)
+        {
+            await DisplayAlertAsync("Hiányzó esemény",
+                "Előbb kattints egy eseményre a listában (így az eredeti meccsvideó töltődik be), majd tekerj oda, " +
+                "ahol a kimaradt esemény történt, és nyomd meg újra ezt a gombot.", "OK");
+            return;
+        }
+        _player.Pause();
+        var t = _player.Position.TotalSeconds;
+        var types = EventLabels.All;
+        var choice = await DisplayActionSheetAsync($"Mi történt itt? ({MatchEvent.FormatTime(t)})", "Mégse", null,
+            types.Select(x => x.Label).ToArray());
+        var picked = types.FirstOrDefault(x => x.Label == choice);
+        if (string.IsNullOrEmpty(picked.Type)) return;
+        var teamChoice = await DisplayActionSheetAsync("Melyik csapat?", "Mégse", null, "Hazai", "Vendég", "Nem tudom");
+        if (teamChoice is null || teamChoice == "Mégse") return;
+        var team = teamChoice == "Hazai" ? "team1" : teamChoice == "Vendég" ? "team2" : null;
+        try
+        {
+            var item = await _api.AddMissingAsync(_loadedEventsUrl, picked.Type, t, team);
+            var ev = new MatchEvent { Type = item.Type, Time = item.Time, Team = item.Team, Desc = "az automatikából kimaradt" };
+            _allEvents.Add(new EventItem(ev, item.Id));
+            _allEvents.Sort((a, b) => a.Event.Time.CompareTo(b.Event.Time));
+            ApplyFilter();
+        }
+        catch (Exception ex)
+        {
+            await DisplayAlertAsync("Hiba", ex.Message, "OK");
+        }
     }
 
     // ================================================================ életciklus
@@ -301,6 +417,7 @@ public class MatchAnalysisPage : ContentPage
         base.OnAppearing();
         _timer ??= CreateTimer();
         _timer.Start();
+        await RefreshEngineInfoAsync();
         await RefreshJobsAsync();
     }
 
@@ -332,6 +449,8 @@ public class MatchAnalysisPage : ContentPage
                 await PollExportAsync();
             if (++_tick % 5 == 0 || _jobs.Any(j => !j.Job.IsFinished))
                 await RefreshJobsAsync();
+            if (_tick % 5 == 0)
+                await RefreshEngineInfoAsync();
         }
         catch (Exception ex)
         {
@@ -409,6 +528,12 @@ public class MatchAnalysisPage : ContentPage
         {
             _startButton.IsEnabled = true;
         }
+    }
+
+    private async Task RefreshEngineInfoAsync()
+    {
+        try { _engineInfo.Text = await _api.GetEngineSummaryAsync(); }
+        catch (Exception ex) { _engineInfo.Text = $"🧠 A motor állapota nem kérdezhető le: {ex.Message}"; }
     }
 
     private async Task RefreshJobsAsync()
@@ -518,6 +643,18 @@ public class MatchAnalysisPage : ContentPage
             var events = await _api.LoadEventsAsync(url);
             _loadedEventsUrl = url;
             _allEvents = events.Select(e => new EventItem(e)).ToList();
+            try
+            {
+                var fb = await _api.GetFeedbackAsync(url);
+                var verdicts = fb.Items.ToDictionary(i => i.Key, i => i.Verdict);
+                foreach (var it in _allEvents)
+                    if (verdicts.TryGetValue(it.Event.FeedbackKey, out var v)) it.Verdict = v;
+                foreach (var m in fb.Missing)
+                    _allEvents.Add(new EventItem(new MatchEvent { Type = m.Type, Time = m.Time, Team = m.Team,
+                        Desc = string.IsNullOrEmpty(m.Note) ? "az automatikából kimaradt" : m.Note }, m.Id));
+                _allEvents.Sort((a, b) => a.Event.Time.CompareTo(b.Event.Time));
+            }
+            catch { /* régebbi motor: nincs /feedback – a lista ítéletek nélkül is használható */ }
             ApplyFilter();
         }
         catch (Exception ex)
@@ -546,7 +683,11 @@ public class MatchAnalysisPage : ContentPage
     private void UpdateEventCount()
     {
         var selected = _allEvents.Count(e => e.Selected);
-        _eventCount.Text = $"{_visibleEvents.Count} / {_allEvents.Count} esemény látszik, {selected} kijelölve";
+        var okN = _allEvents.Count(e => e.Verdict == "ok");
+        var badN = _allEvents.Count(e => e.Verdict == "hamis");
+        var manN = _allEvents.Count(e => e.IsManual);
+        _eventCount.Text = $"{_visibleEvents.Count} / {_allEvents.Count} esemény látszik, {selected} kijelölve" +
+            (okN + badN + manN > 0 ? $"  •  ellenőrizve: {okN} ✓, {badN} ✗, {manN} kézzel felvett" : "");
         _exportButton.IsEnabled = selected > 0;
     }
 
