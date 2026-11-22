@@ -99,6 +99,26 @@ A COCO `category_id` 1-től számoz (1 = ball ... 4 = referee; a CVAT a 0-t nem 
 
 ## 5. Tanítás – javasolt keretrendszerek (Apache-2.0)
 
+### Gyors út: `tools/tanitas.py` (RF-DETR, egy-egy paranccsal)
+
+```bat
+REM egyszer: tanító környezet (GPU-s PyTorch + rfdetr[train])
+powershell -ExecutionPolicy Bypass -File tools\tanitas_telepites.ps1
+
+REM adatkészlet a CVAT exportból (Actions -> Export task dataset -> COCO 1.0, kicsomagolva) + a képek
+venv-tanitas\Scripts\python tools\tanitas.py adat --cimkek export\annotations\instances_default.json --kepek tanito\kepek --ki adat_rfdetr
+
+REM tanítás + ONNX export (-> models\focis_detektor.onnx és futasok\elso\model_config.javaslat.json)
+venv-tanitas\Scripts\python tools\tanitas.py tanit --adat adat_rfdetr --ki futasok\elso --korok 40
+```
+
+- Több meccs (több CVAT-feladat): a `--cimkek` / `--kepek` pár többször is megadható.
+- Az `adat` lépés a teljes képek mellé eredeti felbontású 640×640-es csempéket is tesz (főleg a labda
+  körül), mert a kicsinyített teljes képen a ~11 px-es labda alig látszana.
+- Kevés VRAM-nál: `--batch 2 --accum 8`; ha a modell-letöltés nem megy: `--elotanitott <letöltött .pth>`.
+- A végén a `model_config.javaslat.json`-t másold a repó gyökerébe `model_config.json` néven, és a motor
+  környezetébe tedd fel az `onnxruntime-gpu` csomagot (NVIDIA) – lásd 6. pont.
+
 A tanításhoz külön Python-környezet kell PyTorch-csal (GPU-val; a termékbe a torch nem kerül).
 Bármelyik keretrendszer használható – mindhárom ONNX-et ad, amelyet a motor kezel.
 
