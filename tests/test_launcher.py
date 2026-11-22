@@ -72,6 +72,19 @@ def test_pid_alive():
     assert not L.pid_alive(p.pid)
 
 
+def test_watch_parent_ignores_single_false_negative():
+    """Egyetlen téves "nem fut" válasz még nem állítja le a motort, a tartós igen."""
+    import threading
+    answers = iter([True, False, True, False, True] + [False] * 50)
+    fired = threading.Event()
+    L.watch_parent(12345, fired.set, interval=0.01, confirm=3, alive=lambda pid: next(answers))
+    assert fired.wait(2.0)
+    seq = iter([False, True] * 200)
+    fired2 = threading.Event()
+    L.watch_parent(12345, fired2.set, interval=0.005, confirm=3, alive=lambda pid: next(seq, True))
+    assert not fired2.wait(0.5)
+
+
 def test_watch_parent_calls_back():
     p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     fired = threading.Event()

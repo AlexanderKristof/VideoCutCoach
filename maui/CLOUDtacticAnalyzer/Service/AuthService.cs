@@ -9,20 +9,16 @@ public class AuthService
     private readonly HttpClient _httpClient;
     private const string TokenKey = "auth_token";
 
-#if ANDROID
-    private const string BaseUrl = "http://10.0.2.2:8000";
-#else
-    private const string BaseUrl = "http://localhost:8000";
-#endif
+    private static string BaseUrl => Engine.BaseUrl;
 
     public AuthService()
     {
-        _httpClient = new HttpClient { BaseAddress = new Uri(BaseUrl) };
+        _httpClient = new HttpClient();
     }
 
     public async Task<bool> RegisterAsync(string email, string password)
     {
-        var response = await _httpClient.PostAsJsonAsync("/auth/register", new { email, password });
+        var response = await _httpClient.PostAsJsonAsync($"{BaseUrl}/auth/register", new { email, password });
         if (!response.IsSuccessStatusCode) return false;
 
         var result = await response.Content.ReadFromJsonAsync<AuthResponse>();
@@ -41,7 +37,7 @@ public class AuthService
             new KeyValuePair<string, string>("password", password)
         });
 
-        var response = await _httpClient.PostAsync("/auth/login", formData);
+        var response = await _httpClient.PostAsync($"{BaseUrl}/auth/login", formData);
         if (!response.IsSuccessStatusCode) return false;
 
         var result = await response.Content.ReadFromJsonAsync<AuthResponse>();

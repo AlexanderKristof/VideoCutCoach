@@ -35,11 +35,9 @@ public class AiClickResult
 public class AnalysisService
 {
     private readonly HttpClient _httpClient;
-#if ANDROID
-    public const string BaseUrl = "http://10.0.2.2:8000";
-#else
-    public const string BaseUrl = "http://localhost:8000";
-#endif
+    // A motor címe: induláskor az EngineHost dönti el (kézzel indított motor a 8000-es porton,
+    // vagy a program által indított motor szabad porton). Lásd Service/EngineHost.cs
+    public static string BaseUrl => Engine.BaseUrl;
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
 
     public AnalysisService() { _httpClient = new HttpClient { Timeout = TimeSpan.FromMinutes(15) }; }

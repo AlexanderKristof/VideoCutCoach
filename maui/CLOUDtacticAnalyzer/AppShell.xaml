@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="UTF-8" ?>
+﻿<?xml version="1.0" encoding="UTF-8" ?>
 <Shell
     x:Class="TacticalAnalyzer.AppShell"
     xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
@@ -6,7 +6,19 @@
     xmlns:local="clr-namespace:TacticalAnalyzer">
 
     <TabBar>
-        <Tab Title="Mezőny Taktika">
+        <Tab Title="Meccs elemzés">
+            <ShellContent
+                ContentTemplate="{DataTemplate local:MatchAnalysisPage}"
+                Route="MatchAnalysisPage" />
+        </Tab>
+
+        <Tab Title="Taktikai tábla">
+            <ShellContent
+                ContentTemplate="{DataTemplate local:TacticsBoardPage}"
+                Route="TacticsBoardPage" />
+        </Tab>
+
+        <Tab Title="Kézi vágás">
             <ShellContent
                 ContentTemplate="{DataTemplate local:MainPage}"
                 Route="MainPage" />

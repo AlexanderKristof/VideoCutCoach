@@ -8,11 +8,7 @@ public class MatchService
 {
     private readonly HttpClient _httpClient;
 
-#if ANDROID
-    private const string BaseUrl = "http://10.0.2.2:8000";
-#else
-    private const string BaseUrl = "http://localhost:8000";
-#endif
+    private static string BaseUrl => Engine.BaseUrl;
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {

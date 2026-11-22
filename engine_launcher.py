@@ -132,11 +132,23 @@ def pid_alive(pid):
     return True
 
 
-def watch_parent(pid, on_dead, interval=1.0):
-    """Háttérszál: ha a pid folyamat megszűnik, egyszer meghívja az on_dead()-et."""
+def watch_parent(pid, on_dead, interval=1.0, confirm=3, alive=None):
+    """
+    Háttérszál: ha a pid folyamat megszűnik, egyszer meghívja az on_dead()-et.
+    Csak `confirm` egymás utáni sikertelen ellenőrzés után (kb. confirm × interval mp): egyetlen téves
+    "nem fut" válasz (terhelt gépen előfordult) ne állítsa le a motort egy órás elemzés közepén.
+    """
+    check = alive or pid_alive
+
     def _loop():
+        misses = 0
         while True:
-            if not pid_alive(pid):
+            try:
+                ok = check(pid)
+            except Exception:
+                ok = True   # az ellenőrzés hibája nem jelenti, hogy a szülő meghalt
+            misses = 0 if ok else misses + 1
+            if misses >= max(1, confirm):
                 on_dead()
                 return
             time.sleep(interval)

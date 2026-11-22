@@ -1,0 +1,24 @@
+<!--
+  Fordítás-ellenőrzés a MAUI munkaterhelés (workload) nélkül, pl. Linuxon / CI-ban:
+  a ../CLOUDtacticAnalyzer kódját (a Platforms mappa nélkül) sima net10.0 könyvtárként fordítja,
+  a XAML-t is (forrásgenerátorral). Futtatás: ./ellenoriz.sh  (vagy Windowson: ellenoriz.ps1)
+  A Visual Studio megoldás (CLOUDtacticAnalyzer.slnx) ezt a projektet nem tartalmazza.
+-->
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>Library</OutputType>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>TacticalAnalyzer</RootNamespace>
+    <MauiXamlInflator>SourceGen</MauiXamlInflator>
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
+    <EnableDefaultItems>false</EnableDefaultItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="CommunityToolkit.Maui.MediaElement" Version="10.0.0" />
+    <PackageReference Include="Microsoft.Maui.Controls" Version="10.0.100" />
+    <Compile Include="src/*.cs;src/Service/*.cs;src/UI/*.cs" />
+    <MauiXaml Include="src/*.xaml;src/Resources/Styles/*.xaml" />
+  </ItemGroup>
+</Project>
