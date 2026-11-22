@@ -76,7 +76,8 @@ public class MatchAnalysisPage : ContentPage
     private readonly Entry _halfMin = new() { Text = "45", Keyboard = Keyboard.Numeric, WidthRequest = 60, TextColor = Colors.White, BackgroundColor = Panel };
     private readonly Entry _firstStart = TimeEntry("1. kezdete"), _firstEnd = TimeEntry("1. vége"), _secondStart = TimeEntry("2. kezdete"), _secondEnd = TimeEntry("2. vége");
     private readonly CheckBox _background = new() { IsChecked = true }, _heatmaps = new() { IsChecked = true },
-        _gkComp = new() { IsChecked = true }, _highlights = new() { IsChecked = true }, _team1Right = new() { IsChecked = true };
+        _gkComp = new() { IsChecked = true }, _highlights = new() { IsChecked = true }, _team1Right = new() { IsChecked = true },
+        _makeFullMatch = new() { IsChecked = true };
     private readonly Button _startButton = new() { Text = "▶ Elemzés indítása", BackgroundColor = Color.FromArgb("#E91E63"), FontAttributes = FontAttributes.Bold };
     private readonly CollectionView _jobList = new() { SelectionMode = SelectionMode.Single, HeightRequest = 260 };
 
@@ -196,6 +197,7 @@ public class MatchAnalysisPage : ContentPage
                 Row(_secondStart, _secondEnd),
                 Check(_team1Right, "A hazai csapat az 1. félidőben jobbra támad"),
                 Check(_background, "Háttér-mód (a gép közben használható marad)"),
+                Check(_makeFullMatch, "Szünet nélküli meccsvideó készítése"),
                 Check(_heatmaps, "Hőtérképek"),
                 Check(_gkComp, "Kapus-videók (kapusonként)"),
                 Check(_highlights, "Összefoglaló videó (gólok, lövések)"),
@@ -390,6 +392,7 @@ public class MatchAnalysisPage : ContentPage
             GoalkeeperCompilations = _gkComp.IsChecked,
             Highlights = _highlights.IsChecked,
             Team1AttacksRight = _team1Right.IsChecked,
+            SkipCut = !_makeFullMatch.IsChecked,
         };
         _startButton.IsEnabled = false;
         try
