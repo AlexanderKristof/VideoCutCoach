@@ -55,6 +55,7 @@ ANALYSIS_DEFAULTS = {
     "calib_pitch_points": "",
     "pitch_margin_m": 2.5,           # pályahatár-szűrő: ennyi m-rel a vonalon túl még elfogadott (0 = ki)
     "grass_model": "auto",           # fűmaszk: "auto" = videónként tanult fűmodell, "hsv" = fix HSV tartomány
+    "output_scale": 1.0,             # az annotált elemzés-videó méretaránya (0.5 = fél felbontás, gyorsabb)
 }
 
 # A teljes folyamat saját beállításai
@@ -151,6 +152,7 @@ def build_analysis_config(opts):
         "dynamic_homography": o["dynamic_homography"], "draw_pitch_overlay": o["draw_pitch_overlay"],
         "calib_time_sec": o["calib_time_sec"], "calib_pitch_points": o["calib_pitch_points"],
         "pitch_margin_m": o["pitch_margin_m"], "grass_model": o["grass_model"],
+        "output_scale": o["output_scale"],
         "roi_top_pct": o["roi_top_pct"], "roi_bottom_pct": o["roi_bottom_pct"],
         "min_player_height_pct": o["min_player_height_pct"],
         "use_static_roi": o["use_static_roi"], "grass_min_ratio": o["grass_min_ratio"],
@@ -581,6 +583,7 @@ def run_match_pipeline(video_path, options=None, progress=None, funcs=None, out_
         analysis[key] = {"clip_url": clip_url, "local_path": local_path, "events_path": events_path,
                          "events_url": _url(events_path, clips_root), "review_url": data.get("review_url"),
                          "event_count": len(data.get("events") or []),
+                         "timing": data.get("timing"),   # PROFILOZÁS: szakaszonkénti idő (félidőnként)
                          "team1_attacks_right": cfg["team1_attacks_right"]}
         result["analysis"] = analysis
         result["kesz_reszek"].append(f"elemzes_{key}")
@@ -706,6 +709,9 @@ def summarize(result):
     for key, a in (result.get("analysis") or {}).items():
         lines.append(f"{HALF_LABELS.get(key, key)} – elemzett videó: {a.get('local_path')}")
         lines.append(f"    események ({a.get('event_count')} db): {a.get('events_path')}")
+        if a.get("timing"):
+            from stage_timer import format_timing
+            lines.append(f"    időmérés: {format_timing(a['timing'])}")
     lines.append(f"Összesített események ({result.get('event_count', 0)} db): {result.get('match_events_path')}")
     if result.get("event_counts"):
         lines.append("    " + ", ".join(f"{k}: {v}" for k, v in sorted(result["event_counts"].items())))

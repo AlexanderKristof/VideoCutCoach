@@ -17,6 +17,11 @@ Mintavételezett képkockánként (alap: 0,5 mp-enként) mért jellemzők (frame
   glare       – napfény / csillanás: nagy kiterjedésű, világos, fakó (alacsony telítettségű) képrész
                 és a "kifakult" fű aránya
 
+PÁLYA-TERÜLET: a világosság / beégés / csillanás / bebukás a PÁLYÁN mérve (a fő fűterület felső szélétől
+lefelé; az égbolt, az épületek, a reflektorok kimaradnak) – borús, fehér égboltú nappali képen az
+égbolt beégése nem "napfény", a sötétebb természetes fű nem "sötét / zajos". Esti, villanyfényes
+felvételnél tájékoztató "esti / villanyfényes" címke (info_flags), nem képhiba.
+
 Ezekből hibánként súlyosság (0..1), címke (ha ≥ 0,5): "elmosódott", "beégett / napfény",
 "erős árnyék", "kockás tömörítés", "sötét / zajos"; és képkockánkénti megbízhatóság
 (reliability 0..1, 1 = jó kép). A summary() a teljes klipre: osztályzat, az egyes hibák
@@ -29,6 +34,8 @@ import math
 import cv2
 import numpy as np
 
+from pitch_filters import grass_top_profile
+
 PROC_WIDTH = 640
 
 ISSUES = ("blur", "glare", "shadow", "blocking", "dark_noise")
@@ -39,6 +46,8 @@ ISSUE_LABELS = {
     "blocking": "kockás tömörítés",
     "dark_noise": "sötét / zajos",
 }
+# Tájékoztató címkék (nem képhiba, nem rontják a megbízhatóságot): esti / villanyfényes felvétel
+INFO_LABELS = {"night": "esti / villanyfényes"}
 # a megbízhatóság csökkenése teljes súlyosságnál (szorzódnak)
 ISSUE_WEIGHTS = {"blur": 0.45, "glare": 0.40, "shadow": 0.20, "blocking": 0.35, "dark_noise": 0.40}
 FLAG_SEVERITY = 0.5
@@ -124,6 +133,18 @@ def frame_metrics(frame, grass_model=None, grass_mask=None):
     gm_er = cv2.erode(gm.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
     if np.count_nonzero(gm_er) < 0.03 * h * w:
         gm_er = gm
+    # PÁLYA-TERÜLET: a fő fűterület felső szélétől lefelé (oszloponként) – égbolt / épület / kerítés nélkül
+    pitch = None
+    prof = grass_top_profile(gm.astype(np.uint8))
+    if prof is not None:
+        top = np.where(np.isfinite(prof), prof, h).astype(np.float32)
+        pitch = np.arange(h, dtype=np.float32)[:, None] >= top[None, :]
+        if np.count_nonzero(pitch) < 0.1 * h * w:
+            pitch = None
+    if pitch is None:
+        pitch = np.zeros((h, w), bool)
+        pitch[int(h * 0.45):] = True
+    n_pitch = float(np.count_nonzero(pitch))
 
     g32 = gray.astype(np.float32)
     # log-világosságon: az árnyék / megvilágítás (szorzó) nem változtatja az élességet
@@ -140,8 +161,16 @@ def frame_metrics(frame, grass_model=None, grass_mask=None):
     edge_sharp = float(math.hypot(px_, py_))
     motion_ratio = (min(px_, py_) + 1.0) / (max(px_, py_) + 1.0)   # 1 = izotróp, kicsi = irányított elmosódás
 
-    clipped = float(np.count_nonzero(small.max(axis=2) >= 250)) / (h * w)
-    crushed = float(np.count_nonzero(gray <= 10)) / (h * w)
+    # beégés / bebukás a pályán (az égbolt, a reflektor-lámpák kimaradnak); a vékony fehér vonalak és a
+    # mezek apró csúcsfényei egy nyitással kiesnek – csak a kiterjedt beégett folt számít
+    clip_m = ((small.max(axis=2) >= 250) & pitch).astype(np.uint8)
+    clip_m = cv2.morphologyEx(clip_m, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    clipped = float(np.count_nonzero(clip_m)) / n_pitch
+    crushed = float(np.count_nonzero((gray <= 10) & pitch)) / n_pitch
+    # a pályán kívüli felső képrész (égbolt / háttér) világossága – az esti felvétel jelzéséhez
+    above = ~pitch
+    above[int(h * 0.5):] = False
+    bg_bright = float(np.median(gray[above])) if np.count_nonzero(above) > 0.02 * h * w else None
     gvals = g32[gm]
     brightness = float(gvals.mean()) if gvals.size else float(g32.mean())
     contrast = float(gvals.std() / max(1.0, gvals.mean())) if gvals.size else 0.0
@@ -177,7 +206,7 @@ def frame_metrics(frame, grass_model=None, grass_mask=None):
     hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
     bright_flat = ((hsv[..., 2] >= 215) & (hsv[..., 1] <= 50)).astype(np.uint8)
     bright_flat = cv2.morphologyEx(bright_flat, cv2.MORPH_OPEN, np.ones((7, 7), np.uint8))
-    veil = float(np.count_nonzero(bright_flat[int(h * 0.25):])) / (h * w * 0.75)   # az égbolt nélkül
+    veil = float(np.count_nonzero(bright_flat.astype(bool) & pitch)) / n_pitch   # csak a pályán (égbolt nélkül)
     faded = float(np.count_nonzero(lab_map == 3)) / max(1, np.count_nonzero(lab_map > 0)) if lab_map is not None else 0.0
     # fakóság: a fű telítettsége a fűmodell referenciájához képest
     sat_grass = float(hsv[..., 1][gm].mean()) if np.count_nonzero(gm) else 0.0
@@ -189,6 +218,8 @@ def frame_metrics(frame, grass_model=None, grass_mask=None):
         "noise": round(noise, 2), "blockiness": round(blockiness, 3),
         "shadow_frac": round(shadow_frac, 3), "shadow_ratio": round(shadow_ratio, 3),
         "glare_area": round(veil, 4), "faded_grass": round(faded, 3), "grass_sat": round(sat_grass, 1),
+        "bg_brightness": None if bg_bright is None else round(bg_bright, 1),
+        "pitch_frac": round(n_pitch / (h * w), 3),
     }
 
 
@@ -207,19 +238,43 @@ def severities(m, sharp_ref=None, sat_ref=None, ratio_ref=None, pan_px=None):
         s_dir *= _clip01((pan_px - 2.0) / 4.0)
     rel = m["edge_sharpness"] / max(1e-3, sharp_ref) if sharp_ref else 1.0
     s_rel = _clip01((0.75 - rel) / 0.35)
-    glary = max(m["glare_area"] / 0.08, m["clipped"] / 0.06) >= 0.5
+    glary = max(m["glare_area"] / 0.08, m["clipped"] / 0.06) >= 0.5   # (mindkettő a pályán mérve)
     # (az általános élesség-csökkenés a jelenettől is függ – egymagában nem jelöl, csak ront a megbízhatóságon)
     sev["blur"] = _clip01(max(s_dir, 0.0 if glary else 0.45 * s_rel))
-    # napfény: beégett + fakó terület + kifakult fű + a fű telítettségének esése
+    # napfény / fátyolfény: a PÁLYÁN beégett vagy világos-fakó kiterjedt terület; a "kifakult" fű és a
+    # telítettség-esés csak EGYÜTT jelez (a napsütötte fű önmagában is "kifakultnak" címkézhető – valódi
+    # késő délutáni felvételen a fű 20–90%-a –, az pedig nem csillanás), és csak nappal
     s_sat = _clip01((0.85 - m["grass_sat"] / sat_ref) / 0.35) if sat_ref else 0.0
-    sev["glare"] = _clip01(max(m["glare_area"] / 0.08, m["clipped"] / 0.06, m["faded_grass"] / 0.25, s_sat))
+    s_veil = min(_clip01(m["faded_grass"] / 0.5), s_sat)
+    # fátyolfény: a fű egésze kifehéredett (világos ÉS fakó) – abszolút küszöbökkel, a videó saját
+    # referenciája nélkül is (a természetes fű sötétebb és telítettebb: valódi Veo-képen ~40–110 / 150–225)
+    s_wash = _clip01((155.0 - m["grass_sat"]) / 40.0) * _clip01((m["brightness"] - 110.0) / 30.0)
+    s_veil = max(s_veil, s_wash)
+    if night_like(m):
+        s_veil = 0.0
+    sev["glare"] = _clip01(max(m["glare_area"] / 0.08, m["clipped"] / 0.06, s_veil))
     # erős árnyék: a fű kétmódusú, a módusok elég nagyok és a világosság-arány kicsi
     f = m["shadow_frac"]
     balance = _clip01(min(f, 1.0 - f) / 0.25)   # nagy kiterjedésű árnyék (a játékosok saját árnyéka nem)
     sev["shadow"] = _clip01((0.8 - m["shadow_ratio"]) / 0.3) * balance
     sev["blocking"] = _clip01((m["blockiness"] - 1.7) / 0.8)
-    sev["dark_noise"] = _clip01(max((75.0 - m["brightness"]) / 40.0, (m["noise"] - 3.5) / 5.0, m["crushed"] / 0.2))
+    # sötét / zajos: a fű világossága (a természetes sötétzöld fű ~40–70 – ez még nem sötét), a fűben mért
+    # zaj és a pályán bebukott (≤ 10) rész; a sötétség és a zaj együtt erősebben számít
+    s_dark = _clip01((42.0 - m["brightness"]) / 24.0)
+    s_noise = _clip01((m["noise"] - 3.5) / 5.0)
+    s_comb = _clip01(0.6 * s_dark + 0.6 * s_noise) if s_dark > 0.15 and s_noise > 0.15 else 0.0
+    sev["dark_noise"] = _clip01(max(s_dark, s_noise, s_comb, m["crushed"] / 0.2))
     return {k: round(v, 3) for k, v in sev.items()}
+
+
+def night_like(m):
+    """Esti / villanyfényes felvétel: a pályán kívüli háttér (égbolt) sötét, a fű nem túl világos."""
+    bg = m.get("bg_brightness")
+    return bg is not None and bg < 55.0 and m["brightness"] < 110.0
+
+
+def info_flags(m):
+    return ["night"] if night_like(m) else []
 
 
 def reliability_from(sev):
@@ -279,7 +334,8 @@ class VideoQualityMonitor:
         sev = severities(m, sharp_ref, sat_ref, ratio_ref, pan_px)
         rel = reliability_from(sev)
         flags = [k for k in ISSUES if sev.get(k, 0.0) >= FLAG_SEVERITY]
-        sample = {"t": round(float(t), 2), "metrics": m, "severity": sev, "reliability": rel, "flags": flags}
+        sample = {"t": round(float(t), 2), "metrics": m, "severity": sev, "reliability": rel, "flags": flags,
+                  "info_flags": info_flags(m)}
         self.samples.append(sample)
         return sample
 
@@ -298,6 +354,8 @@ class VideoQualityMonitor:
     def describe_sample(s):
         m = s["metrics"]
         lab = ", ".join(ISSUE_LABELS[k] for k in s["flags"]) or "rendben"
+        if s.get("info_flags"):
+            lab += "; " + ", ".join(INFO_LABELS[k] for k in s["info_flags"])
         return (f"MINŐSÉG: megbízhatóság={s['reliability']:.2f} [{lab}] élesség={m['sharpness']:.1f} "
                 f"(élek {m['edge_sharpness']:.0f}, irányarány {m['motion_ratio']:.2f}), beégett={100 * m['clipped']:.1f}%, fény={m['brightness']:.0f}, "
                 f"zaj={m['noise']:.1f}, kockásodás={m['blockiness']:.2f}, árnyék={100 * m['shadow_frac']:.0f}% "
@@ -344,17 +402,22 @@ class VideoQualityMonitor:
         for key in ("sharpness", "edge_sharpness", "motion_ratio", "brightness", "noise", "blockiness", "clipped", "shadow_frac", "glare_area"):
             med[key] = round(float(np.median([s["metrics"][key] for s in self.samples])), 3)
         main_issues = [k for k, v in sorted(pct.items(), key=lambda kv: -kv[1]) if v >= 10.0]
+        info_pct = {INFO_LABELS[k]: round(100.0 * sum(k in s.get("info_flags", []) for s in self.samples) / n, 1)
+                    for k in INFO_LABELS}
+        info_main = [k for k, v in info_pct.items() if v >= 50.0]
         return {
             "grade": letter, "label": label,
             "mean_reliability": round(mean_rel, 3), "min_reliability": round(float(rel.min()), 3),
             "samples": n, "sample_sec": round(self.sample_sec, 3),
             "issue_time_pct": pct,
+            "info_time_pct": info_pct,
             "main_issues": main_issues,
             "worst_segments": segs[:max_segments],
             "median_metrics": med,
             "summary_text": (f"Videóminőség: {letter} ({label}), átlagos megbízhatóság {mean_rel:.2f}"
                              + (f"; fő gondok: " + ", ".join(f"{k} ({pct[k]:.0f}% idő)" for k in main_issues)
-                                if main_issues else "; jelentős képhiba nem volt")),
+                                if main_issues else "; jelentős képhiba nem volt")
+                             + (f" ({', '.join(info_main)} felvétel)" if info_main else "")),
         }
 
 

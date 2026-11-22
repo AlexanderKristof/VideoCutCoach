@@ -131,6 +131,31 @@ Ultralytics-frissítés után érdemes megnézni a naplóban a „Labda-jelölte
 a mechanizmust utánozza (a követő az első `track()`-nél regisztrált callback), így a
 `tests/test_e2e_synth.py` a valódi kódutat méri.
 
+### 6b. Kis labda: natív felbontású labda-kivágás, sebesség
+
+A Veo 1920x1080-as képén a labda ~6–12 px; a felismerő a teljes képet `imgsz`-re (640) kicsinyíti,
+így a labda 2–4 px lesz, és a COCO modell alig látja (valódi felvételen ~4% labda-találat). A
+**labda-kivágás** (`ball_crops.py`) a labdakövető becsült helye körül egy natív felbontású
+(`ball_crop_size`, alap 640x640) kivágáson külön labda-felismerést futtat, és a dobozokat a teljes
+képre vetítve jelöltként adja a követőnek; elveszett labdánál a pálya csempéin (a kép alsó ~70%-a)
+körbeforgó keresés fut (`ball_tile_every` képkockánként egy csempe; a legutóbbi hely / a képközép
+közelében kezdve). Az ultralytics háttérnél külön modellpéldánnyal (a `model.track()` követője nem
+zavarodik össze), a saját (ONNX) háttérnél a detektor `detect_batch()`-ével.
+
+| kulcs | alap | jelentés |
+|---|---|---|
+| `imgsz` | 640 | a fő (játékos) felismerés bemeneti mérete |
+| `half` | `"auto"` | FP16 a GPU-n (`auto` = CUDA-n be) |
+| `ball_crop_pass` | `"auto"` | labda-kivágás (`auto` = CUDA-n be, CPU-n ki; `TACTICAL_BALL_CROP_PASS`) |
+| `ball_crop_size` | 640 | a kivágás mérete (px, natív felbontáson) |
+| `ball_tile_every` | 2 | elveszett labdánál hány képkockánként fusson egy csempe |
+| `ball_crop_conf` | 0.10 | a kivágásos menet minimális pontszáma |
+
+Az elemzés végén a napló (`analysis_debug_*.log`) és az events JSON `timing` blokkja szakaszonként
+mutatja az időt (ms/képkocka, arány), a tényleges kép/mp-t és a kimeneti videó kódolóját
+(NVENC / QSV / AMF / libx264 veryfast / libopenh264 – a `fast_cut` felderítése szerint). Az annotált
+videó kicsinyíthető: `output_scale` (pl. 0.5), parancssorban `--kimenet-felbontas 0.5`.
+
 
 ## 7. Betöltés és a súlyfájl helye (lusta betöltés, models mappa)
 

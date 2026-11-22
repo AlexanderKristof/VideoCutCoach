@@ -58,6 +58,9 @@ def build_parser():
                         "akkumulátorról a negyede")
     p.add_argument("--szalak", type=int, default=None, metavar="N",
                    help="legfeljebb N szál a torch / OpenCV / ffmpeg számára (háttér-mód nélkül is használható)")
+    p.add_argument("--kimenet-felbontas", type=float, default=1.0, metavar="ARÁNY",
+                   help="az annotált elemzés-videó méretaránya (alap 1.0; pl. 0.5 = fél felbontás: 1080p helyett "
+                        "960x540 – gyorsabb kódolás, kisebb fájl)")
     p.add_argument("--reszletes", action="store_true",
                    help="az elemző motor saját kiírásai is a képernyőre kerüljenek (alap: naplófájlba)")
     return p
@@ -75,6 +78,7 @@ def options_from_args(args):
         "use_person_count": args.letszam,
         "heatmaps": not args.nincs_hoterkep,
         "review_export": not args.nincs_attekinto,
+        "output_scale": args.kimenet_felbontas,
     }
     if args.felidok:
         parts = [x.strip() for x in args.felidok.split(",")]
@@ -144,6 +148,9 @@ def main(argv=None):
             return 2
         # a model_config.py ezt a környezeti változót olvassa (a main.py importja előtt kell beállítani)
         os.environ["TACTICAL_DETECT_EVERY_N"] = str(args.gyors)
+    if not (0.05 < args.kimenet_felbontas <= 1.0):
+        print("Hiba: a --kimenet-felbontas 0.05 és 1.0 közötti arány (pl. 0.5).")
+        return 2
     if args.szalak is not None and args.szalak < 1:
         print("Hiba: a --szalak értéke legalább 1.")
         return 2

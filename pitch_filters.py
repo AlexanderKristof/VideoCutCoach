@@ -121,6 +121,105 @@ class StationaryFilter:
             del self.history[tid]
 
 
+def grass_top_profile(grass_mask, smooth_frac=0.03):
+    """
+    A fő (legnagyobb) összefüggő fűterület felső széle oszloponként, a maszk felbontásán: float tömb
+    (oszloponként a legfelső fű-sor), NaN, ahol az oszlopban nincs fű. A tipikus Veo-képen ez a túlsó
+    pályaszél menti kerítés / reklámtábla alja. Medián-simítás a szélesség smooth_frac részén.
+    """
+    if grass_mask is None:
+        return None
+    m = (grass_mask > 0).astype(np.uint8)
+    h, w = m.shape[:2]
+    n, cc, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=4)
+    if n <= 1:
+        return None
+    main = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    if stats[main, cv2.CC_STAT_AREA] < 0.1 * h * w:
+        return None
+    mm = cc == main
+    has = mm.any(axis=0)
+    top = np.where(has, mm.argmax(axis=0), -1).astype(np.float32)
+    k = max(3, (int(w * smooth_frac) // 2) * 2 + 1)
+    valid = top >= 0
+    if valid.sum() < k:
+        return None
+    filled = np.interp(np.arange(w), np.where(valid)[0], top[valid]).astype(np.float32)
+    pad = np.pad(filled, (k // 2, k // 2), mode="edge")
+    sm = np.median(np.lib.stride_tricks.sliding_window_view(pad, k), axis=1).astype(np.float32)
+    sm[~valid] = np.nan
+    return sm
+
+
+class BoundaryCrowdFilter:
+    """
+    NÉZŐ A TÚLSÓ PÁLYASZÉLEN – kalibráció nélküli heurisztika a tipikus Veo-elrendezéshez: a nézők a
+    túlsó kerítés / reklámtábla előtti füves sávban állnak. Ha nincs megbízható pálya-homográfia (a
+    pályahatár-szűrő nem működik), az ilyen alak a fő fűterület felső széléhez (a kerítés aljához)
+    közel áll (band_ratio * dobozmagasság), ÉS ugyanazon a – kamera-mozgással kompenzált – helyen
+    több másodpercig folyamatosan látszik valaki. A követő-azonosító cserélődése (valódi felvételen
+    gyakori) itt nem számít: a HELY állandósága dönt, nem a követésé. A partjelző és a bedobó
+    mozog (a hely nem állandó), így legfeljebb rövid ideig esik ki.
+    """
+
+    def __init__(self, fps, window_sec=3.0, band_ratio=0.45, min_band_frac=0.012, above_ratio=0.3,
+                 radius_ratio=0.6, min_presence=0.7, profile_every=5):
+        self.fps = float(fps or 25.0)
+        self.window = max(1, int(round(window_sec * self.fps)))
+        self.band_ratio, self.min_band_frac, self.above_ratio = band_ratio, min_band_frac, above_ratio
+        self.radius_ratio, self.min_presence = radius_ratio, min_presence
+        self.profile_every = max(1, int(profile_every))
+        self.profile, self.scale, self.frame_h = None, 1.0, None
+        self._prof_frame = None
+        self.hist = deque()           # (képkocka, sx, sy, magasság) – a sávban látott alakok
+        self.frames = deque()         # a vizsgált képkockák
+        self.stats = {"sávban": 0, "néző (álló a sávban)": 0}
+
+    def set_frame(self, frame_idx, grass_mask, grass_scale, frame_h):
+        """Képkockánként (detektáláskor) hívandó: a fű felső szélének frissítése és az ablak léptetése."""
+        self.frame_h = frame_h
+        if grass_mask is not None and (self._prof_frame is None or frame_idx - self._prof_frame >= self.profile_every):
+            self.profile, self.scale = grass_top_profile(grass_mask), float(grass_scale)
+            self._prof_frame = frame_idx
+        self.frames.append(frame_idx)
+        lim = frame_idx - self.window
+        while self.frames and self.frames[0] < lim:
+            self.frames.popleft()
+        while self.hist and self.hist[0][0] < lim:
+            self.hist.popleft()
+
+    def edge_y(self, x):
+        """A fű felső széle (teljes képes px) az x oszlopban, vagy None."""
+        if self.profile is None:
+            return None
+        i = int(min(max(0, x * self.scale), len(self.profile) - 1))
+        v = self.profile[i]
+        return None if not np.isfinite(v) else float(v) / self.scale
+
+    def in_band(self, foot_x, foot_y, box_h):
+        e = self.edge_y(foot_x)
+        if e is None:
+            return False
+        band = max(self.band_ratio * box_h, self.min_band_frac * (self.frame_h or 1080))
+        return -self.above_ratio * box_h <= foot_y - e <= band
+
+    def update(self, frame_idx, foot_x, foot_y, sx, sy, box_h):
+        """Visszatér: True, ha a (sávban álló) alak nézőnek számít. sx, sy: kamera-kompenzált talppont."""
+        if not self.in_band(foot_x, foot_y, box_h):
+            return False
+        self.stats["sávban"] += 1
+        r = max(4.0, self.radius_ratio * box_h)
+        hit_frames = {f for (f, hx, hy, _h) in self.hist if f < frame_idx and abs(hx - sx) <= r and abs(hy - sy) <= r}
+        self.hist.append((frame_idx, sx, sy, box_h))
+        past = [f for f in self.frames if f < frame_idx]
+        if not past or frame_idx - past[0] < 0.8 * self.window:
+            return False
+        if len(hit_frames) >= self.min_presence * len(past):
+            self.stats["néző (álló a sávban)"] += 1
+            return True
+        return False
+
+
 def extract_dominant_color(image_crop, grass_lower=None, grass_upper=None, grass_model=None):
     """
     Mezszín a felsőtestből – gyors változat (KMeans helyett medián).

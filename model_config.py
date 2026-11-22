@@ -8,6 +8,7 @@ Forrás (erősorrendben):
        TACTICAL_MODEL_CONFIG    – a JSON beállítófájl útvonala
        TACTICAL_DETECTOR_BACKEND – "ultralytics" (alap) | "onnx" | "ultralytics_predict"
        TACTICAL_ONNX_PATH       – az ONNX modellfájl útvonala (backend = "onnx")
+       TACTICAL_BALL_CROP_PASS  – natív felbontású labda-kivágás: auto / 1 / 0
   2. model_config.json (opcionális, a main.py mellett; a telepített alkalmazásban az adatmappában,
      lásd app_paths.py)
   3. alapértelmezés: yolov8x.pt (CUDA) / yolov8n.pt (CPU), COCO osztályok, minden képkocka
@@ -39,6 +40,17 @@ DEFAULTS = {
     # Külön labda-felismerő menet (második modellpéldány), ha a nyers labda-callback nem érhető el
     # (lásd main.py NYERS LABDA-DETEKTÁLÁSOK, docs/MODELL_BEALLITAS.md) – drága, alapból KI
     "ball_extra_pass": False,
+    # --- SEBESSÉG / KIS LABDA (lásd main.py LABDA-KIVÁGÁS, docs/MODELL_BEALLITAS.md) ---
+    "imgsz": 640,             # a fő (játékos) felismerés bemeneti mérete (ultralytics imgsz)
+    "half": "auto",           # félpontosság (FP16): "auto" = CUDA-n be, CPU-n ki; true / false
+    # Natív felbontású labda-kivágás: a becsült labdahely körüli (ball_crop_size px-es) kivágáson külön
+    # labda-felismerés (a teljes kép 640-re kicsinyítve a 1080p Veo-képen 2–4 px-es labdát nem látja);
+    # elveszett labdánál a pálya csempéin körbeforgó keresés (ball_tile_every képkockánként egy csempe).
+    # "auto" = CUDA-n be, CPU-n ki
+    "ball_crop_pass": "auto",
+    "ball_crop_size": 640,
+    "ball_tile_every": 2,
+    "ball_crop_conf": 0.10,   # a kivágásos menet minimális pontszáma (a labdakövető szűr tovább)
     # --- DETEKTOR-HÁTTÉR (lásd detection/, docs/MODELL_BEALLITAS.md 8. pont) ---
     # "ultralytics": model.track() + beépített ByteTrack (AGPL-3.0 – csak fejlesztéshez!)
     # "onnx": ONNX Runtime detektor + saját követő (detection/tracker.py) – a kereskedelmi út
@@ -127,7 +139,25 @@ def load_model_config(config_path=None, env=None):
         cfg["ball_conf"] = DEFAULTS["ball_conf"]
     v = cfg["ball_extra_pass"]
     cfg["ball_extra_pass"] = v if isinstance(v, bool) else str(v).strip().lower() in ("1", "true", "igen", "yes", "on")
+    if env.get("TACTICAL_BALL_CROP_PASS"):
+        cfg["ball_crop_pass"] = env["TACTICAL_BALL_CROP_PASS"]
+    for key, conv, lo in (("imgsz", int, 32), ("ball_crop_size", int, 64), ("ball_tile_every", int, 1),
+                          ("ball_crop_conf", float, 0.0)):
+        try:
+            cfg[key] = max(lo, conv(cfg[key]))
+        except (TypeError, ValueError):
+            print(f"⚠️ Érvénytelen {key} érték: {cfg[key]!r} – alapérték: {DEFAULTS[key]}")
+            cfg[key] = DEFAULTS[key]
     return cfg
+
+
+def auto_flag(value, device):
+    """"auto" / None -> CUDA-n igaz, máshol hamis; egyébként logikai érték (szövegből is)."""
+    if value is None or (isinstance(value, str) and value.strip().lower() in ("auto", "")):
+        return device == "cuda"
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "igen", "yes", "on")
 
 
 def resolve_weights(cfg, device):

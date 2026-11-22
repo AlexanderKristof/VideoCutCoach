@@ -41,6 +41,9 @@ Környezeti változók:
   E2E_DEGRADE (képromlások a szintetikus videón, lásd tools/synth_match.py: pl. "rossz", "arnyek",
   "nap", "esti", "tomorites=42", "arnyek=0.5,nap=0.8,zaj=6,elmosodas=1" – a ground truth nem változik),
   E2E_AUTO_TEAMS=1 (nincs kézi csapat-HSV: az automatikus csapatba sorolás fut, mint a /cut-raw alapból)
+  E2E_BALL_RES=640 (az ál-detektor felbontás-függő labda-kihagyása: a teljes képet ekkora bemenetre
+  kicsinyíti, a kis labdát nem látja – mint a valódi COCO modell 1080p-n), E2E_BALL_CROP=1 / 0 (natív
+  felbontású labda-kivágás be / ki; alap: a model_config szerint, CPU-n KI)
 
 A teszt csak laza épség-küszöböket ellenőriz (mérőeszköz), a teljes táblázatot kiírja.
 Ha valamelyik előfeltétel hiányzik (cv2, numpy, ffmpeg), a teszt kihagyva (0-s kilépési kóddal) ér véget.
@@ -541,6 +544,8 @@ def base_config(gt, tracker_on, dynamic=True):
         "dynamic_homography": dynamic, "draw_pitch_overlay": True,
         "ball_extra_pass": os.environ.get("E2E_BALL_EXTRA_PASS") == "1",
     }
+    if os.environ.get("E2E_BALL_CROP") in ("0", "1"):
+        cfg["ball_crop_pass"] = os.environ["E2E_BALL_CROP"] == "1"
     if os.environ.get("E2E_AUTO_TEAMS") == "1":
         # nincs kézi csapat-/kapus-HSV: automatikus csapatba sorolás (a /cut-raw alapértéke)
         for k in ("team1", "team2", "keeper1", "keeper2"):
@@ -603,7 +608,13 @@ def run_mode(main_mod, fake, gt, video, mode):
     elapsed = time.time() - t0
     with open(events_path, encoding="utf-8") as f:
         payload = json.load(f)
+    if payload.get("timing"):
+        from stage_timer import format_timing
+        print("Időmérés: " + format_timing(payload["timing"]))
+    if payload.get("ball_crop"):
+        print(f"Labda-kivágás: {payload['ball_crop']['stats']}")
     return {"records": Engine.records, "static_H": Engine.static_H, "events": payload["events"],
+            "timing": payload.get("timing"), "ball_crop": payload.get("ball_crop"),
             "video_quality": payload.get("video_quality"), "grass_model": payload.get("grass_model"),
             "elapsed": elapsed, "fake_stats": dict(fake.stats), "out_video": out_path,
             "pitch_tracking": payload.get("pitch_tracking"), "calib_names": calib_names,
@@ -825,7 +836,8 @@ def main():
             print("⚠️ Az első képkockán nem minden pályasarok van a kamera előtt – a kalibráció torz lehet")
 
         frames_dir = os.environ.get("E2E_FRAMES_DIR")
-        fake = FakeYOLO(seed=seed + 100, drop_untracked=os.environ.get("E2E_DROP_UNTRACKED", "1") != "0")
+        prof = {"infer_imgsz": int(os.environ["E2E_BALL_RES"])} if os.environ.get("E2E_BALL_RES") else None
+        fake = FakeYOLO(seed=seed + 100, drop_untracked=os.environ.get("E2E_DROP_UNTRACKED", "1") != "0", profile=prof)
         main_mod = import_main(workdir, fake)
         results = {}
         h_err = None
@@ -840,6 +852,7 @@ def main():
                 "events": score_events(r["events"], gt["events"], tol),
                 "identity": score_identity(r["records"], gt), "own_backend_stats": r["own_backend_stats"],
                 "elapsed": r["elapsed"], "fake_stats": r["fake_stats"],
+                "timing": r.get("timing"), "ball_crop": r.get("ball_crop"),
                 "detected_events": [{k: e.get(k) for k in ("type", "time", "team", "confirmed", "confirmation")} for e in r["events"]],
                 "pitch_tracking": r["pitch_tracking"], "calib_names": r["calib_names"],
                 "video_quality": r.get("video_quality"), "grass_model": r.get("grass_model"),

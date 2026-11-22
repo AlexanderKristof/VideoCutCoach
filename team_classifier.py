@@ -8,12 +8,17 @@ Menete:
    csillanás) levágjuk, és Lab mediánt + kis, telítettséggel súlyozott
    színezet-hisztogramot számolunk. Nincs detektálásonkénti KMeans.
 2. Bemelegítés: az első `fit_seconds` másodpercben (vagy `max_fit_samples`
-   mintáig) követésenként 0.2 mp-enként gyűjtünk mintát, majd cv2.kmeans k=5
-   klaszterre bont. A túl közeli klasztereket (a középpontok távolsága kisebb,
-   mint a szórásuk összege) összevonjuk – így ha az első másodpercekben nem
-   látszik kapus/bíró, a csapat nem esik szét több klaszterre. A két
-   legnagyobb klaszter a két csapat, a többi kicsi klaszter „egyéb” (bíró,
-   kapus). A bemelegítés alatt is van ideiglenes illesztés (100 mintánként).
+   mintáig) követésenként 0.2 mp-enként gyűjtünk mintát, majd cv2.kmeans k=7
+   klaszterre bont. Csapat-jelölt az a klaszter, amelyből EGYSZERRE több ember
+   látszik (egyidejű létszám 0,5 mp-es rekeszekben – a kapus / bíró egy ember,
+   akkor is, ha a követő azonosítója sűrűn cserélődik); a jelölteket egy k=2
+   KMeans osztja két csapatra, a többi „egyéb” (bíró, kapus), a csapathoz közeli
+   töredékek visszakerülnek. A bemelegítés alatt is van ideiglenes illesztés, a
+   végleges után pedig refit_every_sec-enként gördülő újraillesztés (csak ha
+   összhangban van a régivel; a csapat-számozás nem fordul meg).
+   Valódi Veo-felvételen hangolva (fehér–világoskék csíkos vs királykék mez, fekete
+   bírók): a világosság súlya W_L = 1.5, a "színes" pixel S >= 90, a fehér mez
+   pixeleit a fűszűrés nem vágja ki.
 3. Online besorolás: minden követés (track_id) exponenciálisan felejtő
    szavazást tart (felezési idő ~1 mp) a {1, 2, egyéb} címkékre, hiszterézissel,
    így egy-egy rossz kivágás (takarás, elmosódás) nem fordítja át a csapatot.
@@ -41,9 +46,10 @@ TORSO_X = (0.20, 0.80)
 PATCH_SIZE = (12, 16)          # (szélesség, magasság) – a felsőtest-folt fix mérete
 
 # A leíró súlyai: a világosság kevésbé számít (árnyék/napfény), a színesség jobban
-W_L = 0.6
+W_L = 1.5   # (valódi Veo-felvételen a fehér–kék mez fő különbsége a világosság; régen 0.6)
 W_AB = 1.0 / 64.0
 W_HIST = 0.5
+CHROMA_S_MIN = 90   # ennél telítettebb pixel "színes" (a hisztogram színezet-rekeszeibe kerül)
 HUE_BINS = 8
 DESC_DIM = 3 + HUE_BINS + 1
 
@@ -92,9 +98,20 @@ def jersey_descriptor(crop_bgr, grass_lower=None, grass_upper=None, grass_model=
         return None, None
     patch = cv2.resize(torso, PATCH_SIZE, interpolation=cv2.INTER_AREA)
     keep = np.ones(PATCH_SIZE[0] * PATCH_SIZE[1], dtype=bool)
+    # FEHÉR MEZ: a világos, színtelen pixel (fehér / szürkésfehér mez borús fényben, zöldes
+    # tömörítési színszivárgással) sosem "fű" – a fűmodell "kifakult" (csillanás) címkéje és a tág
+    # HSV-tartomány különben a fehér mezt is kivágná, és csak a sötét nadrág / mezszám maradna
+    hsv0 = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV).reshape(-1, 3)
+    whiteish = (hsv0[:, 1] <= 60) & (hsv0[:, 2] >= 120)
     if grass_model is not None and getattr(grass_model, "ready", False):
-        # a fű kiszűrése a korrekció ELŐTT (a modell a kép eredeti színeit ismeri)
-        grass = grass_model.is_grass_pixels(patch.reshape(-1, 3))
+        # a fű kiszűrése a korrekció ELŐTT (a modell a kép eredeti színeit ismeri); csak a biztos
+        # (napos / árnyékos módusú) fű – a "kifakult" címke fehéres pixelt is jelölhet
+        labs = grass_model.labels(patch.reshape(-1, 3))
+        # + tág zöld HSV-tartomány: a fűmodell a megvilágítás változásával (késő délután / felhő)
+        # lemaradhat, és a mez körüli sötétebb fű a leíróba szivárogna (a fehér mez így "sötétkék" lett);
+        # a zöld mezes kapus megmarad (lent: ha szinte minden "fű", mindent megtartunk)
+        greenish = (hsv0[:, 0] >= 28) & (hsv0[:, 0] <= 90) & (hsv0[:, 1] >= 45) & (hsv0[:, 2] >= 25)
+        grass = ((labs == 1) | (labs == 2) | greenish) & ~whiteish
         if (~grass).sum() >= 0.25 * keep.size:
             keep = ~grass
     if gain is not None:
@@ -108,7 +125,7 @@ def jersey_descriptor(crop_bgr, grass_lower=None, grass_upper=None, grass_model=
     elif grass_lower is not None and grass_upper is not None and \
             not is_full_range(np.asarray(grass_lower), np.asarray(grass_upper)):
         lo, hi = np.asarray(grass_lower), np.asarray(grass_upper)
-        grass = np.all((hsv >= lo) & (hsv <= hi), axis=1)
+        grass = np.all((hsv >= lo) & (hsv <= hi), axis=1) & ~whiteish
         keep = ~grass
         # Ha szinte minden "fű": valószínűleg zöld mez (pl. kapus) – ilyenkor mindent megtartunk
         if keep.sum() < 0.25 * n:
@@ -131,7 +148,7 @@ def jersey_descriptor(crop_bgr, grass_lower=None, grass_upper=None, grass_model=
     hh = sel_hsv[:, 0].astype(np.int32)
     s = sel_hsv[:, 1].astype(np.float32)
     v = sel_hsv[:, 2]
-    chrom = (s >= 50) & (v >= 40)
+    chrom = (s >= CHROMA_S_MIN) & (v >= 40)
     # A piros a 0/180 határon van – eltolással egy rekeszbe kerül
     hbin = (((hh + 11) % 180) * HUE_BINS) // 180
     hist_c = np.bincount(hbin[chrom], weights=0.5 + 0.5 * s[chrom] / 255.0, minlength=HUE_BINS)
@@ -173,10 +190,10 @@ class TeamClassifier:
     def __init__(self, grass_lower=None, grass_upper=None, swap_teams=False, grass_model=None,
                  fit_seconds=12.0, max_fit_samples=1500, min_fit_samples=60,
                  refit_step=150, sample_interval_sec=0.2, k=7,
-                 merge_ratio=0.8, min_team_tracks=3.5, min_part_frac=0.04, outlier_z=4.0, spread_floor=0.04,
+                 merge_ratio=0.8, min_team_tracks=2.5, min_part_frac=0.04, outlier_z=4.0, spread_floor=0.04,
                  vote_half_life_sec=1.0, switch_ratio=1.3,
                  goal_zone_m=20.0, keeper_goal_frac=0.6, min_pitch_obs=3,
-                 track_ttl_sec=10.0):
+                 track_ttl_sec=10.0, other_max_frac=0.18, refit_every_sec=45.0, team_conc=1.5):
         self.grass_lower = grass_lower
         self.grass_upper = grass_upper
         self.grass_model = grass_model     # adaptív fűmodell (ha van, a HSV tartomány helyett)
@@ -198,8 +215,17 @@ class TeamClassifier:
         self.keeper_goal_frac = keeper_goal_frac
         self.min_pitch_obs = min_pitch_obs
         self.track_ttl_sec = track_ttl_sec
+        # "egyéb" csoport: a mintáknak legfeljebb ekkora része (kapus / bíró egy-két ember)
+        self.other_max_frac = other_max_frac
+        # csapat: átlagosan legalább ennyi különböző követés látszik egyszerre (0,5 mp-es rekeszekben)
+        self.team_conc = team_conc
+        # későbbi újraillesztés (a végleges illesztés után is gyűjtünk, gördülő pufferben): ha az elején
+        # kevés játékos látszott (Veo: egyszerre csak a pálya egyik fele), később pontosítható; 0 = ki
+        self.refit_every_sec = refit_every_sec
+        self._last_fit_t = None
+        self.n_refits = 0
 
-        self._X, self._lab, self._px, self._tid = [], [], [], []
+        self._X, self._lab, self._px, self._tid, self._ts = [], [], [], [], []
         self._anon = 0             # track_id nélküli minták egyedi (negatív) azonosítója
         self._t0 = None
         self._n_at_fit = 0
@@ -217,13 +243,15 @@ class TeamClassifier:
         self._last_prune = None
 
     # ------------------------------------------------------------------ illesztés
-    def _cluster(self, X, tids):
+    def _cluster(self, X, tids, ts=None):
         """
         KMeans + csoportosítás. Visszatér: (címkék, [A csapat klaszter-id, B csapat klaszter-id]).
-        Heurisztika: egy klaszter akkor "csapatrész", ha sok különböző követésből (játékosból)
-        áll (effektív követésszám >= min_team_tracks) és nem túl kicsi; a bíró és a kapus
-        klasztere jellemzően 1–2 követés mintáiból áll. A csapatrészeket (pl. napos / árnyékos
-        fehér mez) a középpontok távolsága szerint két csoportba vonjuk össze.
+        Heurisztika: egy csoport akkor "csapat", ha EGYSZERRE több ember mintáiból áll (egyidejű
+        létszám >= team_conc, ts: a minták ideje); a bíró és a kapus egy ember (a követő azonosítóinak
+        cserélődése sem számít). A csapatrészeket (pl. napos / árnyékos fehér mez) Ward-összevonással
+        két csoportba vonjuk; a kis, távoli csoportok "egyéb"-ek, a csapathoz közeli, vele követéseket
+        megosztó töredékek a csapathoz kerülnek. (Régen: effektív követésszám – ID-cserénél a kapus /
+        bíró is "csapatnak" látszott, és a fehér + kék mez egy klaszterbe került a fekete bíró ellen.)
         """
         N = len(X)
         k = int(max(2, min(self.k, N // 8)))
@@ -240,42 +268,129 @@ class TeamClassifier:
             Z = np.array([np.count_nonzero(labels == i) for i in ids])
             return ids, C, S, Z
 
-        def eff_tracks(cid):
-            _, cnt = np.unique(tids[labels == cid], return_counts=True)
-            p = cnt / cnt.sum()
-            return float(np.exp(-(p * np.log(p)).sum()))
+        ids, C, S, Z = stats()
+        idl = [int(i) for i in ids]
+        Cd = {i: C[j] for j, i in enumerate(idl)}
+        Zd = {i: float(Z[j]) for j, i in enumerate(idl)}
 
-        ids, C, S, Z = stats()
-        parts = [int(i) for j, i in enumerate(ids)
-                 if Z[j] >= self.min_part_frac * N and eff_tracks(i) >= self.min_team_tracks]
-        if len(parts) < 2:
-            # nincs elég követés-információ: a két legnagyobb klaszter a két csapat
-            order = np.argsort(-Z, kind="stable")
-            parts = sorted(set(parts) | {int(ids[order[0]]), int(ids[order[1]])},
-                           key=lambda i: -Z[list(ids).index(i)])
-        # csapatrészek összevonása, amíg két csoport marad (a legközelebbi pár először)
-        while len(parts) > 2:
-            ids, C, S, Z = stats()
-            pos = {int(i): j for j, i in enumerate(ids)}
-            best, best_d = None, None
-            for a in range(len(parts)):
-                for b in range(a + 1, len(parts)):
-                    d = float(np.linalg.norm(C[pos[parts[a]]] - C[pos[parts[b]]]))
-                    if best_d is None or d < best_d:
-                        best, best_d = (a, b), d
-            keep, drop = parts[best[0]], parts[best[1]]
-            labels[labels == drop] = keep
-            parts.remove(drop)
-        # a csapathoz nagyon közeli "egyéb" klaszter is a csapathoz tartozik
-        ids, C, S, Z = stats()
-        pos = {int(i): j for j, i in enumerate(ids)}
-        for j, i in enumerate(ids):
-            i = int(i)
-            if i in parts:
-                continue
-            r = [float(np.linalg.norm(C[j] - C[pos[t]])) / (S[j] + S[pos[t]]) for t in parts]
-            if min(r) < self.merge_ratio:
-                labels[labels == i] = parts[int(np.argmin(r))]
+        def gcenter(g):
+            n = sum(Zd[i] for i in g)
+            return sum(Cd[i] * Zd[i] for i in g) / n, n
+
+        def ward(g1, g2):
+            c1, n1 = gcenter(g1)
+            c2, n2 = gcenter(g2)
+            return n1 * n2 / (n1 + n2) * float(((c1 - c2) ** 2).sum())
+
+        def merge_cheapest(groups, weighted=True):
+            best, bc = None, None
+            for a in range(len(groups)):
+                for b in range(a + 1, len(groups)):
+                    c = ward(groups[a], groups[b]) if weighted else float(np.linalg.norm(gcenter(groups[a])[0] - gcenter(groups[b])[0]))
+                    if bc is None or c < bc:
+                        best, bc = (a, b), c
+            a, b = best
+            groups[a] = groups[a] + groups[b]
+            del groups[b]
+
+        # Egyidejű létszám (csoportonként): 0,5 mp-es időrekeszekben hány KÜLÖNBÖZŐ követés mintái
+        # vannak a csoportban (átlag a rekeszekre, ahol a csoport megjelenik). Egy csapatból egyszerre
+        # több játékos látszik; a kapus / bíró egyetlen ember – akkor is, ha a követő azonosítója
+        # sűrűn cserélődik (valódi Veo felvételen akár másodpercenként: ezért nem a követés-szám dönt).
+        buckets = np.floor(np.asarray(ts, np.float64) / 0.5).astype(np.int64) if ts is not None else None
+
+        def conc(g):
+            if buckets is None:
+                return float(self.team_conc)
+            m = np.isin(labels, g)
+            if not m.any():
+                return 0.0
+            pairs = np.unique(np.stack([buckets[m], tids[m]], 1), axis=0)
+            _, per = np.unique(pairs[:, 0], return_counts=True)
+            return float(per.mean())
+
+        # 1) csapat-jelöltek: a "csapatszerű" (egyidejűleg több emberből álló) csoportokat Ward-
+        #    összevonással (méret-súlyozott) két csoportig vonjuk össze; az egy-emberes csoportok
+        #    (kapus, bíró, vagy egy csapat apró töredéke) kimaradnak – a töredékeket a 3. lépés visszateszi.
+        groups = [[i] for i in idl]
+        others = []
+        tl = [g for g in groups if conc(g) >= self.team_conc]
+        if len(tl) > 2:
+            # a csapat-jelölt klaszterek kettéosztása: KMeans k=2 a mintáikon, a klaszter a többségi
+            # oldalhoz kerül. (Az összevonásos csoportosítás láncolódik: valódi felvételen a napfényes,
+            # kékes árnyalatú fehér mez közelebb esett a kékhez, mint a saját árnyékos részéhez, és a
+            # fehér + kék egy "csapat" lett a fekete bírók ellen.)
+            tl_ids = [g[0] for g in tl]
+            m = np.isin(labels, tl_ids)
+            cv2.setRNGSeed(54321)
+            _, lab2, _ = cv2.kmeans(X[m], 2, None, crit, 5, cv2.KMEANS_PP_CENTERS)
+            lab2 = lab2.ravel()
+            side = {}
+            for i in tl_ids:
+                v = lab2[labels[m] == i]
+                side[i] = int(np.round(v.mean())) if v.size else 0
+            g0 = [i for i in tl_ids if side[i] == 0]
+            g1 = [i for i in tl_ids if side[i] == 1]
+            if g0 and g1:
+                tl = [g0, g1]
+                groups = tl + [g for g in groups if conc(g) < self.team_conc]
+            else:
+                while len(tl) > 2:
+                    merge_cheapest(tl, weighted=False)
+                groups = tl + [g for g in groups if conc(g) < self.team_conc]
+        self.debug_groups = [(int(gcenter(g)[1]), round(conc(g), 2)) for g in groups]
+        if len(tl) == 2:
+            teams = tl
+            others = [i for g in groups if not any(g is h for h in tl) for i in g]
+        else:
+            # kevés egyidejűségi információ: Ward-összevonás 3 csoportig; a 3 közül a legkisebb, ha a
+            # minták kis része, "egyéb", különben a két legközelebbi összevonva
+            groups = [[i] for i in idl]
+            while len(groups) > 3:
+                merge_cheapest(groups)
+            if len(groups) == 3:
+                smallest = min(range(3), key=lambda g: (conc(groups[g]) >= self.team_conc, gcenter(groups[g])[1]))
+                if gcenter(groups[smallest])[1] < self.other_max_frac * N or conc(groups[smallest]) < self.team_conc <= min(
+                        conc(groups[g]) for g in range(3) if g != smallest):
+                    others = list(groups[smallest])
+                    del groups[smallest]
+                else:
+                    merge_cheapest(groups)
+            teams = groups
+        # 2) a csapat-csoport kicsi, a csoport fő részétől (és a másik csapattól) messzi tagja "egyéb"
+        (ca, _), (cb, _) = gcenter(teams[0]), gcenter(teams[1])
+        d_tt = float(np.linalg.norm(ca - cb))
+        for g in teams:
+            main = max(g, key=lambda i: Zd[i])
+            for i in list(g):
+                if i == main or Zd[i] >= self.other_max_frac * N:
+                    continue
+                if float(np.linalg.norm(Cd[i] - Cd[main])) > 0.6 * d_tt:
+                    g.remove(i)
+                    others.append(i)
+        # 3) az "egyéb" klaszter, ha valamelyik csapathoz sokkal közelebb van, mint a két csapat
+        #    egymáshoz (pl. a távoli, apró játékosok fakóbb mez-foltja), a csapathoz tartozik
+        (ca, _), (cb, _) = gcenter(teams[0]), gcenter(teams[1])
+        d_tt = float(np.linalg.norm(ca - cb))
+        Sd = {i: S[j] for j, i in enumerate(idl)}
+        for i in others:
+            d = [float(np.linalg.norm(Cd[i] - ca)), float(np.linalg.norm(Cd[i] - cb))]
+            k_near = int(np.argmin(d))
+            main = max(teams[k_near], key=lambda q: Zd[q])
+            # követés-átfedés: a töredék mintái ugyanazoktól a követésektől is jönnek, mint a csapaté
+            # (ugyanaz a játékos hol az egyik, hol a másik klaszterbe esik); a bíró / kapus követései nem
+            ti = tids[labels == i]
+            shared = float(np.isin(ti, tids[np.isin(labels, teams[k_near])]).mean()) if ti.size else 0.0
+            if d[k_near] < 0.35 * d_tt or (d[k_near] < 0.5 * d_tt and (
+                    shared >= 0.3 or float(np.linalg.norm(Cd[i] - Cd[main])) / (Sd[i] + Sd[main]) < self.merge_ratio)):
+                teams[k_near].append(i)
+        parts = []
+        for g in teams:
+            g = sorted(g, key=lambda i: -Zd[i])
+            for i in g[1:]:
+                labels[labels == i] = g[0]
+            parts.append(g[0])
+        parts.sort(key=lambda i: -np.count_nonzero(labels == i))
         return labels, parts
 
     def _fit(self, final):
@@ -283,7 +398,7 @@ class TeamClassifier:
         LAB = np.array(self._lab, dtype=np.float32)
         PX = np.array([np.nan if p is None else p for p in self._px], dtype=np.float64)
         tids = np.array(self._tid, dtype=np.int64)
-        labels, parts = self._cluster(X, tids)
+        labels, parts = self._cluster(X, tids, np.array(self._ts, dtype=np.float64) if len(self._ts) == len(self._X) else None)
         ids = np.unique(labels)
         if len(ids) < 2 or len(parts) < 2:
             return  # nem választható szét – tovább gyűjtünk
@@ -325,29 +440,58 @@ class TeamClassifier:
             sizes.append(int(m.sum()))
         centers = np.array(centers, dtype=np.float32)
 
-        # Az előző (ideiglenes) illesztéshez képest megfordult-e a sorrend? Ha igen, a szavazatokat is cseréljük
+        a, b = roles.index(1), roles.index(2)
+        separation = float(np.linalg.norm(centers[a] - centers[b]) / (spreads[a] + spreads[b])) if a != b else 0.0
+        refit = self.fitted
+        if refit:
+            # Későbbi újraillesztés: csak finomítás (a két új csapat-középpont a régiek közelében van),
+            # vagy egy gyengén szétváló régi illesztés javítása, ha az új jóval jobban szétválik. Ha a
+            # pufferben (pl. a forgó kamera miatt) csak az egyik csapat látszott, az új illesztés mást
+            # találna – ezt nem vesszük át.
+            o1, o2 = self._team_center(1), self._team_center(2)
+            n1, n2 = centers[a], centers[b]
+            d_old = float(np.linalg.norm(o1 - o2))
+            match = min(np.linalg.norm(n1 - o1) + np.linalg.norm(n2 - o2), np.linalg.norm(n1 - o2) + np.linalg.norm(n2 - o1))
+            consistent = match < 0.5 * d_old
+            better = (self.separation is not None and self.separation < 1.0 and separation > 1.3 * self.separation)
+            if not (consistent or better):
+                self._n_at_fit = len(self._X)
+                return
+
+        # Az előző illesztéshez képest megfordult-e a sorrend? Ideiglenes illesztésnél a szavazatokat
+        # cseréljük; a végleges utáni újraillesztésnél a csapat-számozás marad (az új klasztereket
+        # nevezzük át), hogy az események csapata a klip közben ne forduljon meg.
         if self.has_model:
             o1, o2 = self._team_center(1), self._team_center(2)
             n1, n2 = centers[roles.index(1)], centers[roles.index(2)]
             if np.linalg.norm(n1 - o2) + np.linalg.norm(n2 - o1) < np.linalg.norm(n1 - o1) + np.linalg.norm(n2 - o2):
-                for tr in self.tracks.values():
-                    tr.votes[1], tr.votes[2] = tr.votes[2], tr.votes[1]
-                    if tr.label in (1, 2):
-                        tr.label = 3 - tr.label
-                self._team_x = {1: self._team_x[2], 2: self._team_x[1]}
+                if refit:
+                    roles = [3 - r if r in (1, 2) else r for r in roles]
+                else:
+                    for tr in self.tracks.values():
+                        tr.votes[1], tr.votes[2] = tr.votes[2], tr.votes[1]
+                        if tr.label in (1, 2):
+                            tr.label = 3 - tr.label
+                    self._team_x = {1: self._team_x[2], 2: self._team_x[1]}
 
         self.centers = centers
         self.spreads = np.array(spreads, dtype=np.float32)
         self.roles, self.colors, self.sizes = roles, colors, sizes
-        a, b = roles.index(1), roles.index(2)
-        self.separation = float(np.linalg.norm(centers[a] - centers[b]) / (spreads[a] + spreads[b])) if a != b else 0.0
-        if self.order_by == "pitch_x":
+        self.separation = separation
+        if self.order_by == "pitch_x" and not refit:
             self._team_x = {1: [mean_x[0] * 10, 10], 2: [mean_x[1] * 10, 10]}
         self.has_model = True
-        self.fitted = bool(final)
-        self._n_at_fit = len(self._X)
+        self.n_refits += int(refit)
+        self.fitted = self.fitted or bool(final)
         if final:
-            self._X, self._lab, self._px, self._tid = [], [], [], []   # memória
+            # gördülő puffer a későbbi újraillesztéshez (memória: legfeljebb max_fit_samples minta)
+            keep = self.max_fit_samples // 2 if self.refit_every_sec else 0
+            if keep:
+                self._X, self._lab, self._px, self._tid = (self._X[-keep:], self._lab[-keep:],
+                                                           self._px[-keep:], self._tid[-keep:])
+            else:
+                self._X, self._lab, self._px, self._tid, self._ts = [], [], [], [], []
+        self._n_at_fit = len(self._X)
 
     def _team_center(self, team):
         return self.centers[self.roles.index(team)]
@@ -402,8 +546,28 @@ class TeamClassifier:
                 tr.n_goal += int(px < self.goal_zone_m or px > PITCH_LENGTH - self.goal_zone_m)
                 tr.ex = px if tr.ex is None else 0.9 * tr.ex + 0.1 * px
 
-        # Bemelegítő mintagyűjtés (követésenként legfeljebb 0.2 mp-enként)
-        if not self.fitted and desc is not None:
+        # Bemelegítő mintagyűjtés (követésenként legfeljebb 0.2 mp-enként); a végleges illesztés után
+        # gördülő pufferbe, refit_every_sec-enkénti újraillesztéshez
+        if self.fitted and desc is not None and self.refit_every_sec:
+            if tr is None or t - tr.last_sample_t >= self.sample_interval_sec:
+                if tr is not None:
+                    tr.last_sample_t = t
+                if track_id is None:
+                    self._anon -= 1
+                self._X.append(desc)
+                self._lab.append(lab)
+                self._px.append(px)
+                self._tid.append(int(track_id) if track_id is not None else self._anon)
+                self._ts.append(t)
+                if len(self._X) > self.max_fit_samples:
+                    cut = len(self._X) - self.max_fit_samples
+                    del self._X[:cut], self._lab[:cut], self._px[:cut], self._tid[:cut], self._ts[:cut]
+            if self._last_fit_t is None:
+                self._last_fit_t = t
+            if t - self._last_fit_t >= self.refit_every_sec and len(self._X) >= self.min_fit_samples:
+                self._last_fit_t = t
+                self._fit(final=True)
+        elif not self.fitted and desc is not None:
             if tr is None or t - tr.last_sample_t >= self.sample_interval_sec:
                 if tr is not None:
                     tr.last_sample_t = t
@@ -413,6 +577,7 @@ class TeamClassifier:
                 if track_id is None:
                     self._anon -= 1
                 self._tid.append(int(track_id) if track_id is not None else self._anon)
+                self._ts.append(t)
             n = len(self._X)
             done = (t - self._t0 >= self.fit_seconds and n >= self.min_fit_samples) or n >= self.max_fit_samples
             if done or (n >= self.min_fit_samples and n - self._n_at_fit >= self.refit_step):
@@ -507,5 +672,7 @@ class TeamClassifier:
             return "Auto csapat: nincs elég minta az illesztéshez"
         parts = [f"{r}:{c}(n={s})" for r, c, s in zip(self.roles, self.colors, self.sizes)]
         warn = "" if self.separation is None or self.separation >= 1.0 else " – FIGYELEM: a két mez nehezen választható szét"
-        return (f"Auto csapat: {'végleges' if self.fitted else 'ideiglenes'} illesztés, sorrend: {self.order_by}, "
+        return (f"Auto csapat: {'végleges' if self.fitted else 'ideiglenes'} illesztés"
+                + (f" (+{self.n_refits} újraillesztés)" if self.n_refits else "")
+                + f", sorrend: {self.order_by}, "
                 f"szétválás: {self.separation:.2f}{warn}; klaszterek: " + ", ".join(parts))

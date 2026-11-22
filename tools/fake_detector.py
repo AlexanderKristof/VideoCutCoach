@@ -11,6 +11,9 @@ A synth_match.py ground-truth JSON-jából állít elő "detektálásokat" való
   * a detektálás azonosító nélküli; a track() egy egyszerű, ByteTrack-szerű IoU követővel ad
     azonosítót – és az ultralytics-hez hasonlóan a nem követett (meg nem erősített) dobozokat
     a track() eredményéből elhagyja (ez a gyors, ritkán detektált labdát is érinti!).
+  * felbontás-függő labda-kihagyás (profile["infer_imgsz"]): a teljes képes menet a kicsinyítés miatt
+    a kis labdát nem látja, a predict() natív felbontású KIVÁGÁSON (a track()-nek adott képkocka
+    numpy nézete, frame[y0:y1, x0:x1]) igen – a kivágás helyét a memóriacímből számoljuk vissza;
   * callback-mechanizmus az ultralytics mintájára (model.add_callback / model.callbacks): a
     követést az első track() hívásnál regisztrált 'on_predict_postprocess_end' callback végzi,
     a korábban regisztrált (saját) callbackek még a NYERS predictor.results-ot látják
@@ -51,6 +54,13 @@ DEFAULT_PROFILE = {
     "ball_fp_rate": 0.35,         # téves labda-jelölt / képkocka (Poisson átlag)
     "ball_conf": (0.25, 0.80),
     "ball_fp_conf": (0.10, 0.50),
+    # FELBONTÁS-FÜGGŐ LABDA (opcionális): ha infer_imgsz meg van adva, a felismerő a képet
+    # imgsz / max(szélesség, magasság) arányban kicsinyíti (mint az ultralytics imgsz=640); a labda
+    # ekkora átmérője (px) alatt egyre többször marad ki: ball_min_px fölött nincs extra kihagyás,
+    # ball_min_px / 2 alatt mindig kimarad. A natív felbontású kivágáson (predict egy kivágással)
+    # a labda nagy, így ott látható. None = a régi (felbontás-független) viselkedés.
+    "infer_imgsz": None,
+    "ball_min_px": 5.0,
 }
 
 
@@ -243,12 +253,14 @@ class FakeYOLO:
         self.callbacks = {"on_predict_start": [], "on_predict_postprocess_end": []}
         self._tracker_registered = False
         self._last_frame = None    # (képkocka objektum id, idx, dets) – az ugyanarra a képre hívott predict()-hez
+        self._last_frame_obj = None   # a legutóbbi track()-képkocka (a kivágások helyének visszaszámolásához)
         self.predictor = _Predictor(self)
         self.gt = None
         self.frame_offset = 0
         self.calls = 0
         self.stats = {"frames": 0, "ball_gt_visible": 0, "ball_detected": 0, "ball_fp": 0,
-                      "ball_dropped_by_tracker": 0, "person_detected": 0, "spectator_fp": 0}
+                      "ball_dropped_by_tracker": 0, "person_detected": 0, "spectator_fp": 0,
+                      "ball_crop_calls": 0, "ball_crop_detected": 0, "ball_res_missed": 0}
         if gt is not None:
             self.load_ground_truth(gt)
 
@@ -267,10 +279,12 @@ class FakeYOLO:
         self.tracker.reset()
         self.calls = 0
         self._last_frame = None
+        self._last_frame_obj = None
         self._miss_state = {}
         self._ball_missed = False
         for k in self.stats:
             self.stats[k] = 0
+        self.stats.update({"ball_crop_calls": 0, "ball_crop_detected": 0, "ball_res_missed": 0})
 
     def _cls(self, role):
         if self.coco:
@@ -278,6 +292,16 @@ class FakeYOLO:
         return {"ball": 0, "goalkeeper": 1, "player": 2, "referee": 3}[role]
 
     # -------------------------------------------------------------- detektálás
+    def _res_visibility(self, r, img_shape):
+        """A labda láthatósági szorzója (0..1) a felismerő bemeneti méretén (lásd infer_imgsz)."""
+        imgsz = self.profile.get("infer_imgsz")
+        if not imgsz or img_shape is None:
+            return 1.0
+        s = float(imgsz) / float(max(img_shape[0], img_shape[1]))
+        d = 2.0 * r * s
+        m = float(self.profile.get("ball_min_px", 5.0))
+        return float(np.clip((d - 0.5 * m) / (0.5 * m), 0.0, 1.0))
+
     def _frame_rng(self, idx):
         return np.random.default_rng([self.seed, idx])
 
@@ -356,6 +380,10 @@ class FakeYOLO:
             if r < 1.6:
                 p_miss = min(0.95, p_miss + 0.1)
             miss = rng.random() < p_miss
+            vis = self._res_visibility(r, img_shape)
+            if not miss and vis < 1.0 and rng.random() > vis:
+                miss = True               # túl kicsi a kicsinyített képen
+                self.stats["ball_res_missed"] += 1
             self._ball_missed = miss
             if not miss:
                 x1, y1, x2, y2 = b["bbox"]
@@ -437,6 +465,7 @@ class FakeYOLO:
         idx = self._next_idx()
         dets = self.detect_frame(idx, getattr(frame, "shape", None))
         self._last_frame = (id(frame), idx, dets)
+        self._last_frame_obj = frame
         self._run_callbacks("on_predict_start")
         # nyers (követés előtti) eredmény: minden detektálás, azonosító nélkül
         self.predictor._dets = dets
@@ -444,7 +473,74 @@ class FakeYOLO:
         self._run_callbacks("on_predict_postprocess_end")
         return self.predictor.results
 
+    def _crop_offset(self, img):
+        """Ha img a legutóbbi track()-képkocka numpy nézete (kivágás): (x0, y0), különben None."""
+        full = self._last_frame_obj
+        if full is None or img is full or not isinstance(img, np.ndarray) or not isinstance(full, np.ndarray):
+            return None
+        if not np.shares_memory(img, full):
+            return None
+        off = img.__array_interface__["data"][0] - full.__array_interface__["data"][0]
+        y0, rem = divmod(off, full.strides[0])
+        return int(rem // full.strides[1]), int(y0)
+
+    def detect_crop(self, img, x0, y0, classes=None, conf=0.0):
+        """Labda-felismerés egy natív felbontású kivágáson: [(xyxy kivágás-koordinátában, conf, cls)]."""
+        self.stats["ball_crop_calls"] += 1
+        if self._last_frame is None or self.gt is None:
+            return []
+        idx = self._last_frame[1]
+        frames = self.gt["frames"]
+        if idx < 0 or idx >= len(frames):
+            return []
+        ch, cw = img.shape[:2]
+        pr = self.profile
+        rng = np.random.default_rng([self.seed, idx, 7, int(x0), int(y0)])
+        out = []
+        b = frames[idx]["ball"]
+        cls_b = self._cls("ball")
+        if classes is not None and cls_b not in classes:
+            return []
+        if b.get("vis"):
+            x1, y1, x2, y2 = b["bbox"]
+            cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+            if x0 <= cx < x0 + cw and y0 <= cy < y0 + ch:
+                r = b.get("r", 3.0)
+                p_miss = pr["ball_miss"] * (1.0 - pr["ball_miss_burst"]) / max(1e-6, 1 - pr["ball_miss"])
+                if b.get("occ", 0) > 0.5:
+                    p_miss = max(p_miss, pr["ball_occluded_miss"])
+                if b.get("blur", 0.0) > 4 * r:
+                    p_miss = min(0.95, p_miss + pr["ball_blur_miss"])
+                vis = self._res_visibility(r, img.shape)
+                if rng.random() >= p_miss and rng.random() <= vis:
+                    jx, jy = rng.normal(0, pr["ball_jitter_px"], 2)
+                    bw = (x2 - x1) * rng.uniform(0.85, 1.15) + 1.0
+                    bh = (y2 - y1) * rng.uniform(0.85, 1.15) + 1.0
+                    lo, hi = pr["ball_conf"]
+                    c = float(rng.uniform(lo, hi))
+                    if c >= conf:
+                        ux, uy = cx + jx - x0, cy + jy - y0
+                        out.append(((ux - bw / 2, uy - bh / 2, ux + bw / 2, uy + bh / 2), c, cls_b))
+                        self.stats["ball_crop_detected"] += 1
+        # téves labda-jelöltek (a kivágás területével arányosan)
+        W_, H_ = self.gt["width"], self.gt["height"]
+        n_fp = rng.poisson(pr["ball_fp_rate"] * 2.0 * (cw * ch) / float(W_ * H_))
+        for _ in range(n_fp):
+            s_ = rng.uniform(4.0, 10.0)
+            ux, uy = rng.uniform(0, cw), rng.uniform(0, ch)
+            lo, hi = pr["ball_fp_conf"]
+            c = float(rng.uniform(lo, hi))
+            if c >= conf:
+                out.append(((ux - s_ / 2, uy - s_ / 2, ux + s_ / 2, uy + s_ / 2), c, cls_b))
+        return out
+
     def predict(self, frame=None, classes=None, conf=0.0, **kwargs):
+        if isinstance(frame, (list, tuple)):
+            return [self.predict(f, classes=classes, conf=conf, **kwargs)[0] for f in frame]
+        off = self._crop_offset(frame)
+        if off is not None:   # natív felbontású kivágás (LABDA-KIVÁGÁS)
+            dets = self.detect_crop(frame, off[0], off[1], classes=classes, conf=conf)
+            return [FakeResult([FakeBox(c, cf, xy) for xy, cf, c in dets], False, self.names)]
         # Ugyanarra a képkockára hívott predict() (pl. külön labda-menet) ugyanazt a GT képkockát kapja
         if self._last_frame is not None and frame is not None and self._last_frame[0] == id(frame):
             dets = self._last_frame[2]
@@ -472,8 +568,16 @@ class FakeDetector:
 
     def detect(self, frame):
         from detection.detector_base import Detections
+        off = self.src._crop_offset(frame)
+        if off is not None:   # LABDA-KIVÁGÁS: natív felbontású kivágás a legutóbbi képkockából
+            dets = self.src.detect_crop(frame, off[0], off[1])
+            if not dets:
+                return Detections(names=self.names)
+            return Detections([d[0] for d in dets], [d[1] for d in dets], [d[2] for d in dets], self.names)
         idx = self.src._next_idx()
         dets = self.src.detect_frame(idx, getattr(frame, "shape", None))
+        self.src._last_frame = (id(frame), idx, dets)
+        self.src._last_frame_obj = frame
         if not dets:
             return Detections(names=self.names)
         return Detections([d[0] for d in dets], [d[1] for d in dets], [d[2] for d in dets], self.names)
