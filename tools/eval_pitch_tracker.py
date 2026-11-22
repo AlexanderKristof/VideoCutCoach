@@ -203,7 +203,7 @@ def run_one(job):
                      "refine_tried": bool(q.get("refine_tried", q.get("n_visible") is not None)),
                      "refined": bool(q.get("refined")), "conf": q.get("conf"),
                      "q": {k: q.get(k) for k in ("err_m", "precision", "support", "innovation", "n_visible",
-                                                 "motion_ok", "inliers", "lost", "camera_refined")
+                                                 "motion_ok", "inliers", "lost", "camera_refined", "recall")
                            if q.get(k) is not None}})
         if q.get("relocalize"):
             rows[-1]["q"]["reloc"] = q["relocalize"]

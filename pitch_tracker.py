@@ -304,7 +304,28 @@ def _boxes_mask(shape, boxes, scale, pad_ratio=0.15, pad_px=3):
     return m
 
 
-def main_grass_mask(hsv, grass, tol=14.0, max_tol=24.0, min_keep=0.5):
+def grass_hue_model(hsv, grass, tol=14.0, max_tol=24.0):
+    """A saját fű árnyalat-modellje a kép alsó sávjából: (medián hue, tűrés) vagy None (kevés fű)."""
+    if grass is None:
+        return None
+    h = grass.shape[0]
+    y0 = int(h * 0.6)
+    band_g = grass[y0::3, ::3]
+    sel = band_g > 0
+    if np.count_nonzero(sel) < 0.15 * sel.size:
+        return None
+    hue = hsv[y0::3, ::3, 0][sel]
+    hist = np.bincount(hue, minlength=180).astype(np.float64)
+    c = np.cumsum(hist)
+    med = float(np.searchsorted(c, 0.5 * c[-1]))
+    dev = np.abs(np.arange(180) - med)
+    order = np.argsort(dev)
+    cd = np.cumsum(hist[order])
+    mad = float(dev[order][np.searchsorted(cd, 0.5 * c[-1])]) * 1.4826
+    return med, min(max_tol, max(tol, 3.0 * mad))
+
+
+def main_grass_mask(hsv, grass, tol=14.0, max_tol=24.0, min_keep=0.5, model=None):
     """
     A saját pálya füve: a kép alsó sávjának (a kamerához közeli, biztosan a mi pályánk) fűszínéből
     tanult árnyalat (hue) körüli pixelek. A kerítés mögötti másik (pl. műfüves, kékesebb zöld) pálya
@@ -315,19 +336,14 @@ def main_grass_mask(hsv, grass, tol=14.0, max_tol=24.0, min_keep=0.5):
     if grass is None:
         return None
     h, w = grass.shape[:2]
-    y0 = int(h * 0.6)
-    band_g = grass[y0::2, ::2]
-    band_h = hsv[y0::2, ::2, 0]
-    sel = band_g > 0
-    if np.count_nonzero(sel) < 0.15 * sel.size:
+    if model is None:
+        model = grass_hue_model(hsv, grass, tol, max_tol)
+    if model is None:
         return grass
-    hue = band_h[sel].astype(np.float32)
-    med = float(np.median(hue))
-    mad = float(np.median(np.abs(hue - med))) * 1.4826
-    t = min(max_tol, max(tol, 3.0 * mad))
-    hh = hsv[:, :, 0].astype(np.int16)
-    good = (np.abs(hh - med) <= t).astype(np.uint8) * 255
+    med, t = model
+    good = cv2.inRange(hsv[:, :, 0], int(math.ceil(med - t)), int(math.floor(med + t)))
     m = cv2.bitwise_and(grass, good)
+    # a fehér vonal árnyalata tetszőleges: zárással visszakerül a fűbe (különben kiesne a fűzónából)
     k = max(5, (int(h / 60) // 2) * 2 + 1)
     m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
     m = cv2.bitwise_and(m, grass)
@@ -349,13 +365,14 @@ def _glare_mask(mn, k):
     bright = (mn >= 235).astype(np.uint8) * 255
     if not bright.any():
         return None
-    # csak a VASTAG foltok (a k/2 átmérőjű erózió után is megmaradó részek): a beégett, de vékony
+    # csak a VASTAG foltok (a k átmérőjű erózió után is megmaradó részek): a beégett, de vékony
     # pályavonal így nem esik ki
-    ke = _odd(max(3, k // 2))
+    ke = _odd(max(3, k))
     core = cv2.erode(bright, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ke, ke)))
     if not core.any():
         return None
-    return cv2.dilate(core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1, 2 * k + 1)))
+    kd = _odd(ke + 6)                    # a folt eredeti mérete + néhány px (a peremén is lehet hamis "vonal")
+    return cv2.dilate(core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kd, kd)))
 
 
 def detect_line_mask(small_bgr, grass_mask=None, box_mask=None, hsv=None, min_tophat=22, max_sat=140,
@@ -381,7 +398,7 @@ def detect_line_mask(small_bgr, grass_mask=None, box_mask=None, hsv=None, min_to
     if adaptive:
         # helyi zajszint: a (levágott) top-hat átlaga nagy ablakban; a ritka vonalpixelek alig emelik
         kb = _odd(max(15, w / 12))
-        loc = cv2.boxFilter(np.minimum(th, 30).astype(np.float32), -1, (kb, kb))
+        loc = cv2.boxFilter(cv2.min(th, 30).astype(np.float32), -1, (kb, kb))
         thr = np.clip(1.6 * loc + 3.0, min_tophat_floor, min_tophat)
         line = th.astype(np.float32) >= thr
     else:
@@ -1739,6 +1756,8 @@ class PitchTracker:
         self.grass_upper = np.maximum(np.asarray(grass_upper), DEFAULT_GRASS_HSV[1])
         self.refine_every = max(1, int(refine_every))
         self.main_grass_only = True   # a kerítés mögötti másik pálya füvét / vonalait kizárjuk (main_grass_mask)
+        self._hue_model = None
+        self._hue_model_frame = -10 ** 9
         # képre égetett feliratok helye (relatív x0, y0, x1, y1) – a vonalkeresés kihagyja (Veo logó: jobb alsó sarok)
         self.overlay_regions = [(0.86, 0.87, 1.0, 1.0)]
         self.auto_init = auto_init
@@ -1899,17 +1918,33 @@ class PitchTracker:
                 "height_m": float(-self.C[2])}
 
     # --- előfeldolgozás ---------------------------------------------------
-    def _prepare(self, frame):
+    def _prepare(self, frame, main=True):
+        """main=False: a saját-fű szűrés elmarad (kalibráció nélkül csak a vonalkereséshez kell, ott
+        _line_field pótolja – így a kalibrálatlan képkockák olcsóbbak)."""
         small = cv2.resize(frame, (self.ws, self.hs), interpolation=cv2.INTER_AREA) if self.s < 1.0 else frame
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
         hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
         grass, _ = build_grass_mask(hsv, self.grass_lower, self.grass_upper, scale=1.0)
-        if self.main_grass_only:
-            grass = main_grass_mask(hsv, grass)
+        self._grass_raw = not main
+        if main:
+            grass = self._main_grass(hsv, grass)
         return small, gray, hsv, grass
+
+    def _main_grass(self, hsv, grass):
+        if self.main_grass_only and grass is not None:
+            # az árnyalat-modellt ritkán frissítjük (olcsóbb, és nem ugrál képkockánként)
+            if self._hue_model is None or self.frame_idx - self._hue_model_frame >= 25:
+                self._hue_model = grass_hue_model(hsv, grass)
+                self._hue_model_frame = self.frame_idx
+            if self._hue_model is not None:
+                grass = main_grass_mask(hsv, grass, model=self._hue_model)
+        return grass
 
     def _line_field(self, frame, small, hsv, grass, box_mask, boxes):
         """Vonalmaszk + távolság-transzformált a vonal-felbontáson."""
+        if getattr(self, "_grass_raw", False):
+            grass = self._main_grass(hsv, grass)
+            self._grass_raw = False
         if (self.wl, self.hl) == (self.ws, self.hs):
             mask = detect_line_mask(small, grass, box_mask, hsv)
         else:
@@ -1977,7 +2012,7 @@ class PitchTracker:
     def update(self, frame, boxes=None):
         """Egy képkocka feldolgozása. Visszatér: (H_t vagy None, minőség-szótár)."""
         self.frame_idx += 1
-        small, gray, hsv, grass = self._prepare(frame)
+        small, gray, hsv, grass = self._prepare(frame, main=self.G is not None)
         box_mask = _boxes_mask(gray.shape, boxes, self.s)
         q = {"frame": self.frame_idx, "refined": False, "motion_ok": None, "refine_tried": False}
 
@@ -2072,6 +2107,17 @@ class PitchTracker:
         self.last_auto_try = None       # azonnal próbálkozhat egyszer az automatikus kalibrációval;
         # a visszalépés szintje (self._auto_wait) megmarad: a sikertelen próbálkozások nem halmozódnak
 
+    _STATE_KEYS = ("mode", "x", "C", "P", "v", "G", "source", "conf", "lost", "bad_streak", "since_refine",
+                   "since_verified", "keyframes", "C_calib", "C_prior_info")
+
+    def _snapshot(self):
+        import copy
+        return {k: copy.copy(getattr(self, k)) for k in self._STATE_KEYS}
+
+    def _restore(self, saved):
+        for k, v in saved.items():
+            setattr(self, k, v)
+
     def _looks_promising(self, field):
         """Olcsó előszűrő (csak a vonalmaszk): érdemes-e a visszalépési idő előtt újra próbálkozni."""
         need = 150.0 * self.px
@@ -2101,12 +2147,11 @@ class PitchTracker:
 
     def _enter_prior_search(self):
         """Elveszett követés kézi kalibrációval: a kamerahely marad, tág újrapozicionálás kezdődik."""
-        self.lost = self.max_lost + 1          # 'elveszett' státusz, de nem dobjuk el a kamerát
+        # Az állás kovarianciáját NEM növeljük: a képkockák közti mozgásbecslés jellemzően tovább is
+        # működik, a vonal-illesztés ne sodródhasson el egy rossz (pl. csillanás miatti) vonalképre.
         self.bad_streak = 4
-        self.conf = min(self.conf, 0.2)
+        self.conf = min(self.conf, 0.3)        # 'bizonytalan', amíg a vonalak újra meg nem erősítik
         self.wide_reloc = True
-        if self.P is not None:
-            self.P = np.diag([5.0, 2.0, 0.5, 10.0]) ** 2
 
     # --- fizikai kameramodell ---------------------------------------------
     def _propagate_pose(self, gray, q):
@@ -2202,6 +2247,11 @@ class PitchTracker:
         q["innovation"] = round(maha, 2)
         accepted = (prec >= info["precision_before"] - 0.02 and
                     _plausible(self._G_line_of()(y), self.wl, self.hl))
+        # Gyenge vonalkép (csillanás, fátyolfény, takarás): csak érdemi javulást fogadunk el – különben
+        # a finomítás a zajt követve lassan elsodorná az állást (a mozgásbecslés ilyenkor megbízhatóbb)
+        if accepted and prec < 0.35 and prec < info["precision_before"] + 0.05:
+            accepted = False
+            q["refine_reason"] = "gyenge vonalkép"
         # nagy ugrást (más vonalra ugrás) csak erős alátámasztással fogadunk el
         if accepted and maha > 30.0 and not (prec >= 0.7 and sup >= 0.7):
             accepted = False
@@ -2349,8 +2399,19 @@ class PitchTracker:
                 if self.manual_prior is not None:
                     c = self.manual_prior
                     cams = [tuple(c), (c[0] - 5.0, c[1], c[2]), (c[0] + 5.0, c[1], c[2])]
-                q["relocalize"]["auto"] = self._auto_attempt(field, q, cam_positions=cams)
-                return q["relocalize"]["auto"]
+                saved = self._snapshot()
+                ok_auto = self._auto_attempt(field, q, cam_positions=cams)
+                if ok_auto and saved["x"] is not None and self.x is not None \
+                        and saved["lost"] <= self.max_lost:
+                    # A képkockák közti mozgásbecslés végig működött, tehát a kamera iránya nagyjából ismert:
+                    # a tőle messze eső (pl. a pálya tükörképére illesztett – a felezővonalnál álló kamerából
+                    # a két térfél hasonló) automatikus eredményt nem fogadjuk el
+                    if abs(self.x[0] - saved["x"][0]) > 20.0 or abs(self.x[1] - saved["x"][1]) > 6.0:
+                        self._restore(saved)
+                        ok_auto = False
+                        q["relocalize"]["auto_rejected"] = "messze a követett iránytól"
+                q["relocalize"]["auto"] = ok_auto
+                return ok_auto
             return False
         self.reloc_fails = 0
         self._reloc_wait = self.reloc_every
