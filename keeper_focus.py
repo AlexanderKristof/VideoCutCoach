@@ -167,6 +167,49 @@ def attacks_in_zone(data, goal_x, halves, attack_zone_m=30.0, min_attack_s=3.0, 
     return res
 
 
+def from_detector_logs(data, base_dir, bin_s=0.2):
+    """
+    Pontosabb kapus- és labdapályák a detektor-naplóból (detector_log.py), ha van: a kapusok képkockánkénti
+    jelölése alapján (nem "valaha kapus volt"), bin_s-es átlagolással (a képkockánkénti remegés ne tűnjön
+    mozgásnak). Visszatér: {"tracks": {"<félidő>:<id>": {"team", "keeper": True, "half", "points"}},
+    "ball": [[x, y, t], ...]} vagy None, ha nincs napló.
+    """
+    try:
+        import detector_log
+    except ImportError:
+        return None
+    logs = detector_log.find_logs(data, base_dir) if base_dir else []
+    if not logs:
+        return None
+    tracks, ball = {}, []
+    for idx, (key, path) in enumerate(logs, 1):
+        half = {"first_half": 1, "second_half": 2}.get(key, idx if len(logs) > 1 else None)
+        _h, rows = detector_log.read(path)
+        bins = {}
+        for r in rows:
+            if r[0] != "frame":
+                continue
+            t, b, players = r[1], r[2], r[5]
+            if b is not None:
+                ball.append([b[0], b[1], t])
+            for p in players:
+                if not p.get("is_keeper"):
+                    continue
+                k = f"{half or 0}:{p['track_id']}"
+                slot = int(t / bin_s)
+                acc = bins.setdefault(k, {}).setdefault(slot, [0.0, 0.0, 0.0, 0, p.get("team_id")])
+                acc[0] += p["pitch_coords"][0]
+                acc[1] += p["pitch_coords"][1]
+                acc[2] += t
+                acc[3] += 1
+        for k, slots in bins.items():
+            pts = [[a[0] / a[3], a[1] / a[3], a[2] / a[3]] for _, a in sorted(slots.items())]
+            teams = [a[4] for a in slots.values() if a[4] in (1, 2)]
+            tracks[k] = {"team": max(set(teams), key=teams.count) if teams else None, "keeper": True,
+                         "half": half, "points": pts}
+    return {"tracks": tracks, "ball": sorted(ball, key=lambda q: q[2])}
+
+
 def keeper_tracks(data, team, goal_x, half=None, max_line_m=25.0):
     """A csapat kapus-követései: "keeper" jelzésű, és a pontok többsége a saját gólvonal közelében."""
     tracks = ((data.get("trajectories") or {}).get("tracks")) or {}
@@ -264,12 +307,20 @@ def _move_desc(m, goal_x):
             f"{d1:.0f} m-re a gólvonaltól")
 
 
-def build(data, team, min_move_m=2.0, attack_zone_m=30.0, min_attack_s=3.0, include_moves=True):
-    """A Kapus Modul listája egy meccs-eredményből a `team` kapusára."""
+def build(data, team, min_move_m=2.0, attack_zone_m=30.0, min_attack_s=3.0, include_moves=True, base_dir=None):
+    """
+    A Kapus Modul listája egy meccs-eredményből a `team` kapusára. base_dir: az eredményfájl mappája – ha ott
+    van detektor-napló, a kapus-mozgások és a zóna-támadások abból (teljes ütem, képkockánkénti kapus-jelölés).
+    """
     if team not in ("team1", "team2"):
         raise ValueError("A csapat 'team1' vagy 'team2' lehet.")
     halves = _halves(data)
     goal_by_half = {idx: defended_goal_x(data, team, idx) for idx, _, _ in halves}
+    precise = from_detector_logs(data, base_dir) if base_dir else None
+    source = "detektor-napló" if precise else "mentett pályák"
+    if precise:
+        # a védett kapu továbbra is a mezőnyjátékosok átlagából (a mentett pályák), a kapus és a labda a naplóból
+        data = dict(data, trajectories={"tracks": precise["tracks"], "ball": precise["ball"]})
     items = []
     for ev in data.get("events") or []:
         t = float(ev.get("time", 0.0))
@@ -308,7 +359,7 @@ def build(data, team, min_move_m=2.0, attack_zone_m=30.0, min_attack_s=3.0, incl
     for it in items:
         counts[it["group"]] = counts.get(it["group"], 0) + 1
     return {
-        "team": team, "team_label": TEAM_LABELS[team],
+        "team": team, "team_label": TEAM_LABELS[team], "source": source,
         "defended_goal_x": {str(k): v for k, v in goal_by_half.items()},
         "groups": [{"key": k, "label": v, "count": counts.get(k, 0)} for k, v in GROUP_LABELS.items()],
         "items": items,

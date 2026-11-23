@@ -1829,7 +1829,8 @@ async def get_keeper_focus(events: str, team: str = "team1", moves: int = 1, min
             return JSONResponse({"status": "error", "message": "Nincs ilyen eredményfájl."}, status_code=404)
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
-        res = _keeper_focus.build(data, team, min_move_m=max(0.5, float(min_move)), include_moves=bool(moves))
+        res = _keeper_focus.build(data, team, min_move_m=max(0.5, float(min_move)), include_moves=bool(moves),
+                                  base_dir=os.path.dirname(path))
         return {"status": "success", **res}
     except (ValueError, TypeError) as ex:
         return JSONResponse({"status": "error", "message": str(ex)}, status_code=400)

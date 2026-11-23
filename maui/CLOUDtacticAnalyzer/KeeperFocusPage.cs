@@ -177,7 +177,8 @@ public class KeeperFocusPage : ContentPage
                 if (key != "mozgas" || _showMoves.IsChecked) _groupOptions.Add((key, $"{label} ({count})"));
             _groupPicker.ItemsSource = _groupOptions.Select(g => g.Label).ToList();
             _groupPicker.SelectedIndex = Math.Max(0, _groupOptions.FindIndex(g => g.Key == prev));
-            _status.Text = $"{TeamNames.Of(team)} kapusa – {_focus.Items.Count} jelenet.";
+            _status.Text = $"{TeamNames.Of(team)} kapusa – {_focus.Items.Count} jelenet" +
+                           (_focus.Source is { Length: > 0 } src ? $" (forrás: {src})." : ".");
             ApplyFilter();
         }
         catch (Exception ex)

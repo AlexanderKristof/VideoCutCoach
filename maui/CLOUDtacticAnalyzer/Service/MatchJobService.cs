@@ -198,6 +198,8 @@ public sealed class KeeperFocus
 {
     public List<(string Key, string Label, int Count)> Groups { get; } = new();
     public List<MatchEvent> Items { get; set; } = new();
+    /// <summary>"detektor-napló" (pontos, teljes ütem) vagy "mentett pályák" (ritkított).</summary>
+    public string? Source { get; set; }
 }
 
 /// <summary>Esemény-kalapok (egyezik az events.py EVENT_CATEGORIES / CATEGORY_LABELS értékeivel).</summary>
@@ -522,6 +524,8 @@ public sealed class MatchJobService
                     g.TryGetProperty("count", out var c) ? c.GetInt32() : 0));
         if (root.TryGetProperty("items", out var its) && its.ValueKind == JsonValueKind.Array)
             res.Items = its.Deserialize<List<MatchEvent>>(JsonOptions) ?? new();
+        if (root.TryGetProperty("source", out var src) && src.ValueKind == JsonValueKind.String)
+            res.Source = src.GetString();
         return res;
     }
 
