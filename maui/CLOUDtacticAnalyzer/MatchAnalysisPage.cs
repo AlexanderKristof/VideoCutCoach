@@ -11,6 +11,7 @@ public sealed class EventItem : INotifyPropertyChanged
 {
     private bool _selected;
     private string? _verdict;
+    private bool _fontos;
     public EventItem(MatchEvent ev, string? manualId = null)
     {
         Event = ev;
@@ -43,6 +44,23 @@ public sealed class EventItem : INotifyPropertyChanged
             OnChanged(nameof(RowColor));
         }
     }
+
+    /// <summary>Az edző "fontos" (⭐) jelölése: ezt a jelenetet látni akarja a válogatásban.</summary>
+    public bool Fontos
+    {
+        get => _fontos;
+        set
+        {
+            if (_fontos == value) return;
+            _fontos = value;
+            OnChanged();
+            OnChanged(nameof(StarText));
+            OnChanged(nameof(StarColor));
+        }
+    }
+
+    public string StarText => Fontos ? "⭐" : "☆";
+    public Color StarColor => Fontos ? Color.FromArgb("#8D6E00") : Color.FromArgb("#37474F");
 
     public Color OkColor => Verdict == "ok" ? Color.FromArgb("#2E7D32") : Color.FromArgb("#37474F");
     public Color WrongColor => Verdict == "hamis" ? Color.FromArgb("#C62828") : Color.FromArgb("#37474F");
@@ -131,6 +149,13 @@ public class MatchAnalysisPage : ContentPage
     private readonly Label _eventCount = new() { TextColor = Muted, VerticalOptions = LayoutOptions.Center };
     private readonly Button _exportButton = new() { Text = "✂ Kijelöltek kivágása egy videóba", BackgroundColor = Color.FromArgb("#00897B") };
     private readonly Label _exportStatus = new() { TextColor = Muted };
+    private readonly Button _labelPackageButton = new() { Text = "📦 Címkéző csomag (laptopra)", BackgroundColor = Color.FromArgb("#5E35B1") };
+    private readonly Button _importLabelsButton = new() { Text = "📥 Címkék beolvasása", BackgroundColor = Color.FromArgb("#3949AB") };
+    private readonly Button _tuneButton = new() { Text = "🧠 Tanulás a jelöléseimből", BackgroundColor = Color.FromArgb("#00838F") };
+    private readonly Button _openFolderButton = new() { Text = "📂 Mappa megnyitása", BackgroundColor = Color.FromArgb("#455A64"), IsVisible = false };
+    private readonly Label _learnStatus = new() { TextColor = Muted, VerticalOptions = LayoutOptions.Center, MaxLines = 4, WidthRequest = 520 };
+    private string? _learnJobId;
+    private string? _learnFolder;
     private readonly MediaElement _player = new() { ShouldAutoPlay = false, ShouldShowPlaybackControls = true, Aspect = Aspect.AspectFit, HeightRequest = 360, BackgroundColor = Colors.Black };
     private readonly HorizontalStackLayout _videoButtons = new() { Spacing = 8 };
     private readonly HorizontalStackLayout _heatmapStrip = new() { Spacing = 10 };
@@ -179,6 +204,10 @@ public class MatchAnalysisPage : ContentPage
         _pauseButton.Clicked += async (_, _) => await PauseResumeAsync();
         _cancelButton.Clicked += async (_, _) => await CancelAsync();
         _exportButton.Clicked += async (_, _) => await ExportSelectedAsync();
+        _labelPackageButton.Clicked += async (_, _) => await StartLearnJobAsync("package");
+        _importLabelsButton.Clicked += async (_, _) => await StartLearnJobAsync("import");
+        _tuneButton.Clicked += async (_, _) => await StartLearnJobAsync("tune");
+        _openFolderButton.Clicked += (_, _) => OpenFolder(_learnFolder);
 
         Content = BuildLayout();
     }
@@ -285,6 +314,17 @@ public class MatchAnalysisPage : ContentPage
         _resultBox.Children.Add(_eventList);
         _resultBox.Children.Add(_exportButton);
         _resultBox.Children.Add(_exportStatus);
+        _resultBox.Children.Add(Header("Tanulás a jelöléseidből"));
+        _resultBox.Children.Add(new Label
+        {
+            Text = "📦 A címkéző csomag rövid részleteket és egy weboldalt készít, amivel laptopon (internet és telepítés " +
+                   "nélkül) végignézheted a jeleneteket – a program tippjeit, amit majdnem jelzett, és véletlen részleteket. " +
+                   "📥 A mentett cimkek_*.json fájlt itt olvasd vissza. 🧠 A tanulás az összes eddigi jelölésből " +
+                   "(✓ / ✗ / ➕ / címkéző) beállítja a felismerést; a következő elemzés már így fut.",
+            TextColor = Muted, FontSize = 12,
+        });
+        _resultBox.Children.Add(Row(_labelPackageButton, _importLabelsButton, _tuneButton));
+        _resultBox.Children.Add(Row(_learnStatus, _openFolderButton));
         _resultBox.Children.Add(Header("Hőtérképek"));
         _resultBox.Children.Add(new ScrollView { Orientation = ScrollOrientation.Horizontal, Content = _heatmapStrip });
 
@@ -343,6 +383,11 @@ public class MatchAnalysisPage : ContentPage
         var wrong = new Button { Text = "✗", WidthRequest = 40, HeightRequest = 34, Padding = 0, FontSize = 16, TextColor = Colors.White };
         wrong.SetBinding(BackgroundColorProperty, nameof(EventItem.WrongColor));
         wrong.Clicked += async (s, _) => { if ((s as BindableObject)?.BindingContext is EventItem it) await SetVerdictAsync(it, "hamis"); };
+        var star = new Button { WidthRequest = 40, HeightRequest = 34, Padding = 0, FontSize = 16, TextColor = Colors.White };
+        star.SetBinding(Button.TextProperty, nameof(EventItem.StarText));
+        star.SetBinding(BackgroundColorProperty, nameof(EventItem.StarColor));
+        star.Clicked += async (s, _) => { if ((s as BindableObject)?.BindingContext is EventItem it) await ToggleImportantAsync(it); };
+        ToolTipProperties.SetText(star, "Fontos – ezt a jelenetet látni akarom a válogatásban");
         ToolTipProperties.SetText(ok, "Valódi esemény (helyes)");
         ToolTipProperties.SetText(wrong, "Téves esemény (nem történt meg / nem ez volt)");
 
@@ -355,7 +400,7 @@ public class MatchAnalysisPage : ContentPage
         grid.SetBinding(BackgroundColorProperty, nameof(EventItem.RowColor));
         grid.Add(box, 0, 0);
         grid.Add(new VerticalStackLayout { Spacing = 1, Children = { title, sub } }, 1, 0);
-        grid.Add(new HorizontalStackLayout { Spacing = 4, VerticalOptions = LayoutOptions.Center, Children = { ok, wrong } }, 2, 0);
+        grid.Add(new HorizontalStackLayout { Spacing = 4, VerticalOptions = LayoutOptions.Center, Children = { star, ok, wrong } }, 2, 0);
         return grid;
     }
 
@@ -381,6 +426,21 @@ public class MatchAnalysisPage : ContentPage
             var newVerdict = item.Verdict == verdict ? null : verdict;   // újra megnyomva: visszavonás
             await _api.SetVerdictAsync(_loadedEventsUrl, item.Event, newVerdict);
             item.Verdict = newVerdict;
+            UpdateEventCount();
+        }
+        catch (Exception ex)
+        {
+            _eventCount.Text = $"A jelölés nem menthető: {ex.Message}";
+        }
+    }
+
+    private async Task ToggleImportantAsync(EventItem item)
+    {
+        if (_loadedEventsUrl is null) return;
+        try
+        {
+            await _api.SetImportantAsync(_loadedEventsUrl, item.Event, item.ManualId, !item.Fontos);
+            item.Fontos = !item.Fontos;
             UpdateEventCount();
         }
         catch (Exception ex)
@@ -461,6 +521,8 @@ public class MatchAnalysisPage : ContentPage
                 await SelectJobAsync(await _api.GetJobAsync(_currentJob.Id), fromPoll: true);
             if (_exportJobId is not null)
                 await PollExportAsync();
+            if (_learnJobId is not null)
+                await PollLearnAsync();
             if (++_tick % 5 == 0 || _jobs.Any(j => !j.Job.IsFinished))
                 await RefreshJobsAsync();
             if (_tick % 5 == 0)
@@ -660,12 +722,16 @@ public class MatchAnalysisPage : ContentPage
             try
             {
                 var fb = await _api.GetFeedbackAsync(url);
-                var verdicts = fb.Items.ToDictionary(i => i.Key, i => i.Verdict);
+                var byKey = fb.Items.GroupBy(i => i.Key).ToDictionary(g => g.Key, g => g.Last());
                 foreach (var it in _allEvents)
-                    if (verdicts.TryGetValue(it.Event.FeedbackKey, out var v)) it.Verdict = v;
+                    if (byKey.TryGetValue(it.Event.FeedbackKey, out var v))
+                    {
+                        it.Verdict = string.IsNullOrEmpty(v.Verdict) ? null : v.Verdict;
+                        it.Fontos = v.Fontos == true;
+                    }
                 foreach (var m in fb.Missing)
                     _allEvents.Add(new EventItem(new MatchEvent { Type = m.Type, Time = m.Time, Team = m.Team,
-                        Desc = string.IsNullOrEmpty(m.Note) ? "az automatikából kimaradt" : m.Note }, m.Id));
+                        Desc = string.IsNullOrEmpty(m.Note) ? "az automatikából kimaradt" : m.Note }, m.Id) { Fontos = m.Fontos == true });
                 _allEvents.Sort((a, b) => a.Event.Time.CompareTo(b.Event.Time));
             }
             catch { /* régebbi motor: nincs /feedback – a lista ítéletek nélkül is használható */ }
@@ -780,8 +846,10 @@ public class MatchAnalysisPage : ContentPage
         var okN = _allEvents.Count(e => e.Verdict == "ok");
         var badN = _allEvents.Count(e => e.Verdict == "hamis");
         var manN = _allEvents.Count(e => e.IsManual);
+        var starN = _allEvents.Count(e => e.Fontos);
         _eventCount.Text = $"{_visibleEvents.Count} / {_allEvents.Count} esemény látszik, {selected} kijelölve" +
-            (okN + badN + manN > 0 ? $"  •  ellenőrizve: {okN} ✓, {badN} ✗, {manN} kézzel felvett" : "");
+            (okN + badN + manN > 0 ? $"  •  ellenőrizve: {okN} ✓, {badN} ✗, {manN} kézzel felvett" : "") +
+            (starN > 0 ? $"  •  {starN} ⭐" : "");
         _exportButton.IsEnabled = selected > 0;
     }
 
@@ -861,6 +929,125 @@ public class MatchAnalysisPage : ContentPage
         {
             _exportStatus.Text = $"Hiba: {ex.Message}";
             _exportButton.IsEnabled = true;
+        }
+    }
+
+    // ================================================================ tanulás (címkéző csomag, beolvasás, hangolás)
+
+    private void SetLearnBusy(bool busy)
+    {
+        _labelPackageButton.IsEnabled = _importLabelsButton.IsEnabled = _tuneButton.IsEnabled = !busy;
+    }
+
+    private async Task StartLearnJobAsync(string what)
+    {
+        try
+        {
+            _openFolderButton.IsVisible = false;
+            switch (what)
+            {
+                case "package":
+                    if (_loadedEventsUrl is null) return;
+                    SetLearnBusy(true);
+                    _learnStatus.Text = "Címkéző csomag készül…";
+                    _learnJobId = await _api.StartLabelPackageAsync(_loadedEventsUrl);
+                    break;
+                case "import":
+                    var pick = await FilePicker.Default.PickAsync(new PickOptions
+                    {
+                        PickerTitle = "A laptopon mentett cimkek_*.json",
+                        FileTypes = new FilePickerFileType(new Dictionary<DevicePlatform, IEnumerable<string>>
+                        {
+                            [DevicePlatform.WinUI] = new[] { ".json" },
+                            [DevicePlatform.MacCatalyst] = new[] { "public.json" },
+                        }),
+                    });
+                    if (pick is null) return;
+                    var tune = await DisplayAlertAsync("Címkék beolvasása",
+                        "A beolvasás után tanuljon is a program az összes eddigi jelölésből? (Ez néhány perc lehet.)",
+                        "Igen", "Csak beolvasás");
+                    SetLearnBusy(true);
+                    _learnStatus.Text = "Címkék beolvasása…";
+                    _learnJobId = await _api.StartImportLabelsAsync(pick.FullPath, tune);
+                    break;
+                default:
+                    SetLearnBusy(true);
+                    _learnStatus.Text = "Tanulás az eddigi jelölésekből…";
+                    _learnJobId = await _api.StartTuneAsync();
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            _learnStatus.Text = $"Hiba: {ex.Message}";
+            SetLearnBusy(false);
+        }
+    }
+
+    private async Task PollLearnAsync()
+    {
+        var job = await _api.GetJobAsync(_learnJobId!);
+        if (!job.IsFinished)
+        {
+            _learnStatus.Text = $"{job.Progress:0}% – {job.Phase}";
+            return;
+        }
+        _learnJobId = null;
+        SetLearnBusy(false);
+        if (job.Status != "done" || job.Result is not { ValueKind: System.Text.Json.JsonValueKind.Object } r)
+        {
+            _learnStatus.Text = $"Nem sikerült: {job.Error ?? job.Status}";
+            return;
+        }
+        _learnStatus.Text = DescribeLearnResult(job.Kind, r);
+        if (job.Kind == "label-package" && r.TryGetProperty("folder", out var f) && f.GetString() is { Length: > 0 } folder)
+        {
+            _learnFolder = folder;
+            _openFolderButton.IsVisible = true;
+        }
+        if (job.Kind == "import-labels" && _loadedEventsUrl is not null)
+            await LoadEventsAsync(_loadedEventsUrl);   // a beolvasott ítéletek a listában is látszanak
+    }
+
+    private static string Str(System.Text.Json.JsonElement r, string name) =>
+        r.TryGetProperty(name, out var v) && v.ValueKind == System.Text.Json.JsonValueKind.String ? v.GetString() ?? "" : "";
+
+    /// <summary>A tanulás-feladatok eredménye egy-két mondatban.</summary>
+    internal static string DescribeLearnResult(string kind, System.Text.Json.JsonElement r)
+    {
+        if (Str(r, "status") == "error") return "Hiba: " + Str(r, "message");
+        switch (kind)
+        {
+            case "label-package":
+                var n = r.TryGetProperty("clips", out var c) && c.TryGetInt32(out var ci) ? ci : 0;
+                return $"Kész: {n} jelenet. Másold a mappát a laptopra (pendrive / OneDrive), és nyisd meg benne az " +
+                       $"index.html-t. A végén a „Mentés fájlba” gombbal mentett fájlt itt olvasd vissza. Mappa: {Str(r, "folder")}";
+            case "import-labels":
+                var text = Str(r, "message");
+                if (r.TryGetProperty("tuning", out var t) && t.ValueKind == System.Text.Json.JsonValueKind.Object)
+                    text += "  " + DescribeLearnResult("tune-events", t);
+                return text;
+            default:
+                var st = Str(r, "status");
+                if (st != "success") return Str(r, "message");
+                var changed = r.TryGetProperty("overrides", out var o) && o.ValueKind == System.Text.Json.JsonValueKind.Object
+                    ? o.EnumerateObject().Count() : 0;
+                return $"Tanulás kész – {Str(r, "message")}. " +
+                       (changed > 0 ? $"{changed} beállítás változott; a következő elemzés már ezekkel fut."
+                                    : "Az eddigi beállítások maradnak (ezek a legjobbak a jelöléseidre).");
+        }
+    }
+
+    private static void OpenFolder(string? folder)
+    {
+        if (string.IsNullOrEmpty(folder) || !Directory.Exists(folder)) return;
+        try
+        {
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo { FileName = folder, UseShellExecute = true });
+        }
+        catch
+        {
+            // ha a rendszer nem tud mappát nyitni, az útvonal a szövegben is ott van
         }
     }
 

@@ -60,6 +60,10 @@ if os.path.isfile(_h264):
     binaries.append((_h264, "."))
 
 hiddenimports = list(APP_MODULES)
+# A címkéző csomag és a hangolás a tools/ mappából (a motor "label-package" / "import-labels" / "tune-events"
+# feladatai) – felső szintű modulként kerülnek a csomagba; a szintetikus őr (eval_events / synth_match) nem,
+# a hangolás nélküle is fut.
+hiddenimports += ["cimkezo_csomag", "hangolas", "replay_events"]
 hiddenimports += collect_submodules("uvicorn")          # loops / protocols / lifespan dinamikus import
 hiddenimports += [
     "bcrypt",
@@ -90,7 +94,7 @@ if RELEASE:
 
 a = Analysis(
     [os.path.join(ROOT, "engine_launcher.py")],
-    pathex=[ROOT],
+    pathex=[ROOT, os.path.join(ROOT, "tools")],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,

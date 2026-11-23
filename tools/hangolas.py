@@ -397,9 +397,76 @@ def tune(matches, start=None, passes=2, tol_s=3.0, guard=None, guard_tol=0.02, l
     return final, base, best, changes
 
 
+def run(specs, out_path=None, start=None, passes=2, tol_s=3.0, before_s=90.0, after_s=20.0, synth_guard=True,
+        guard_tol=0.02, workers=None, min_labels=10, log=print):
+    """
+    A teljes hangolás (parancssor és a motor "tune-events" feladata is ezt hívja).
+    Visszatér: {"status": "success"|"keves_cimke"|"nincs_meccs", "message", "overrides", "elotte", "utana",
+                "valtozasok", "cimkek", "meccsek", "mentve"}.
+    """
+    t0 = time.time()
+    matches = []
+    for spec in specs:
+        m = load_match(spec)
+        m["pieces"] = crop_windows(m, before_s, after_s)
+        src = ", ".join(sorted({s["source"] for s in m["segments"]})) or "-"
+        nf = sum(len(pc["rows"]) for pc in m["pieces"])
+        fbk = m["feedback"]
+        log(f"{m['name']}: {len(fbk['items'])} ítélet, {len(fbk['missing'])} hiányzó, {len(fbk['reviewed'])} "
+            f"végignézett ablak; forrás: {src}; visszajátszás: {nf} képkocka")
+        if not m["pieces"]:
+            log("  (nincs visszajátszható szakasz a címkék körül – kimarad)")
+            continue
+        matches.append(m)
+    if not matches:
+        return {"status": "nincs_meccs", "message": "Nincs hangolható meccs (címkék + visszajátszható adat)."}
+    n_labels = sum(count_labels(m["feedback"]) for m in matches)
+    if n_labels < min_labels:
+        return {"status": "keves_cimke", "cimkek": n_labels,
+                "message": f"Még kevés a címke a hangoláshoz: {n_labels} megítélt esemény (legalább {min_labels} "
+                           f"kell). Címkézz még néhány jelenetet, és futtasd újra – addig az eddigi küszöbök maradnak."}
+    guard = None
+    if synth_guard:
+        try:
+            guard = SynthGuard()
+        except Exception as ex:   # pl. nincs numpy: őr nélkül fut
+            log(f"(szintetikus őr nélkül: {ex})")
+    final, base, best, changes = tune(matches, start, passes, tol_s, guard, guard_tol, log=log, workers=workers)
+    pick = lambda r: {k: r[k] for k in ("tp", "fp", "fn", "f1")}  # noqa: E731
+    res = {"status": "success", "overrides": final, "elotte": pick(base), "utana": pick(best),
+           "valtozasok": changes, "cimkek": n_labels, "meccsek": [m["name"] for m in matches],
+           "ido_s": round(time.time() - t0, 1), "mentve": None}
+    res["message"] = (f"Talált {base['tp']} -> {best['tp']}, kimaradt {base['fn']} -> {best['fn']}, "
+                      f"téves {base['fp']} -> {best['fp']} ({n_labels} címke alapján)")
+    if out_path:
+        payload = {"version": 1, "enabled": True,
+                   "created": datetime.datetime.now().isoformat(timespec="seconds"),
+                   "meccsek": res["meccsek"], "overrides": final, "valtozasok": changes,
+                   "eredmeny": {"elotte": res["elotte"], "utana": res["utana"]}}
+        tmp = out_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, out_path)
+        res["mentve"] = out_path
+    return res
+
+
+def feedback_matches(clips_dir):
+    """A clips mappa meccsei, amelyekhez van visszajelzés: [események-json útvonal]."""
+    out = []
+    for name in sorted(os.listdir(clips_dir)):
+        if name.startswith("feedback_") and name.endswith(".json"):
+            m = os.path.join(clips_dir, name[len("feedback_"):])
+            if os.path.isfile(m):
+                out.append(m)
+    return out
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Esemény-küszöbök hangolása az edző címkéiből (videó nélkül).")
-    ap.add_argument("meccsek", nargs="+", help="match_events_*.json (vagy meccs.json:feedback.json)")
+    ap.add_argument("meccsek", nargs="*", help="match_events_*.json (vagy meccs.json:feedback.json); üresen: a "
+                                                "--clips mappa minden visszajelzéssel rendelkező meccse")
+    ap.add_argument("--clips", default=None, help="a clips mappa (alap: a program adatmappája)")
     ap.add_argument("--ki", default=None, help="a kimeneti hangolás-fájl (alap: csak kiírás, mentés --ment-tel)")
     ap.add_argument("--ment", action="store_true", help="mentés a motor helyére (esemeny_hangolas.json)")
     ap.add_argument("--nullarol", action="store_true", help="ne a meglévő hangolásból induljon, hanem az alapból")
@@ -416,55 +483,21 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     import app_paths
+    specs = args.meccsek or feedback_matches(args.clips or app_paths.clips_dir())
     out_path = app_paths.event_tuning_path() if args.ment else args.ki
     start = {} if args.nullarol else events_mod.load_tuning(app_paths.event_tuning_path())
-    t0 = time.time()
-    matches = []
-    for spec in args.meccsek:
-        m = load_match(spec)
-        m["pieces"] = crop_windows(m, args.elotte, args.utana)
-        src = ", ".join(sorted({s["source"] for s in m["segments"]})) or "-"
-        nf = sum(len(pc["rows"]) for pc in m["pieces"])
-        fbk = m["feedback"]
-        print(f"{m['name']}: {len(fbk['items'])} ítélet, {len(fbk['missing'])} hiányzó, {len(fbk['reviewed'])} "
-              f"végignézett ablak; forrás: {src}; visszajátszás: {nf} képkocka")
-        if not m["pieces"]:
-            print("  (nincs visszajátszható szakasz a címkék körül – kimarad)")
-            continue
-        matches.append(m)
-    if not matches:
-        print("Nincs hangolható meccs.")
-        return 1
-    n_labels = sum(count_labels(m["feedback"]) for m in matches)
-    if n_labels < args.min_cimke:
-        print(f"Még kevés a címke a hangoláshoz: {n_labels} megítélt esemény (legalább {args.min_cimke} kell). "
-              f"Címkézz még néhány jelenetet, és futtasd újra – addig az eddigi küszöbök maradnak.")
-        return 0
-    guard = None
-    if not args.nincs_szint:
-        try:
-            guard = SynthGuard()
-        except Exception as ex:   # pl. nincs numpy: őr nélkül fut
-            print(f"(szintetikus őr nélkül: {ex})")
-    final, base, best, changes = tune(matches, start, args.menetek, args.tures, guard, args.szint_tures,
-                                      workers=args.szalak)
-    print(f"\nEredmény: talált {base['tp']} -> {best['tp']}, kimaradt {base['fn']} -> {best['fn']}, "
-          f"téves {base['fp']} -> {best['fp']}, F1 {base['f1']} -> {best['f1']}  ({time.time() - t0:.0f} mp)")
-    if final:
-        print("Eltérés az alapértelmezéstől: " + ", ".join(f"{k}={v}" for k, v in sorted(final.items())))
+    res = run(specs, out_path, start, args.menetek, args.tures, args.elotte, args.utana, not args.nincs_szint,
+              args.szint_tures, args.szalak, args.min_cimke)
+    if res["status"] != "success":
+        print(res["message"])
+        return 1 if res["status"] == "nincs_meccs" else 0
+    print(f"\nEredmény: {res['message']}, F1 {res['elotte']['f1']} -> {res['utana']['f1']}  ({res['ido_s']:.0f} mp)")
+    if res["overrides"]:
+        print("Eltérés az alapértelmezéstől: " + ", ".join(f"{k}={v}" for k, v in sorted(res["overrides"].items())))
     else:
         print("Az alapértelmezett küszöbök a legjobbak ezekre a címkékre.")
-    if out_path:
-        payload = {"version": 1, "enabled": True,
-                   "created": datetime.datetime.now().isoformat(timespec="seconds"),
-                   "meccsek": [m["name"] for m in matches], "overrides": final, "valtozasok": changes,
-                   "eredmeny": {"elotte": {k: base[k] for k in ("tp", "fp", "fn", "f1")},
-                                "utana": {k: best[k] for k in ("tp", "fp", "fn", "f1")}}}
-        tmp = out_path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=1)
-        os.replace(tmp, out_path)
-        print(f"Mentve: {out_path}" + ("  – a motor a következő elemzéstől ezt használja." if args.ment else ""))
+    if res["mentve"]:
+        print(f"Mentve: {res['mentve']}" + ("  – a motor a következő elemzéstől ezt használja." if args.ment else ""))
     return 0
 
 

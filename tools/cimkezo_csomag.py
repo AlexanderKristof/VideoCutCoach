@@ -134,7 +134,8 @@ def doubtful_events(data, events_path, n, log=print):
         return []
 
 
-def build(events_path, out_dir, video=None, n_random=10, pre=5.0, post=4.0, width=960, log=print, n_doubt=0):
+def build(events_path, out_dir, video=None, n_random=10, pre=5.0, post=4.0, width=960, log=print, n_doubt=0,
+          progress=None):
     with open(events_path, encoding="utf-8") as f:
         data = json.load(f)
     events = data.get("events") or []
@@ -154,6 +155,8 @@ def build(events_path, out_dir, video=None, n_random=10, pre=5.0, post=4.0, widt
         s, e = _clip_window(ev, pre, post)
         name = f"klip_{i:03d}.mp4"
         log(f"  [{i}/{len(todo)}] {LABELS.get(ev.get('type'), ev.get('type'))} @ {ev.get('time', 0):.1f} mp")
+        if progress is not None:
+            progress(i - 1, len(todo))
         cut_small(video, s, e, os.path.join(out_dir, "klipek", name), width)
         items.append({
             "id": i, "file": f"klipek/{name}", "kind": kind, "start": round(s, 2), "end": round(e, 2),
@@ -251,20 +254,10 @@ def main(argv=None):
 
 def tune_all(clips_dir=None):
     """Hangolás az összes olyan meccsből, amelyhez van visszajelzés (feedback_*.json) a clips mappában."""
-    import app_paths
     import hangolas
-    clips_dir = clips_dir or app_paths.clips_dir()
-    specs = []
-    for name in sorted(os.listdir(clips_dir)):
-        if name.startswith("feedback_") and name.endswith(".json"):
-            m = os.path.join(clips_dir, name[len("feedback_"):])
-            if os.path.isfile(m):
-                specs.append(m)
-    if not specs:
-        print("Nincs hangolható meccs (feedback_*.json + a hozzá tartozó eseményfájl).")
-        return 1
-    print(f"\nHangolás {len(specs)} meccs címkéiből…")
-    return hangolas.main(specs + ["--ment"])
+    args = ["--clips", clips_dir] if clips_dir else []
+    print("\nHangolás az eddigi címkékből…")
+    return hangolas.main(args + ["--ment"])
 
 
 PAGE = r"""<!doctype html>

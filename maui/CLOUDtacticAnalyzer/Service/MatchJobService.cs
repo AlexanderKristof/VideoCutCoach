@@ -247,7 +247,8 @@ public sealed class FeedbackData
 public sealed class FeedbackVerdict
 {
     [JsonPropertyName("key")] public string Key { get; set; } = "";
-    [JsonPropertyName("verdict")] public string Verdict { get; set; } = "";
+    [JsonPropertyName("verdict")] public string? Verdict { get; set; }
+    [JsonPropertyName("fontos")] public bool? Fontos { get; set; }
 }
 
 public sealed class FeedbackMissing
@@ -257,6 +258,7 @@ public sealed class FeedbackMissing
     [JsonPropertyName("time")] public double Time { get; set; }
     [JsonPropertyName("team")] public string? Team { get; set; }
     [JsonPropertyName("note")] public string? Note { get; set; }
+    [JsonPropertyName("fontos")] public bool? Fontos { get; set; }
 }
 
 public sealed class ExportedClip
@@ -563,6 +565,48 @@ public sealed class MatchJobService
         using var resp = await _http.PostAsync(U("/feedback"), content, ct);
         await ReadJsonAsync(resp, ct);
     }
+
+    /// <summary>"Fontos" (⭐) jelölés – az automatikus eseményre (ev) vagy a kézzel felvettre (manualId).</summary>
+    public async Task SetImportantAsync(string eventsUrl, MatchEvent ev, string? manualId, bool fontos,
+        CancellationToken ct = default)
+    {
+        object target = manualId is not null
+            ? new { id = manualId }
+            : new { type = ev.Type, time = ev.Time, team = ev.Team };
+        var body = JsonSerializer.Serialize(new { events = eventsUrl, important = new { @event = target, fontos } });
+        using var content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
+        using var resp = await _http.PostAsync(U("/feedback"), content, ct);
+        await ReadJsonAsync(resp, ct);
+    }
+
+    /// <summary>Háttérfeladat indítása a /jobs/run végponton (kind + form mezők) – a job azonosítóját adja.</summary>
+    public async Task<string> StartJobAsync(string kind, IDictionary<string, string> fields, CancellationToken ct = default)
+    {
+        var form = new Dictionary<string, string>(fields) { ["kind"] = kind };
+        using var content = new FormUrlEncodedContent(form);
+        using var resp = await _http.PostAsync(U("/jobs/run"), content, ct);
+        var root = await ReadJsonAsync(resp, ct);
+        return root.GetProperty("job_id").GetString()!;
+    }
+
+    /// <summary>Címkéző csomag (rövid részletek + offline weboldal) egy meccs eseményeiből.</summary>
+    public Task<string> StartLabelPackageAsync(string eventsUrl, int nRandom = 20, int nDoubt = 20, CancellationToken ct = default) =>
+        StartJobAsync("label-package", new Dictionary<string, string>
+        {
+            ["events_url"] = eventsUrl, ["n_random"] = nRandom.ToString(CultureInfo.InvariantCulture),
+            ["n_doubt"] = nDoubt.ToString(CultureInfo.InvariantCulture), ["background"] = "true",
+        }, ct);
+
+    /// <summary>A laptopon mentett cimkek_*.json beolvasása (tune: utána tanulás is).</summary>
+    public Task<string> StartImportLabelsAsync(string labelsPath, bool tune, CancellationToken ct = default) =>
+        StartJobAsync("import-labels", new Dictionary<string, string>
+        {
+            ["labels_path"] = labelsPath, ["tune"] = tune ? "true" : "false", ["background"] = "true",
+        }, ct);
+
+    /// <summary>Tanulás az összes eddigi jelölésből (az esemény-küszöbök hangolása).</summary>
+    public Task<string> StartTuneAsync(CancellationToken ct = default) =>
+        StartJobAsync("tune-events", new Dictionary<string, string> { ["background"] = "true" }, ct);
 
     public async Task<FeedbackMissing> AddMissingAsync(string eventsUrl, string type, double timeSec, string? team,
         CancellationToken ct = default)

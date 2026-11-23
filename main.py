@@ -1753,6 +1753,7 @@ from jobs import JobManager
 #   POST /feedback  {"events": ..., "event": {...}, "verdict": "ok"|"hamis"|""}
 #   POST /feedback  {"events": ..., "missing": {"type", "time", "team", "note"}}
 #   POST /feedback  {"events": ..., "remove_missing": "<id>"}
+#   POST /feedback  {"events": ..., "important": {"event": {...} vagy {"id": "<hiányzó id>"}, "fontos": true}}
 # ============================================================
 import feedback as _feedback
 
@@ -1778,6 +1779,10 @@ async def post_feedback(request: Request):
             item = _feedback.add_missing(CLIPS_DIR, events, m.get("type"), float(m.get("time", 0.0)),
                                          m.get("team"), m.get("note", ""))
             return {"status": "success", "item": item}
+        if body.get("important") is not None:
+            data = _feedback.set_important(CLIPS_DIR, events, body["important"].get("event") or {},
+                                           bool(body["important"].get("fontos")))
+            return {"status": "success", "feedback": data}
         if body.get("remove_missing"):
             return {"status": "success", "feedback": _feedback.remove_missing(CLIPS_DIR, events, body["remove_missing"])}
         raise ValueError("Hiányzik: event + verdict, missing vagy remove_missing.")
@@ -1933,7 +1938,91 @@ def _job_export_clips(progress, raw):
         progress_cb=lambda done, total: progress(100.0 * done / max(1, total), f"{done}/{total} klip"))
 
 
+def _tools_import(name):
+    """A tools/ mappa moduljai (címkéző csomag, hangolás) – fejlesztői és csomagolt módban is."""
+    import importlib
+    tools_dir = app_paths.resource_path("tools")
+    if os.path.isdir(tools_dir) and tools_dir not in sys.path:
+        sys.path.insert(0, tools_dir)
+    return importlib.import_module(name)
+
+
+def _events_file(raw):
+    """Az események-JSON (clips mappán belüli fájlnév) a kérésből: events_url vagy events."""
+    name = os.path.basename(str(raw.get("events_url") or raw.get("events") or "")).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+\.json", name):
+        raise ValueError("Érvénytelen eseményfájl-név.")
+    path = os.path.join(CLIPS_DIR, name)
+    if not os.path.isfile(path):
+        raise ValueError("Nincs ilyen eredményfájl.")
+    return path
+
+
+def _job_label_package(progress, raw):
+    """Címkéző csomag (tools/cimkezo_csomag.py) a clips mappába: cimkezo_<meccs>/index.html + klipek."""
+    try:
+        events_path = _events_file(raw)
+    except ValueError as ex:
+        return {"status": "error", "message": str(ex)}
+    cc = _tools_import("cimkezo_csomag")
+    stem = os.path.splitext(os.path.basename(events_path))[0]
+    out_dir = os.path.join(CLIPS_DIR, f"cimkezo_{stem}")
+    if os.path.isdir(out_dir):
+        import shutil
+        shutil.rmtree(out_dir, ignore_errors=True)
+    progress(1.0, "Kétes jelenetek keresése")
+    try:
+        cc.build(events_path, out_dir, video=raw.get("video_path") or None,
+                 n_random=int(raw.get("n_random", 20)), n_doubt=int(raw.get("n_doubt", 20)),
+                 log=lambda *_: None,
+                 progress=lambda i, n: progress(5.0 + 95.0 * i / max(1, n), f"Részletek kivágása: {i + 1}/{n}"))
+    except SystemExit as ex:      # a build SystemExit-tel jelzi a hiányzó videót
+        return {"status": "error", "message": str(ex)}
+    n = len(os.listdir(os.path.join(out_dir, "klipek"))) if os.path.isdir(os.path.join(out_dir, "klipek")) else 0
+    return {"status": "success", "folder": os.path.abspath(out_dir), "clips": n,
+            "index_path": os.path.abspath(os.path.join(out_dir, "index.html")),
+            "index_url": f"/clips/cimkezo_{stem}/index.html"}
+
+
+def _job_import_labels(progress, raw):
+    """A laptopon mentett cimkek_*.json beolvasása a visszajelzésbe (+ igény szerint hangolás)."""
+    path = raw.get("labels_path", "")
+    if not os.path.isfile(path):
+        return {"status": "error", "message": "A címkefájl nem található."}
+    cc = _tools_import("cimkezo_csomag")
+    try:
+        ok, bad, new = cc.import_labels(path, CLIPS_DIR, log=lambda *_: None)
+    except (ValueError, KeyError) as ex:
+        return {"status": "error", "message": f"A címkefájl nem olvasható: {ex}"}
+    res = {"status": "success", "ok": ok, "hamis": bad, "uj": new,
+           "message": f"Beolvasva: {ok} jó, {bad} téves/javított, {new} új esemény."}
+    if pipeline._to_bool(raw.get("tune", False)):
+        res["tuning"] = _job_tune_events(progress, raw)
+    return res
+
+
+def _job_tune_events(progress, raw):
+    """Hangolás az összes visszajelzéssel rendelkező meccs címkéiből (tools/hangolas.py), mentéssel."""
+    hg = _tools_import("hangolas")
+    specs = hg.feedback_matches(CLIPS_DIR)
+    progress(2.0, f"Hangolás {len(specs)} meccs címkéiből")
+    start = {} if pipeline._to_bool(raw.get("from_scratch", False)) else \
+        _events_mod.load_tuning(app_paths.event_tuning_path())
+    steps = {"n": 0}
+
+    def log(msg):
+        steps["n"] += 1
+        progress(min(95.0, 5.0 + steps["n"] * 1.5), str(msg)[:90])
+
+    res = hg.run(specs, out_path=app_paths.event_tuning_path(), start=start, log=log,
+                 min_labels=int(raw.get("min_labels", 10)), workers=1)
+    return res
+
+
 JOB_KINDS = {
+    "label-package": _job_label_package,
+    "import-labels": _job_import_labels,
+    "tune-events": _job_tune_events,
     "cut-raw": _job_cut_raw,
     "detect-halves": _job_detect_halves,
     "cut-match": _job_cut_match,
@@ -1944,7 +2033,8 @@ JOB_KINDS = {
 
 @app.post("/jobs/run")
 async def run_job_endpoint(request: Request):
-    """A régi végpontok háttérfeladatos változata: kind=cut-raw|detect-halves|cut-match|heatmap|export-clips + ugyanazok a form mezők."""
+    """A régi végpontok háttérfeladatos változata: kind=cut-raw|detect-halves|cut-match|heatmap|export-clips + ugyanazok
+    a form mezők; címkézés / tanulás: label-package (events_url), import-labels (labels_path, tune), tune-events."""
     raw = await _form_dict(request)
     kind = raw.get("kind", "")
     if kind not in JOB_KINDS:

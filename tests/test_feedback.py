@@ -86,6 +86,28 @@ def test_quiet_windows_count_as_false_and_dedupe():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_important_flag_survives_verdicts():
+    d = tempfile.mkdtemp()
+    try:
+        ev = {"type": "corner", "time": 300.0, "team": "team1"}
+        fb.set_important(d, URL, ev, True)                      # ítélet nélkül is megmarad
+        data = fb.load(d, URL)
+        assert data["items"][0]["fontos"] is True and data["items"][0]["verdict"] is None
+        assert fb.evaluate(data, [])["talalt"] == 0              # a mérést nem befolyásolja
+        fb.set_verdict(d, URL, ev, "ok")                         # az ítélet nem törli a jelölést
+        assert fb.load(d, URL)["items"][0]["fontos"] is True
+        fb.set_verdict(d, URL, ev, None)                         # ítélet visszavonása: a jelölés marad
+        it = fb.load(d, URL)["items"]
+        assert len(it) == 1 and it[0]["verdict"] is None and it[0]["fontos"] is True
+        fb.set_important(d, URL, ev, False)                      # se ítélet, se jelölés: törlődik
+        assert fb.load(d, URL)["items"] == []
+        m = fb.add_missing(d, URL, "cross", 400.0)
+        fb.set_important(d, URL, {"id": m["id"]}, True)
+        assert fb.load(d, URL)["missing"][0]["fontos"] is True
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     ok = 0

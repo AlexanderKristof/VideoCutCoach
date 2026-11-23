@@ -73,7 +73,14 @@ def set_verdict(clips_dir, events_url, ev, verdict, corrected_type=None, correct
         raise ValueError(f"Ismeretlen ítélet: {verdict!r} (lehet: ok, hamis)")
     data = load(clips_dir, events_url)
     key = event_key(ev)
+    prev = next((it for it in data["items"] if it.get("key") == key), None)
+    if fontos is None and prev is not None and "fontos" in prev:
+        fontos = prev["fontos"]          # az újbóli ítélet nem törli a "fontos" jelölést
     data["items"] = [it for it in data["items"] if it.get("key") != key]
+    if not verdict and fontos:
+        # ítélet nélkül, csak "fontos" jelöléssel marad meg
+        data["items"].append({"key": key, "type": ev.get("type"), "time": round(float(ev.get("time", 0.0)), 2),
+                              "team": ev.get("team"), "verdict": None, "fontos": True})
     if verdict:
         item = {"key": key, "type": ev.get("type"), "time": round(float(ev.get("time", 0.0)), 2),
                 "team": ev.get("team"), "verdict": verdict}
@@ -88,6 +95,28 @@ def set_verdict(clips_dir, events_url, ev, verdict, corrected_type=None, correct
         if fontos is not None:
             item["fontos"] = bool(fontos)
         data["items"].append(item)
+    return _save(clips_dir, events_url, data)
+
+
+def set_important(clips_dir, events_url, ev, fontos):
+    """Egy esemény "fontos" jelölése (⭐) – az ítélettől függetlenül; a hiányzó (kézzel felvett) eseményre is."""
+    data = load(clips_dir, events_url)
+    if ev.get("id"):
+        for m in data["missing"]:
+            if m.get("id") == ev["id"]:
+                m["fontos"] = bool(fontos)
+                return _save(clips_dir, events_url, data)
+        raise ValueError("Nincs ilyen kézzel felvett esemény.")
+    key = event_key(ev)
+    for it in data["items"]:
+        if it.get("key") == key:
+            it["fontos"] = bool(fontos)
+            if it.get("verdict") is None and not fontos:
+                data["items"] = [x for x in data["items"] if x is not it]
+            return _save(clips_dir, events_url, data)
+    if fontos:
+        data["items"].append({"key": key, "type": ev.get("type"), "time": round(float(ev.get("time", 0.0)), 2),
+                              "team": ev.get("team"), "verdict": None, "fontos": True})
     return _save(clips_dir, events_url, data)
 
 
