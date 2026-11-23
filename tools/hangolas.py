@@ -221,6 +221,14 @@ def label_times(feedback):
     return sorted(ts)
 
 
+def count_labels(feedback):
+    """A megítélt események száma: valódi (✓, hiányzó, javított típus) + téves (✗) + "semmi" ablakok."""
+    n = len(feedback["items"]) + len(feedback["missing"])
+    n += sum(1 for it in feedback["items"] if it.get("javitott_tipus") not in (None, "", "semmi"))
+    n += sum(1 for w in feedback["reviewed"] if w.get("label") == "semmi")
+    return n
+
+
 def labelled_types(feedbacks):
     out = set()
     for f in feedbacks:
@@ -359,9 +367,11 @@ def tune(matches, start=None, passes=2, tol_s=3.0, guard=None, guard_tol=0.02, l
                 jobs = [(matches, dict(cur, **{name: v}), tol_s) for v in cands]
                 results = pool.map(_eval_candidate, jobs) if pool is not None else [_eval_candidate(j) for j in jobs]
                 order = sorted(zip(cands, results), key=lambda cr: (-cr[1]["f1"], abs(cr[0] - now)))
+                # a minden eseményt érintő (labda-szűrő) paraméterhez erősebb bizonyíték kell
+                need = 2 if SEARCH[name][1] == "*" else 1
                 for v, r in order:
                     net = (r["tp"] - best["tp"]) - (r["fp"] - best["fp"])
-                    if not (r["f1"] > best["f1"] + 1e-9 and net >= 1):
+                    if not (r["f1"] > best["f1"] + 1e-9 and net >= need):
                         break
                     trial = dict(cur, **{name: v})
                     if guard is not None:
@@ -400,6 +410,9 @@ def main(argv=None):
     ap.add_argument("--nincs-szint", action="store_true", help="a szintetikus őr kikapcsolása")
     ap.add_argument("--szint-tures", type=float, default=0.02)
     ap.add_argument("--szalak", type=int, default=max(1, min(8, (os.cpu_count() or 2) - 1)))
+    ap.add_argument("--min-cimke", type=int, default=10,
+                    help="legalább ennyi megítélt esemény (valódi + téves) kell a hangoláshoz (alap 10) – kevés "
+                         "címkéből a hangolás a véletlenre tanulna rá")
     args = ap.parse_args(argv)
 
     import app_paths
@@ -422,6 +435,11 @@ def main(argv=None):
     if not matches:
         print("Nincs hangolható meccs.")
         return 1
+    n_labels = sum(count_labels(m["feedback"]) for m in matches)
+    if n_labels < args.min_cimke:
+        print(f"Még kevés a címke a hangoláshoz: {n_labels} megítélt esemény (legalább {args.min_cimke} kell). "
+              f"Címkézz még néhány jelenetet, és futtasd újra – addig az eddigi küszöbök maradnak.")
+        return 0
     guard = None
     if not args.nincs_szint:
         try:

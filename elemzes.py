@@ -6,6 +6,7 @@ A teljes meccs elemzése parancssorból (szerver és MAUI kliens nélkül).
     python elemzes.py MECCS.mp4 --nincs-vagas --gyors 3
     python elemzes.py MECCS.mp4 --hatterben            (laptopon: alacsony prioritás, kevés szál)
     python elemzes.py MECCS.mp4 --hatterben --szalak 2
+    python elemzes.py MECCS.mp4 --cimkezo "C:\\Users\\en\\OneDrive\\cimkezes"   (utána címkéző csomag is)
 
 Ugyanazt a folyamatot futtatja, mint a POST /jobs/analyze-match végpont (pipeline.py).
 A --help torch nélkül is működik: a modell csak az elemzés indításakor töltődik be.
@@ -64,6 +65,13 @@ def build_parser():
     p.add_argument("--kimenet-felbontas", type=float, default=1.0, metavar="ARÁNY",
                    help="az annotált elemzés-videó méretaránya (alap 1.0; pl. 0.5 = fél felbontás: 1080p helyett "
                         "960x540 – gyorsabb kódolás, kisebb fájl)")
+    p.add_argument("--cimkezo", default="", metavar="MAPPA",
+                   help="az elemzés után címkéző csomag készül ide (rövid videórészletek + offline weboldal, "
+                        "pl. a OneDrive mappába, hogy laptopon / telefonon is címkézhess)")
+    p.add_argument("--cimkezo-veletlen", type=int, default=20, metavar="N",
+                   help="a csomagba ennyi véletlen jelenet is (alap 20)")
+    p.add_argument("--cimkezo-ketes", type=int, default=20, metavar="N",
+                   help="a csomagba ennyi kétes jelenet is: amit a program majdnem jelzett (alap 20)")
     p.add_argument("--reszletes", action="store_true",
                    help="az elemző motor saját kiírásai is a képernyőre kerüljenek (alap: naplófájlba)")
     return p
@@ -235,7 +243,34 @@ def main(argv=None):
             return 1
     bar.done()
     print(pipeline.summarize(result))
+    if args.cimkezo:
+        make_label_package(result, args, out_dir)
     return 0
+
+
+def make_label_package(result, args, out_dir):
+    """Címkéző csomag az összesített eseményekből (tools/cimkezo_csomag.py) – hiba esetén csak figyelmeztet."""
+    events_path = result.get("match_events_path")
+    if not events_path or not os.path.exists(events_path):
+        print("A címkéző csomag nem készült el: nincs összesített eseményfájl.")
+        return None
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools"))
+    import cimkezo_csomag
+    target = os.path.abspath(args.cimkezo)
+    name = os.path.splitext(os.path.basename(events_path))[0]
+    if os.path.isdir(target) and os.listdir(target):
+        target = os.path.join(target, f"cimkezo_{name}")   # nem üres mappa: almappába
+    print(f"\nCímkéző csomag készül: {target}")
+    try:
+        cimkezo_csomag.build(events_path, target, video=args.video, n_random=args.cimkezo_veletlen,
+                             n_doubt=args.cimkezo_ketes, log=lambda *_: None)
+    except (Exception, SystemExit) as ex:
+        print(f"A címkéző csomag nem készült el: {ex}")
+        return None
+    print(f"Kész. Nyisd meg ezt a böngészőben (laptopon / telefonon is): {os.path.join(target, 'index.html')}\n"
+          f"A címkézés után a mentett cimkek_{name}.json fájllal ezen a gépen:\n"
+          f"    python tools\\cimkezo_csomag.py beolvas --cimkek cimkek_{name}.json --clips \"{out_dir}\" --hangol")
+    return target
 
 
 if __name__ == "__main__":

@@ -236,12 +236,35 @@ def main(argv=None):
     b = sub.add_parser("beolvas", help="a laptopon készült cimkek_*.json beolvasása")
     b.add_argument("--cimkek", required=True)
     b.add_argument("--clips", help="a clips mappa (alap: a program adatmappája)")
+    b.add_argument("--hangol", action="store_true",
+                   help="a beolvasás után a küszöbök hangolása is az összes eddigi címkéből (tools/hangolas.py), "
+                        "és mentés: a következő elemzés már ezekkel fut")
     a = ap.parse_args(argv)
     if a.cmd == "keszit":
         build(a.esemenyek, a.ki, a.video, a.veletlen, a.elotte, a.utana, a.szelesseg, n_doubt=a.ketes)
     else:
         import_labels(a.cimkek, a.clips)
+        if a.hangol:
+            return tune_all(a.clips)
     return 0
+
+
+def tune_all(clips_dir=None):
+    """Hangolás az összes olyan meccsből, amelyhez van visszajelzés (feedback_*.json) a clips mappában."""
+    import app_paths
+    import hangolas
+    clips_dir = clips_dir or app_paths.clips_dir()
+    specs = []
+    for name in sorted(os.listdir(clips_dir)):
+        if name.startswith("feedback_") and name.endswith(".json"):
+            m = os.path.join(clips_dir, name[len("feedback_"):])
+            if os.path.isfile(m):
+                specs.append(m)
+    if not specs:
+        print("Nincs hangolható meccs (feedback_*.json + a hozzá tartozó eseményfájl).")
+        return 1
+    print(f"\nHangolás {len(specs)} meccs címkéiből…")
+    return hangolas.main(specs + ["--ment"])
 
 
 PAGE = r"""<!doctype html>

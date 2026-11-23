@@ -207,3 +207,36 @@ A végén „Mentés fájlba” → `cimkek_<meccs>.json`, amit az elemző gépe
 python tools\cimkezo_csomag.py beolvas --cimkek cimkek_match_events_ab12.json
 python tools\eval_feedback.py clips\feedback_match_events_ab12.json clips\match_events_ab12.json
 ```
+
+### 7.1 Egyparancsos menet: este elemzés, reggel címkézés, utána hangolás
+
+```bat
+REM este (az asztali gépen, GPU-val) – az elemzés után a címkéző csomag is elkészül, pl. a OneDrive-ba
+python elemzes.py D:\Veo\meccs.mp4 --hatterben --cimkezo "%USERPROFILE%\OneDrive\cimkezes"
+
+REM címkézés után (bármelyik gépen, ahol a program és a clips mappa van)
+python tools\cimkezo_csomag.py beolvas --cimkek cimkek_match_events_ab12.json --clips clips --hangol
+```
+
+A csomagban háromféle jelenet van:
+
+* **esemény** – amit a program jelzett: ✓ Jó / ✗ Nem jó → mi volt valójában;
+* **🤔 kétes** – amit a program *majdnem* jelzett (engedékenyebb küszöbökkel jelezné, a normállal nem):
+  „Az volt?” – ezekből tanul a hangolás a legtöbbet;
+* **❓ véletlen** – a program itt semmit nem jelzett: mi történik? A „Nem történt semmi lényeges” is
+  értékes: azt tanítja, hol *ne* jelezzen.
+
+A **⭐ Fontos (F)** gomb azt jelöli, hogy a jelenetet látni akarod a válogatásban – ebből tanulja meg később a
+program, mi lényeges neked.
+
+**Detektor-napló.** Minden elemzés mellé egy `events_<id>.detlog.jsonl.gz` is kerül (egy 90 perces meccsnél
+kb. 8 MB): képkockánként a labda és a játékosok pálya-pozíciója, csapata, kapus-jelölése – pontosan az, amit
+az eseményfelismerő kap. Ebből a felismerés videó és GPU nélkül, másodpercek alatt újrajátszható
+(`tools/replay_events.py`), és a küszöbei a címkéidhez hangolhatók (`tools/hangolas.py`).
+
+**Hangolás** (`--hangol`, vagy külön: `python tools\hangolas.py clips\match_events_ab12.json --ment`):
+a címkék körüli szakaszokat újrajátssza, és paraméterenként kipróbálja a felismerés küszöbeit; csak azt
+a változtatást tartja meg, ami legalább egy eseménnyel javít, és a szintetikus meccsen sem ront. Legalább
+10 megítélt esemény kell hozzá. Az eredmény az `esemeny_hangolas.json` (a program adatmappájában), amit a
+motor a következő elemzéstől használ; ha rosszabb lett, a fájl törlésével (vagy `"enabled": false`)
+visszaáll az alapbeállítás.
