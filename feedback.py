@@ -6,7 +6,11 @@ clips mappában:
     {"events": "/clips/match_events_ab12.json",
      "items":   [{"key": "shot@634.20", "type": "shot", "time": 634.2, "team": "team1", "verdict": "ok"|"hamis"}],
      "missing": [{"id": "k1a2b3", "type": "gk_long_ball", "time": 642.0, "team": "team2", "note": ""}],
+     "reviewed": [{"start": 692.1, "end": 701.1, "label": "semmi", "source": "cimkezo"}],
      "updated": "2026-11-22T21:10:00"}
+
+A "reviewed" a végignézett jelenetek ablaka (a címkéző csomag klipjei): a "semmi" címkéjű ablak erős negatív
+minta – ami ott esemény, az téves –, ezért a hangolás (tools/hangolas.py) ezekből is tanul.
 
 Az ítélet az esemény típusa + ideje (key) szerint tapad – így egy újraelemzés után is összevethető
 (evaluate(): mennyi a valódi / téves / kimaradt esemény egy új eseménylistában, ±tol_s idő-tűréssel).
@@ -43,6 +47,7 @@ def load(clips_dir, events_url):
     data.setdefault("events", events_url)
     data.setdefault("items", [])
     data.setdefault("missing", [])
+    data.setdefault("reviewed", [])
     return data
 
 
@@ -88,11 +93,31 @@ def add_missing(clips_dir, events_url, typ, time_sec, team=None, note=""):
     if not typ:
         raise ValueError("Hiányzik az esemény típusa.")
     data = load(clips_dir, events_url)
-    item = {"id": uuid.uuid4().hex[:8], "type": str(typ), "time": round(float(time_sec), 2),
+    t = round(float(time_sec), 2)
+    for m in data["missing"]:   # ugyanaz kétszer (pl. a címkék újbóli beolvasása): nem duplikáljuk
+        if m.get("type") == str(typ) and abs(float(m.get("time", 0.0)) - t) < 0.05:
+            m["team"] = team or m.get("team")
+            if note:
+                m["note"] = str(note)[:200]
+            _save(clips_dir, events_url, data)
+            return m
+    item = {"id": uuid.uuid4().hex[:8], "type": str(typ), "time": t,
             "team": team or None, "note": str(note or "")[:200]}
     data["missing"].append(item)
     _save(clips_dir, events_url, data)
     return item
+
+
+def add_reviewed(clips_dir, events_url, start, end, label=None, source="cimkezo"):
+    """Egy végignézett jelenet-ablak (mp a videóban) és a címkéje ("semmi" = nem történt semmi lényeges)."""
+    data = load(clips_dir, events_url)
+    a, b = round(float(start), 2), round(float(end), 2)
+    if b <= a:
+        raise ValueError("Az ablak vége a kezdete előtt van.")
+    data["reviewed"] = [w for w in data["reviewed"]
+                        if not (abs(float(w["start"]) - a) < 0.05 and abs(float(w["end"]) - b) < 0.05)]
+    data["reviewed"].append({"start": a, "end": b, "label": label, "source": source})
+    return _save(clips_dir, events_url, data)
 
 
 def remove_missing(clips_dir, events_url, item_id):
@@ -105,11 +130,13 @@ def evaluate(feedback, events, tol_s=3.0):
     """
     Egy (akár új elemzésből származó) eseménylista összevetése a visszajelzéssel.
     Igazság: az "ok" ítéletű események + a kézzel felvett hiányzók; téves: a "hamis" ítéletűek.
-    Visszatér: {"talalt", "kimaradt", "teves_maradt", "teves_eltunt", "pontossag", "felidezes", "tipusonkent"}.
+    Visszatér: {"talalt", "kimaradt", "teves_maradt", "teves_eltunt", "teves_csendes", "pontossag", "felidezes",
+                "pontszam", "tipusonkent"}.
       talalt        – valódi eseményből ennyit megtalált (azonos típus, ±tol_s)
       kimaradt      – valódi eseményből ennyit nem talált meg
       teves_maradt  – a téves jelöltek közül ennyit most is kiad
-      pontossag     – talalt / (talalt + teves_maradt)  (csak a megítélt eseményekre!)
+      teves_csendes – ennyi eseményt ad egy "semmi" címkéjű (végignézett, eseménytelen) ablakban
+      pontossag     – talalt / (talalt + teves_maradt + teves_csendes)  (csak a megítélt eseményekre!)
       felidezes     – talalt / (talalt + kimaradt)
     """
     truth = [{"type": it["type"], "time": float(it["time"])} for it in feedback.get("items", [])
@@ -148,10 +175,24 @@ def evaluate(feedback, events, tol_s=3.0):
         if matched(t, evs, used):
             still_false += 1
             per.setdefault(t["type"], {"talalt": 0, "kimaradt": 0, "teves_maradt": 0})["teves_maradt"] += 1
+    # "semmi" ablakok: ami itt (még ki nem párosított) esemény, az téves
+    quiet = [(float(w["start"]), float(w["end"])) for w in feedback.get("reviewed", []) if w.get("label") == "semmi"]
+    in_quiet = 0
+    for i, e in enumerate(evs):
+        if i in used:
+            continue
+        if any(a <= e["time"] <= b for a, b in quiet):
+            in_quiet += 1
+            used.add(i)
+            per.setdefault(e["type"], {"talalt": 0, "kimaradt": 0, "teves_maradt": 0})["teves_maradt"] += 1
     missed = len(truth) - found
+    fp = still_false + in_quiet
     return {
         "talalt": found, "kimaradt": missed, "teves_maradt": still_false, "teves_eltunt": len(false) - still_false,
-        "pontossag": round(found / (found + still_false), 3) if (found + still_false) else None,
+        "teves_csendes": in_quiet,
+        "pontossag": round(found / (found + fp), 3) if (found + fp) else None,
         "felidezes": round(found / len(truth), 3) if truth else None,
+        # összesített pontszám (F1): a hangolás ezt maximalizálja
+        "pontszam": round(2 * found / (2 * found + fp + missed), 4) if (found + fp + missed) else None,
         "tipusonkent": per,
     }

@@ -59,6 +59,33 @@ def test_evaluate_new_event_list():
     assert r["tipusonkent"]["goal"]["teves_maradt"] == 1
 
 
+def test_quiet_windows_count_as_false_and_dedupe():
+    d = tempfile.mkdtemp()
+    try:
+        fb.add_missing(d, URL, "throw_in", 744.36)
+        fb.add_missing(d, URL, "throw_in", 744.37, "team1")      # újra-beolvasás: nem duplikál
+        fb.add_reviewed(d, URL, 692.0, 701.0, "semmi")
+        fb.add_reviewed(d, URL, 692.0, 701.0, "semmi")           # ugyanaz az ablak egyszer
+        fb.add_reviewed(d, URL, 740.0, 749.0, "throw_in")
+        data = fb.load(d, URL)
+        assert len(data["missing"]) == 1 and data["missing"][0]["team"] == "team1"
+        assert len(data["reviewed"]) == 2
+        evs = [{"type": "pass", "time": 695.0},       # "semmi" ablakban: téves
+               {"type": "throw_in", "time": 745.0},   # valódi
+               {"type": "pass", "time": 746.0},       # nem "semmi" ablak: nem számít
+               {"type": "pass", "time": 800.0}]       # nem nézett rész: nem számít
+        r = fb.evaluate(data, evs)
+        assert r["talalt"] == 1 and r["teves_csendes"] == 1 and r["kimaradt"] == 0, r
+        assert abs(r["pontossag"] - 0.5) < 1e-6 and abs(r["pontszam"] - 2 / 3) < 1e-3, r
+        try:
+            fb.add_reviewed(d, URL, 10.0, 5.0)
+            raise AssertionError("fordított ablakra hibát várunk")
+        except ValueError:
+            pass
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     ok = 0

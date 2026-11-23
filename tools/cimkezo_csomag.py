@@ -160,6 +160,10 @@ def import_labels(labels_path, clips_dir=None, log=print):
         if not v:
             continue
         when = c["start"] + float(v["pillanat"]) if v.get("pillanat") is not None else None
+        # a végignézett ablak (a "semmi" címke erős negatív minta a hangolásnak)
+        if c.get("start") is not None and c.get("end") is not None:
+            lab_t = v.get("tipus") if v.get("itelet") != "ok" else c.get("type")
+            fb.add_reviewed(clips_dir, url, c["start"], c["end"], label=lab_t, source="cimkezo")
         if c["kind"] == "esemeny":
             ev = {"type": c["type"], "time": c["time"], "team": c.get("team")}
             if v["itelet"] == "ok":

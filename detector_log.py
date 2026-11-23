@@ -158,7 +158,8 @@ def replay(path, detector_module=None, config=None, ball_filter=None):
     header, rows = read(path)
     if ball_filter is not None:
         rows = ball_filter(rows)
-    cfg = config if config is not None else detector_module.EventConfig()
+    # alapból azokkal a (hangolt) küszöbökkel, amelyekkel az eredeti elemzés futott
+    cfg = config if config is not None else detector_module.EventConfig(**(header.get("event_tuning") or {}))
     if config is None:
         cfg.team1_attacks_right = bool(header.get("team1_attacks_right", True))
     det = detector_module.EventDetector(cfg, *(header.get("pitch") or (105.0, 68.0)))

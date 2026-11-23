@@ -29,6 +29,7 @@ from database import get_db, engine
 from models import Base, User, Match
 from tactical_engine import TacticalEngine
 from events import PositioningMonitor  # kapus helyezkedési hiba (tartós eltérés)
+import events as _events_mod  # EventConfig + a hangolt küszöbök betöltése
 from pitch_filters import (build_grass_mask, foot_on_grass, CameraMotion,
                            StationaryFilter, extract_dominant_color,
                            PitchBoundary, PitchTrackSanity, KeeperGate, pitch_h_trusted)  # PÁLYAHATÁR
@@ -431,7 +432,12 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    engine_instance = TacticalEngine(team1_attacks_right=config.get("team1_attacks_right", True))
+    # HANGOLT KÜSZÖBÖK: az edző címkéiből hangolt esemény-paraméterek (tools/hangolas.py), ha van ilyen fájl
+    event_tuning = config.get("event_tuning")
+    if event_tuning is None:
+        event_tuning = _events_mod.load_tuning(app_paths.event_tuning_path())
+    engine_instance = TacticalEngine(team1_attacks_right=config.get("team1_attacks_right", True),
+                                     event_config=_events_mod.EventConfig(**(event_tuning or {})))
     # DETEKTOR-NAPLÓ: képkockánként a detektor bemenete (labda + játékosok pálya-koordinátában), hogy a valódi
     # meccsen talált / kihagyott események utólag, videó és GPU nélkül újrajátszhatók és hangolhatók legyenek.
     det_log = None
@@ -441,6 +447,7 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
             "team1_attacks_right": bool(config.get("team1_attacks_right", True)),
             "pitch": [engine_instance.pitch_length, engine_instance.pitch_width],
             "video_path": os.path.abspath(video_path), "clip_id": clip_id,
+            "event_tuning": event_tuning or {},
         })
         engine_instance.recorder = det_log if det_log.active else None
 

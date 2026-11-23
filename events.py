@@ -175,6 +175,32 @@ def _seg_dist(p, a, b):
     return math.hypot(p[0] - (ax + u * dx), p[1] - (ay + u * dy))
 
 
+def load_tuning(path):
+    """
+    A hangolt küszöbök (tools/hangolas.py -> esemeny_hangolas.json) beolvasása: {param: érték}. Hiányzó vagy
+    hibás fájlnál üres dict; ismeretlen paraméter kimarad (egy régebbi / újabb verzió fájlja sem okoz hibát).
+    """
+    import json as _json
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            data = _json.load(f)
+    except (OSError, ValueError):
+        return {}
+    over = data.get("overrides") if isinstance(data, dict) else None
+    if not isinstance(over, dict) or data.get("enabled") is False:
+        return {}
+    ref = EventConfig()
+    out = {}
+    for k, v in over.items():
+        if k == "team1_attacks_right" or not hasattr(ref, k):
+            continue
+        cur = getattr(ref, k)
+        if isinstance(cur, bool) or not isinstance(cur, (int, float)) or not isinstance(v, (int, float)):
+            continue
+        out[k] = type(cur)(v) if isinstance(cur, int) and float(v).is_integer() else float(v)
+    return out
+
+
 class EventConfig:
     """Az eseménydetektálás hangolható paraméterei. Bármelyik felülírható kulcsszavas argumentummal."""
 

@@ -158,6 +158,16 @@ def model_config_path(env=None):
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "model_config.json")
 
 
+def event_tuning_path(env=None):
+    """
+    A címkékből hangolt esemény-küszöbök (tools/hangolas.py kimenete): alkalmazás-módban az adatmappában,
+    fejlesztői módban a forrásmappában (a model_config.json mellett).
+    """
+    if app_mode(env):
+        return os.path.join(data_dir(env), "esemeny_hangolas.json")
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "esemeny_hangolas.json")
+
+
 def ensure_dirs(env=None):
     """Az írható mappák létrehozása (alkalmazás-módban az adatmappával együtt)."""
     paths = [clips_dir(env), jobs_dir(env), boards_dir(env)]
