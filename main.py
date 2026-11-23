@@ -1790,6 +1790,29 @@ async def post_feedback(request: Request):
         return JSONResponse({"status": "error", "message": str(ex)}, status_code=400)
 
 
+# AZ EDZŐ ÍZLÉSE: a ⭐ jelölésekből tanult ajánlottság (preferences.py) egy meccs eseményeire
+#   GET /importance?events=/clips/match_events_x.json -> {"model": bool, "scores": {"pass@12.30": 0.87, ...}}
+import preferences as _preferences
+
+
+@app.get("/importance")
+async def get_importance(events: str):
+    try:
+        path = _events_file({"events_url": events})
+        with open(path, encoding="utf-8") as f:
+            evs = (json.load(f) or {}).get("events") or []
+        model = _preferences.train(CLIPS_DIR)
+        if model is None:
+            return {"status": "success", "model": False, "scores": {},
+                    "message": f"Az ajánláshoz legalább {_preferences.MIN_POSITIVES} ⭐ jelölés és "
+                               f"{_preferences.MIN_NEGATIVES} megnézett, de nem ⭐ (✓) esemény kell."}
+        scores = {_feedback.event_key(e): _preferences.score_event(model, e) for e in evs}
+        return {"status": "success", "model": True, "n_pos": model["n_pos"], "n_neg": model["n_neg"],
+                "scores": scores}
+    except ValueError as ex:
+        return JSONResponse({"status": "error", "message": str(ex)}, status_code=400)
+
+
 # KAPUS MODUL: a választott csapat kapusát érintő jelenetek egy meccs-eredményből (keeper_focus.py)
 #   GET /keeper-focus?events=/clips/match_events_x.json&team=team1&moves=1&min_move=2
 import keeper_focus as _keeper_focus

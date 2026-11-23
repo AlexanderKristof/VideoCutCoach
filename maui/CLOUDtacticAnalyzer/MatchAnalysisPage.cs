@@ -22,7 +22,15 @@ public sealed class EventItem : INotifyPropertyChanged
     public string? ManualId { get; }
     public bool IsManual => ManualId is not null;
     public string Title => IsManual ? $"➕ {Event.Label}{(string.IsNullOrEmpty(Event.TeamLabel) ? "" : " – " + Event.TeamLabel)} (kézzel felvett)" : Event.Title;
-    public string Subtitle => Event.Subtitle;
+    public string Subtitle => Score is { } sc ? $"⭐ ajánlott: {sc * 100:0}%  •  {Event.Subtitle}" : Event.Subtitle;
+
+    /// <summary>Az edző ⭐ jelöléseiből tanult ajánlottság (0..1), vagy null, ha még nincs modell.</summary>
+    public double? Score
+    {
+        get => _score;
+        set { _score = value; OnChanged(); OnChanged(nameof(Subtitle)); }
+    }
+    private double? _score;
 
     public bool Selected
     {
@@ -168,6 +176,8 @@ public class MatchAnalysisPage : ContentPage
     private List<(string Label, Func<MatchEvent, bool> Match)> _typeOptions = new() { ("Minden típus", _ => true) };
     private readonly Picker _categoryFilter = new() { Title = "Kalap", TextColor = Colors.White, WidthRequest = 230 };
     private readonly CheckBox _showExperimental = new() { IsChecked = false };
+    private readonly CheckBox _recommended = new() { IsChecked = false };
+    private readonly Label _recommendedInfo = new() { TextColor = Muted, FontSize = 12, VerticalOptions = LayoutOptions.Center };
 
     public MatchAnalysisPage()
     {
@@ -177,6 +187,7 @@ public class MatchAnalysisPage : ContentPage
         RebuildCategoryOptions();
         _categoryFilter.SelectedIndexChanged += (_, _) => { RebuildTypeOptions(); ApplyFilter(); };
         _showExperimental.CheckedChanged += (_, _) => { RebuildCategoryOptions(); ApplyFilter(); };
+        _recommended.CheckedChanged += (_, _) => ApplyFilter();
         _teamFilter.ItemsSource = new List<string> { "Mindkét csapat", TeamNames.Team1, TeamNames.Team2 };
         _teamFilter.SelectedIndex = 0;
         _halfFilter.ItemsSource = new List<string> { "Teljes meccs", "1. félidő", "2. félidő" };
@@ -310,6 +321,11 @@ public class MatchAnalysisPage : ContentPage
         _resultBox.Children.Add(Row(_categoryFilter, _typeFilter, _teamFilter, _halfFilter));
         _resultBox.Children.Add(Check(_showExperimental,
             "Kísérleti események is (sikertelen passz, szerelés, labdaszerzés, beadás, labdavezetés – még bizonytalan felismerés)"));
+        _resultBox.Children.Add(Row(_recommended, new Label
+        {
+            Text = "Csak az ajánlottak, a legfontosabb elöl (a ⭐ jelöléseidből tanulva)", TextColor = Colors.White,
+            VerticalOptions = LayoutOptions.Center,
+        }, _recommendedInfo));
         _resultBox.Children.Add(Row(selectAll, selectNone, _eventCount));
         _resultBox.Children.Add(_eventList);
         _resultBox.Children.Add(_exportButton);
@@ -434,6 +450,24 @@ public class MatchAnalysisPage : ContentPage
         }
     }
 
+    /// <summary>Az ajánlottság betöltése (a ⭐ jelölésekből tanult modell); hiba / kevés jelölés esetén üres.</summary>
+    private async Task LoadImportanceAsync(string url)
+    {
+        try
+        {
+            var (scores, message) = await _api.GetImportanceAsync(url);
+            foreach (var it in _allEvents)
+                it.Score = scores is not null && scores.TryGetValue(it.Event.FeedbackKey, out var sc) ? sc : null;
+            _recommended.IsEnabled = scores is not null;
+            if (scores is null) _recommended.IsChecked = false;
+            _recommendedInfo.Text = scores is null ? (message ?? "") : "";
+        }
+        catch
+        {
+            _recommended.IsEnabled = false;
+        }
+    }
+
     private async Task ToggleImportantAsync(EventItem item)
     {
         if (_loadedEventsUrl is null) return;
@@ -442,6 +476,7 @@ public class MatchAnalysisPage : ContentPage
             await _api.SetImportantAsync(_loadedEventsUrl, item.Event, item.ManualId, !item.Fontos);
             item.Fontos = !item.Fontos;
             UpdateEventCount();
+            await LoadImportanceAsync(_loadedEventsUrl);   // a modell minden jelöléssel tanul
         }
         catch (Exception ex)
         {
@@ -736,6 +771,7 @@ public class MatchAnalysisPage : ContentPage
             }
             catch { /* régebbi motor: nincs /feedback – a lista ítéletek nélkül is használható */ }
             LoadTeamNames();
+            await LoadImportanceAsync(url);
             RebuildCategoryOptions();
             ApplyFilter();
         }
@@ -835,7 +871,14 @@ public class MatchAnalysisPage : ContentPage
             if (!type(e)) continue;
             if (team is not null && e.Team != team) continue;
             if (half != 0 && e.Half != half) continue;
+            if (_recommended.IsChecked && (item.Score ?? 0) < 0.5) continue;
             _visibleEvents.Add(item);
+        }
+        if (_recommended.IsChecked)
+        {
+            var sorted = _visibleEvents.OrderByDescending(i => i.Score ?? 0).ToList();
+            _visibleEvents.Clear();
+            foreach (var i in sorted) _visibleEvents.Add(i);
         }
         UpdateEventCount();
     }

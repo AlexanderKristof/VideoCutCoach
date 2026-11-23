@@ -579,6 +579,25 @@ public sealed class MatchJobService
         await ReadJsonAsync(resp, ct);
     }
 
+    /// <summary>
+    /// Az edző ízlése (GET /importance): a ⭐ jelölésekből tanult ajánlottság eseménykulcsonként (0..1).
+    /// Null, ha még nincs elég jelölés (Message: miért).
+    /// </summary>
+    public async Task<(Dictionary<string, double>? Scores, string? Message)> GetImportanceAsync(string eventsUrl,
+        CancellationToken ct = default)
+    {
+        using var resp = await _http.GetAsync(U($"/importance?events={Uri.EscapeDataString(eventsUrl)}"), ct);
+        if ((int)resp.StatusCode == 404) return (null, null);   // régebbi motor
+        var root = await ReadJsonAsync(resp, ct);
+        if (!root.TryGetProperty("model", out var m) || m.ValueKind != JsonValueKind.True)
+            return (null, root.TryGetProperty("message", out var msg) ? msg.GetString() : null);
+        var res = new Dictionary<string, double>();
+        if (root.TryGetProperty("scores", out var sc) && sc.ValueKind == JsonValueKind.Object)
+            foreach (var p in sc.EnumerateObject())
+                if (p.Value.TryGetDouble(out var d)) res[p.Name] = d;
+        return (res, null);
+    }
+
     /// <summary>Háttérfeladat indítása a /jobs/run végponton (kind + form mezők) – a job azonosítóját adja.</summary>
     public async Task<string> StartJobAsync(string kind, IDictionary<string, string> fields, CancellationToken ct = default)
     {
