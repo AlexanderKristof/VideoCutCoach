@@ -36,6 +36,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+import detector_log  # noqa: E402
 import events as events_mod  # noqa: E402
 
 
@@ -148,6 +149,39 @@ def replay(data, hz=None, keeper_mode="near_goal", keeper_max_line_m=25.0, team1
     return out, stats, (1000.0 * spent / max(1, nframes))
 
 
+def replay_logs(logs, config_factory=None, detector_module=None):
+    """
+    Pontos visszajátszás a detektor-naplókból (detector_log.py): [(szakasz, útvonal)] -> (események, stat).
+    config_factory: opcionális függvény (fejléc) -> EventConfig (a hangoláshoz).
+    """
+    mod = detector_module or events_mod
+    out, stats = [], {}
+    for name, path in logs:
+        header, _ = detector_log.read(path) if config_factory is not None else ({}, None)
+        cfg = config_factory(header) if config_factory is not None else None
+        evs, st, _h = detector_log.replay(path, detector_module=mod, config=cfg)
+        for ev in evs:
+            e = dict(ev)
+            e["segment"] = name or os.path.basename(path)
+            out.append(e)
+        stats[name or os.path.basename(path)] = st
+    out.sort(key=lambda e: e["time"])
+    return out, stats
+
+
+def load_input(path, use_logs=True):
+    """
+    Egy bemenet betöltése: (adat, naplók). Detektor-napló (*.detlog.jsonl.gz) közvetlenül is megadható;
+    events / match_events JSON-nál a hozzá tartozó naplók (ha vannak és use_logs), különben a mentett pályák.
+    """
+    if path.endswith(detector_log.SUFFIX):
+        return {}, [(None, path)]
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    logs = detector_log.find_logs(data, os.path.dirname(os.path.abspath(path))) if use_logs else []
+    return data, logs
+
+
 def _fmt_t(t):
     t = float(t)
     return f"{int(t // 60):02d}:{t % 60:05.2f}"
@@ -155,11 +189,13 @@ def _fmt_t(t):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Mentett pályák visszajátszása az events.py detektoron.")
-    ap.add_argument("files", nargs="+", help="events_*.json / match_events_*.json")
+    ap.add_argument("files", nargs="+", help="events_*.json / match_events_*.json / *.detlog.jsonl.gz")
     ap.add_argument("--hz", type=float, default=None, help="visszajátszási ütem (alap: a labda mentési üteme)")
     ap.add_argument("--keeper-mode", default="near_goal", choices=("near_goal", "track", "none"))
     ap.add_argument("--keeper-max-line-m", type=float, default=25.0)
     ap.add_argument("--team1-left", action="store_true", help="tartalék irány: az 1. csapat a bal kaput védi")
+    ap.add_argument("--palyakbol", action="store_true",
+                    help="a detektor-napló helyett a (ritkított) mentett pályákból játsszon vissza")
     ap.add_argument("--types", default="", help="csak ezek az eseménytípusok (vesszővel)")
     ap.add_argument("--json", default=None, help="az események mentése JSON-ba (fájlonként, statisztikával)")
     ap.add_argument("--events-json", default=None,
@@ -168,11 +204,16 @@ def main(argv=None):
     types = {s.strip() for s in args.types.split(",") if s.strip()}
     all_out = {}
     for path in args.files:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-        evs, stats, ms = replay(data, args.hz, args.keeper_mode, args.keeper_max_line_m,
-                                team1_attacks_right=not args.team1_left, timing=True)
-        print(f"\n=== {os.path.basename(path)}: {len(evs)} esemény, detektor: {ms:.3f} ms/képkocka")
+        data, logs = load_input(path, use_logs=not args.palyakbol)
+        if logs:
+            evs, stats = replay_logs(logs)
+            print(f"\n=== {os.path.basename(path)}: {len(evs)} esemény (pontos visszajátszás "
+                  f"{len(logs)} detektor-naplóból)")
+        else:
+            evs, stats, ms = replay(data, args.hz, args.keeper_mode, args.keeper_max_line_m,
+                                    team1_attacks_right=not args.team1_left, timing=True)
+            print(f"\n=== {os.path.basename(path)}: {len(evs)} esemény (a ritkított pályákból), "
+                  f"detektor: {ms:.3f} ms/képkocka")
         cnt = Counter((e["type"], e.get("team")) for e in evs)
         by_type = Counter(e["type"] for e in evs)
         for typ in sorted(by_type):

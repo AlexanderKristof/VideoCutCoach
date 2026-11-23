@@ -22,6 +22,7 @@ from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 import app_paths  # adat- és erőforrás-útvonalak (fejlesztői módban a régi relatív utak)
 import background  # háttér-mód és megszakítható ffmpeg-futtatás
+import detector_log  # a detektor bemenetének naplója (videó nélküli visszajátszás / hangolás)
 import model_manager  # súlyfájlok keresése / letöltése a models mappába
 
 from database import get_db, engine
@@ -431,6 +432,17 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
     engine_instance = TacticalEngine(team1_attacks_right=config.get("team1_attacks_right", True))
+    # DETEKTOR-NAPLÓ: képkockánként a detektor bemenete (labda + játékosok pálya-koordinátában), hogy a valódi
+    # meccsen talált / kihagyott események utólag, videó és GPU nélkül újrajátszhatók és hangolhatók legyenek.
+    det_log = None
+    if config.get("detector_log", True):
+        det_log = detector_log.DetectorLogWriter(detector_log.log_path_for(events_path), header={
+            "start_sec": float(start_sec), "end_sec": float(end_sec), "fps": float(fps),
+            "team1_attacks_right": bool(config.get("team1_attacks_right", True)),
+            "pitch": [engine_instance.pitch_length, engine_instance.pitch_width],
+            "video_path": os.path.abspath(video_path), "clip_id": clip_id,
+        })
+        engine_instance.recorder = det_log if det_log.active else None
 
     H = None
     if calib_points_str and config.get("calib_pitch_points"):
@@ -989,7 +1001,12 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
 
                 t_eng = time.perf_counter()
                 if H_cur is not None:
-                    valid_players, real_ball = engine_instance.update_tracks(frames_done, current_time_sec, raw_detections, ball_pixel, H_cur)
+                    b_st = None
+                    if ball_tracker is not None and ball_pixel is not None and last_ball_state is not None:
+                        b_st = "p" if last_ball_state.predicted else "d"
+                    valid_players, real_ball = engine_instance.update_tracks(
+                        frames_done, current_time_sec, raw_detections, ball_pixel, H_cur, ball_status=b_st,
+                        ball_conf=(last_ball_state.conf if b_st is not None else None))
                 else:
                     valid_players = raw_detections
                     real_ball = None
@@ -1116,6 +1133,14 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
 
     # Lövés/gól/kapus események lezárása és összefésülése a helyezkedési hibákkal (idő szerint rendezve)
     engine_instance.finalize(start_sec + frames_done / fps)
+    det_log_url = None
+    if det_log is not None:
+        det_log.close()
+        engine_instance.recorder = None
+        if det_log.frames > 0 and det_log.error is None:
+            det_log_url = f"/clips/{os.path.basename(det_log.path)}"
+        elif det_log.error:
+            print(f"[detektor-napló] nem menthető: {det_log.error}")
     if review is not None:
         feed_review_events()
         review.close(video_quality=quality_summary)
@@ -1142,6 +1167,9 @@ def cut_and_analyze_sync(video_path, start_sec, end_sec, dev_mode, detect_mode, 
         "ball_crop": ({"stats": ball_crops.stats, "crop_size": ball_crops.crop, "tiles": len(ball_crops.tiles)}
                       if ball_crops is not None else None),
         "team_model": team_clf.describe() if team_clf is not None else None,
+        # DETEKTOR-NAPLÓ (detector_log.py): képkockánkénti detektor-bemenet a videó nélküli visszajátszáshoz
+        "detector_log": det_log_url,
+        "detector_log_frames": det_log.frames if det_log is not None else 0,
     }
     with open(events_path, 'w', encoding='utf-8') as f:
         json.dump(analysis_payload, f, ensure_ascii=False, indent=4)

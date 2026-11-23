@@ -256,11 +256,11 @@ def make_recording_engine(main_mod, gt, oracle):
         records = []
         static_H = None
 
-        def update_tracks(self, frame_idx, timestamp, detections, ball_pos, H):
+        def update_tracks(self, frame_idx, timestamp, detections, ball_pos, H, **kw):
             if RecordingEngine.static_H is None and H is not None:
                 RecordingEngine.static_H = np.array(H)
             H_use = gt_H[frame_idx] if (oracle and frame_idx < len(gt_H)) else H
-            players, real_ball = super().update_tracks(frame_idx, timestamp, detections, ball_pos, H_use)
+            players, real_ball = super().update_tracks(frame_idx, timestamp, detections, ball_pos, H_use, **kw)
             RecordingEngine.records.append({
                 "frame": frame_idx, "ball_px": ball_pos, "real_ball": real_ball,
                 "players": [{"bbox": p["bbox"], "pitch": p.get("pitch_coords"), "team": p["team_id"],
@@ -608,6 +608,16 @@ def run_mode(main_mod, fake, gt, video, mode):
     elapsed = time.time() - t0
     with open(events_path, encoding="utf-8") as f:
         payload = json.load(f)
+    # DETEKTOR-NAPLÓ: a valódi futás naplójának visszajátszása ugyanazokat a detektor-eseményeket adja
+    import detector_log
+    logs = detector_log.find_logs(payload, os.path.dirname(events_path))
+    assert logs, "nincs detektor-napló az elemzés mellett"
+    replayed, _st, _h = detector_log.replay(logs[0][1])
+    key = lambda evs: sorted((e["type"], round(float(e["time"]), 1), e.get("team")) for e in evs)  # noqa: E731
+    own = [e for e in payload["events"] if e.get("type") != "gk_positioning_error"]
+    assert key(own) == key(replayed), ("a detektor-napló visszajátszása eltér", key(own)[:10], key(replayed)[:10])
+    print(f"Detektor-napló: {payload.get('detector_log_frames')} képkocka, "
+          f"{os.path.getsize(logs[0][1]) / 1024:.0f} KB, visszajátszás: {len(replayed)} esemény (egyezik)")
     if payload.get("timing"):
         from stage_timer import format_timing
         print("Időmérés: " + format_timing(payload["timing"]))

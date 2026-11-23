@@ -613,6 +613,11 @@ def run_match_pipeline(video_path, options=None, progress=None, funcs=None, out_
                          "event_count": len(data.get("events") or []),
                          "timing": data.get("timing"),   # PROFILOZÁS: szakaszonkénti idő (félidőnként)
                          "team1_attacks_right": cfg["team1_attacks_right"]}
+        if data.get("detector_log") and events_path:
+            # detektor-napló (detector_log.py): az events_*.json mellett, a videó nélküli visszajátszáshoz
+            log_local = os.path.join(os.path.dirname(events_path), os.path.basename(data["detector_log"]))
+            analysis[key]["detector_log"] = {"path": log_local, "url": data["detector_log"],
+                                             "frames": data.get("detector_log_frames")}
         result["analysis"] = analysis
         result["kesz_reszek"].append(f"elemzes_{key}")
         _publish(progress, result)
@@ -635,6 +640,8 @@ def run_match_pipeline(video_path, options=None, progress=None, funcs=None, out_
         # a taktikai tábla visszajátszásához: mezszínek és a félidő hossza (a meccsórához)
         "team_colors": merge_team_colors(half_data),
         "expected_half_min": opts["expected_half_min"],
+        # félidőnkénti detektor-napló (ha készült) – tools/replay_events.py, tools/hangolas.py
+        "detector_logs": {k: analysis[k]["detector_log"] for k in analysis if analysis[k].get("detector_log")},
     }
     match_events_path = os.path.join(out_dir, f"match_events_{run_id}.json")
     with open(match_events_path, "w", encoding="utf-8") as f:

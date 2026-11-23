@@ -27,15 +27,20 @@ class TacticalEngine:
         # szerelések stb. a detektor KIADOTT eseményeit számolják (korábban itt egy külön, naiv számlálás
         # futott, ami nem egyezett az eseménylistával).
         self.stats = self.event_detector.stats
+        # Opcionális detektor-bemenet napló (detector_log.DetectorLogWriter) – a valódi meccsek utólagos,
+        # videó nélküli visszajátszásához / hangolásához.
+        self.recorder = None
 
     @property
     def events(self):
         """A detektor által eddig talált események (idő szerint rendezve)."""
         return sorted(self.event_detector.events, key=lambda e: e["time"])
 
-    def set_attack_direction(self, team1_attacks_right):
+    def set_attack_direction(self, team1_attacks_right, timestamp=None):
         """Félidőnként fordítható: True esetén az 1. csapat az x=105 kapura támad."""
         self.event_detector.set_attack_direction(team1_attacks_right)
+        if self.recorder is not None and timestamp is not None:
+            self.recorder.direction(timestamp, team1_attacks_right)
 
     def finalize(self, timestamp=None):
         """A feldolgozás végén lezárja a függő eseményeket (pl. megerősítetlen védés)."""
@@ -120,7 +125,7 @@ class TacticalEngine:
             return None
         return x, y
 
-    def update_tracks(self, frame_idx, timestamp, detections, ball_pos, H):
+    def update_tracks(self, frame_idx, timestamp, detections, ball_pos, H, ball_status=None, ball_conf=None):
         current_frame_players = []
 
         for det in detections:
@@ -149,6 +154,10 @@ class TacticalEngine:
                 self.ball_trajectory.append((real_ball[0], real_ball[1], timestamp))
 
         # Esemény-detektálás minden képkockán (játékosok nélkül is: a lövés/gól a labdán múlik)
+        if self.recorder is not None:
+            self.recorder.frame(timestamp, real_ball, current_frame_players,
+                                ball_status=ball_status if real_ball is not None else None,
+                                ball_conf=ball_conf if real_ball is not None else None)
         self.event_detector.update(timestamp, real_ball, current_frame_players)
 
         return current_frame_players, real_ball
