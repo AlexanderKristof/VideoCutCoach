@@ -9,7 +9,8 @@ clips mappában:
      "reviewed": [{"start": 692.1, "end": 701.1, "label": "semmi", "source": "cimkezo"}],
      "updated": "2026-11-22T21:10:00"}
 
-A "reviewed" a végignézett jelenetek ablaka (a címkéző csomag klipjei): a "semmi" címkéjű ablak erős negatív
+A "fontos" jelző (ha van) az edző ítélete arról, hogy a jelenetet látni akarja-e a válogatásban – ebből tanulja
+később a program, mit tart az edző lényegesnek. A "reviewed" a végignézett jelenetek ablaka (a címkéző csomag klipjei): a "semmi" címkéjű ablak erős negatív
 minta – ami ott esemény, az téves –, ezért a hangolás (tools/hangolas.py) ezekből is tanul.
 
 Az ítélet az esemény típusa + ideje (key) szerint tapad – így egy újraelemzés után is összevethető
@@ -62,7 +63,7 @@ def _save(clips_dir, events_url, data):
 
 
 def set_verdict(clips_dir, events_url, ev, verdict, corrected_type=None, corrected_team=None, note=None,
-                corrected_time=None):
+                corrected_time=None, fontos=None):
     """
     Egy automatikus esemény ítélete: "ok" (valódi), "hamis" (téves), vagy None / "" (törlés).
     Téves eseménynél megadható, mi volt valójában: corrected_type (pl. "cross"; "semmi" = nem történt
@@ -84,11 +85,13 @@ def set_verdict(clips_dir, events_url, ev, verdict, corrected_type=None, correct
             item["javitott_ido"] = round(float(corrected_time), 2)
         if note:
             item["note"] = str(note)[:300]
+        if fontos is not None:
+            item["fontos"] = bool(fontos)
         data["items"].append(item)
     return _save(clips_dir, events_url, data)
 
 
-def add_missing(clips_dir, events_url, typ, time_sec, team=None, note=""):
+def add_missing(clips_dir, events_url, typ, time_sec, team=None, note="", fontos=None):
     """Az automatikából kimaradt esemény felvétele (a videó adott pillanatára)."""
     if not typ:
         raise ValueError("Hiányzik az esemény típusa.")
@@ -99,16 +102,20 @@ def add_missing(clips_dir, events_url, typ, time_sec, team=None, note=""):
             m["team"] = team or m.get("team")
             if note:
                 m["note"] = str(note)[:200]
+            if fontos is not None:
+                m["fontos"] = bool(fontos)
             _save(clips_dir, events_url, data)
             return m
     item = {"id": uuid.uuid4().hex[:8], "type": str(typ), "time": t,
             "team": team or None, "note": str(note or "")[:200]}
+    if fontos is not None:
+        item["fontos"] = bool(fontos)
     data["missing"].append(item)
     _save(clips_dir, events_url, data)
     return item
 
 
-def add_reviewed(clips_dir, events_url, start, end, label=None, source="cimkezo"):
+def add_reviewed(clips_dir, events_url, start, end, label=None, source="cimkezo", fontos=None):
     """Egy végignézett jelenet-ablak (mp a videóban) és a címkéje ("semmi" = nem történt semmi lényeges)."""
     data = load(clips_dir, events_url)
     a, b = round(float(start), 2), round(float(end), 2)
@@ -116,7 +123,10 @@ def add_reviewed(clips_dir, events_url, start, end, label=None, source="cimkezo"
         raise ValueError("Az ablak vége a kezdete előtt van.")
     data["reviewed"] = [w for w in data["reviewed"]
                         if not (abs(float(w["start"]) - a) < 0.05 and abs(float(w["end"]) - b) < 0.05)]
-    data["reviewed"].append({"start": a, "end": b, "label": label, "source": source})
+    w = {"start": a, "end": b, "label": label, "source": source}
+    if fontos is not None:
+        w["fontos"] = bool(fontos)
+    data["reviewed"].append(w)
     return _save(clips_dir, events_url, data)
 
 

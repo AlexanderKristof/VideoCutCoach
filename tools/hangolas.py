@@ -106,6 +106,68 @@ SEARCH = {
 }
 
 
+# "Engedékeny" küszöbök: ezekkel a detektor a kétes helyzeteket is jelzi – ami csak így jön elő, az a
+# "majdnem esemény" (a címkéző csomag "kétes" jelenetei: ezekből tanul a hangolás a legtöbbet).
+PERMISSIVE = {
+    "ctl_radius_m": 3.0, "ctl_min_samples": 2, "ctl_min_span_s": 0.1, "ctl_gap_s": 2.0, "ctl_max_ball_speed_mps": 11.0,
+    "pass_min_m": 4.0, "pass_max_gap_s": 6.0, "pass_max_unseen_s": 3.5, "pass_receive_s": 3.0,
+    "pass_failed_min_m": 6.0, "dribble_min_m": 6.0, "dribble_min_s": 1.0,
+    "cross_final_third_m": 40.0, "cross_min_m": 6.0, "cross_window_flight_s": 6.0, "cross_box_tol_m": 3.5,
+    "restart_launch_dist_m": 2.0, "restart_min_speed_mps": 3.0, "restart_kicker_m": 5.0,
+    "touch_zone_m": 5.0, "throw_in_still_s": 0.5, "throw_in_rest_alone_s": 1.0, "throw_in_min_dead_s": 2.0,
+    "throw_in_max_dx_m": 35.0, "corner_radius_m": 5.0, "corner_still_s": 0.6,
+    "free_kick_still_s": 1.0, "free_kick_dead_s": 2.0, "free_kick_min_players": 1, "kickoff_still_s": 0.6,
+    "shot_speed_kmh": 38.0, "shot_max_distance_m": 40.0, "shot_min_x_ratio": 0.4,
+    "min_distribution_m": 3.0, "distribution_lost_s": 5.0, "goal_kick_still_s": 0.6,
+    "sweeper_speed_mps": 3.0, "sweeper_min_line_dist_m": 10.0,
+}
+
+
+def near_misses(segments, base_overrides=None, n=20, avoid_times=(), min_gap_s=6.0, avoid_gap_s=3.0, tol_s=4.0,
+                seed=0):
+    """
+    "Majdnem események": amit az engedékeny küszöbökkel futó detektor talál, de a normál (base_overrides)
+    nem (azonos típus ±tol_s). Legfeljebb n darab, típusonként váltogatva, egymástól min_gap_s-re, a már
+    meglévő események (avoid_times) idejétől legalább avoid_gap_s-re. Visszatér: eseménylista ("kétes": True mezővel).
+    """
+    import random
+    pieces = [{"rows": seg["rows"], "t1a": seg["t1a"],
+               "end": seg.get("end") if seg.get("end") is not None else
+               max((r[1] for r in seg["rows"] if r[0] == "frame"), default=0.0)} for seg in segments]
+    normal = run_pieces(pieces, dict(base_overrides or {}))
+    loose = run_pieces(pieces, dict(base_overrides or {}, **PERMISSIVE))
+    by_type = {}
+    for e in loose:
+        if e.get("type") == "gk_positioning_error":
+            continue
+        t = float(e["time"])
+        if any(x["type"] == e["type"] and abs(float(x["time"]) - t) <= tol_s for x in normal):
+            continue
+        by_type.setdefault(e["type"], []).append(e)
+    rng = random.Random(seed)
+    for v in by_type.values():
+        rng.shuffle(v)
+    avoid = [float(t) for t in avoid_times]
+    taken = []
+    out = []
+    while len(out) < n and any(by_type.values()):
+        for typ in sorted(by_type):
+            lst = by_type[typ]
+            while lst:
+                e = lst.pop()
+                t = float(e["time"])
+                if all(abs(t - x) >= min_gap_s for x in taken) and all(abs(t - x) >= avoid_gap_s for x in avoid):
+                    ev = dict(e)
+                    ev["ketes"] = True
+                    out.append(ev)
+                    taken.append(t)
+                    break
+            if len(out) >= n:
+                break
+    out.sort(key=lambda e: float(e["time"]))
+    return out
+
+
 # ------------------------------------------------------------------ bemenet
 def _load_json(path):
     with open(path, encoding="utf-8-sig") as f:

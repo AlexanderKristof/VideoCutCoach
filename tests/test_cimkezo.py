@@ -56,6 +56,42 @@ def test_import_labels():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_import_doubtful_and_important():
+    d = tempfile.mkdtemp()
+    try:
+        lab = {"meccs": "m", "events_url": "/clips/m.json", "klipek": [
+            # kétes jelenet: "igen, az volt" -> valódi (kimaradt) esemény, fontosnak jelölve
+            {"id": 1, "kind": "ketes", "type": "throw_in", "time": 50.0, "start": 47.0, "end": 55.0, "team": "team2",
+             "cimke": {"itelet": "ok", "fontos": True}},
+            # kétes jelenet: "nem, semmi" -> csak a végignézett "semmi" ablak (negatív minta)
+            {"id": 2, "kind": "ketes", "type": "pass", "time": 90.0, "start": 88.0, "end": 93.0, "team": "team1",
+             "cimke": {"itelet": "hamis", "tipus": "semmi", "fontos": False}},
+            # csak "fontos" jelölés ítélet nélkül
+            {"id": 3, "kind": "esemeny", "type": "shot", "time": 120.0, "start": 116.0, "end": 124.0,
+             "cimke": {"fontos": True}},
+        ]}
+        p = os.path.join(d, "cimkek.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(lab, f)
+        assert cc.import_labels(p, d, log=lambda *_: None) == (0, 0, 1)
+        data = fb.load(d, lab["events_url"])
+        assert data["items"] == []
+        m = data["missing"][0]
+        assert m["type"] == "throw_in" and m["time"] == 50.0 and m["team"] == "team2" and m["fontos"] is True
+        rev = {(w["start"], w["label"]): w for w in data["reviewed"]}
+        assert rev[(88.0, "semmi")]["fontos"] is False and rev[(116.0, None)]["fontos"] is True
+        assert rev[(47.0, "throw_in")]["fontos"] is True
+        # a "semmi" ablakban talált passz téves, a bedobás valódi
+        r = fb.evaluate(data, [{"type": "pass", "time": 90.5}, {"type": "throw_in", "time": 51.0}])
+        assert r["talalt"] == 1 and r["teves_csendes"] == 1, r
+        # újbóli beolvasás: nem duplikál
+        cc.import_labels(p, d, log=lambda *_: None)
+        data = fb.load(d, lab["events_url"])
+        assert len(data["missing"]) == 1 and len(data["reviewed"]) == 3
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     ok = 0
