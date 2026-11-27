@@ -5,7 +5,8 @@
   állványos kamera, kapu mögötti kamera; felnőtt amatőr, utánpótlás nagypályán, kispálya / gyerek, futsal.
 * **Első eladható változat: Veo + nagypálya, Kapus mód.** A többi kamera és pályatípus utána.
 * Kapu mögötti kamera: most nincs felvétel, később lesz.
-* Vásárlói gép: még nyitott (laptop GPU nélkül / erős PC / felhő) – mindhárom maradjon lehetséges.
+* Vásárlói gép: **laptop is menjen** (videókártya nélkül lassabban, GPU-val gyorsan); felhő nem (a videók az
+  edző gépén maradnak).
 * Nyelv: magyar + angol; könnyen fordítható felépítés (további nyelvek később).
 * Pályaméret és félidőhossz: **az edző választja** (nagypálya, 9v9, 7v7, futsal / korosztály) – ebből tudja a
   program a méreteket.
@@ -21,6 +22,8 @@
 * **Kapusok:** a program megkeresi a 2 kapust, megmutatja, az edző megerősíti / rákattint a jóra.
   **Az edző választ: 1. kapus / 2. kapus / mindkettő** (egy kapus gyorsabb).
   Kapuscsere (pl. félidőben): **egynek számít** („a csapat kapusa”).
+  Ha nem talál biztosan kapust, **mind a három mód** elérhető: több jelölt képe (választás), rákattintás egy
+  képkockán, kapusmez színének megadása palettáról.
 * **Csak a kapusos jelenetekkel dolgozik** (gyorsítás). **Kapusos jelenet szabálya** (egyeztetve):
   1. **minden, amiben a kapus a labdához ér – bárhol a pályán** (felszabadítás, söprögetés a félpályán is);
   2. amikor **a labda a kapus közelében** van;
@@ -66,8 +69,19 @@
 * Válogatás: **kalaponként külön fájl ÉS egy összesített** (fejezetekkel), csapatonként.
 * Statisztika alapból: passzok térfelenként (sikeres / sikertelen, előre adott); befejezések; rögzített
   helyzetek és kimenetük; labdavesztés / -szerzés pályatérképen.
+* Bontás: **félidőnként**, **csapatonként egymás mellett**, **pályatérképen** (hol történtek).
 * Riport: a programban egy lapon (kattintható: a számra kattintva lejátssza a jeleneteket), PDF, Excel / CSV.
+  PDF: fejléc (csapatok, dátum, eredmény, logó), számok táblázatban, pályarajzok (lövés-, labdavesztés-,
+  hőtérkép), képkockák a ⭐ jelenetekből az edző rajzaival.
+* Több meccs összesítése (szezon, fejlődés): később.
 * Nevek: csapatnevek (+ kapusok neve); játékosonkénti azonosítás (mezszám) később.
+
+## Meccsadatok, csapatok, mentés
+* Meccsadatok (csapatok, dátum, korosztály / pályatípus, félidőhossz): **utólag, ha kell** – az elemzés azonnal
+  indulhat.
+* **Csapatprofilok lenyíló listából:** a program rákérdez, és elmenti az eddigi csapatokat (név, logó, mezszín,
+  kapusok), legközelebb csak ki kell választani.
+* Eredmények mentése: **mindig megkérdezi**, hova.
 
 ## Adatok és tanulás
 * **A videók csak az edző gépén maradnak**; csak az edző tölti fel, ha akarja.
