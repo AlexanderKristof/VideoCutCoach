@@ -21,12 +21,23 @@
 * **Kapusok:** a program megkeresi a 2 kapust, megmutatja, az edző megerősíti / rákattint a jóra.
   **Az edző választ: 1. kapus / 2. kapus / mindkettő** (egy kapus gyorsabb).
   Kapuscsere (pl. félidőben): **egynek számít** („a csapat kapusa”).
-* **Csak a kapusos jelenetekkel dolgozik** (gyorsítás). Kapusos jelenet:
-  * a kapus hozzáér a labdához (védés, elkapás, kirúgás, kidobás, passz, kifutás);
-  * lövés / beadás a kapujára (akkor is, ha nem ér hozzá);
-  * támadás a kapuja előtt (labda kb. 30 m-en belül);
-  * kapus-mozgás – **finomítandó**: nem csak a > 2 m mozgás, hanem az is, ha a helyzet mozgást kívánt volna,
-    és nem mozdult.
+* **Csak a kapusos jelenetekkel dolgozik** (gyorsítás). **Kapusos jelenet szabálya** (egyeztetve):
+  1. **minden, amiben a kapus a labdához ér – bárhol a pályán** (felszabadítás, söprögetés a félpályán is);
+  2. amikor **a labda a kapus közelében** van;
+  3. **a végkimenet alapján visszafelé:** ha a támadás góllal, lövéssel vagy a 16-oson belülre érkező labdával
+     (beadás, szabadrúgás az ellenfél térfeléről, mélységi labda) végződött, a támadás eleje is bekerül –
+     **nem számít, mozdult-e a kapus**; az edző dönti el, jól döntött-e (ment / maradt);
+  4. **inkább több, „?” jellel, mint kevesebb.**
+  * A > 2 m mozgás NEM feltétel (lehet, hogy éppen a nem-mozdulás a lényeg).
+  * Ritka, eredmény nélküli helyzet (pl. 40 m-es lövőcsel, jól reagált): **az edző veszi fel kézzel**
+    („➕ Jelenet ide”); ha gyakran felvesz ilyet, a program megtanulja és ajánlja.
+* **Labdakihozatal** (a kapustól VAGY a védőktől indul – kapus módba akkor, ha a kapus is részt vesz a
+  passzláncban). Kimenet:
+  * **sikeres:** passzokkal legalább a félpályáig / az ellenfél térfeléig jut;
+  * **labdatartás:** nálunk marad, de nem jut előre – a jelenet addig tart, amíg el nem jut a félpályáig vagy
+    el nem veszti (nincs időkorlát);
+  * **labdavesztés:** az ellenfélnél köt ki → még pár mp (kb. 5) a reakcióig (visszatámadás / védekezés);
+    ha helyzet / lövés lesz belőle, addig.
 * **Jelenet-ablak: típusonként más** (pl. lövés 6 mp előtte + 3 utána; kirúgás 2 + 6), beállítható.
 * **Kalapok:** védések + kapott gólok; beadások, szögletek; labdakihozatal; kifutások, 1 az 1 elleni; egyéb.
 * **Bizonytalan jelenet: bekerül, „?” jellel** (inkább egy felesleges, mint egy kimaradt).
@@ -36,7 +47,8 @@
   a videó.
 * **Kimenet kapusonként:** válogatás kalapokba; egy hosszú videó időrendben; kapus-statisztika
   (**opció, bepipálható**): védések / kapott gólok, beadások kezelése, labdakihozatal (rövid / hosszú, kézzel /
-  lábbal, csapatnál maradt-e), kifutások + távolságok / hőtérkép.
+  lábbal; sikeres / labdatartás / labdavesztés), kifutások + távolságok / hőtérkép.
+* A jelenetek között nincs átmenet (egymás után); az eredeti hang marad, opcióként kikapcsolható.
 
 ## Szerkesztő (a vágás után; minden döntés az edzőé, a program nem rajzol magától)
 * Idősáv címkékkel; jelenet törlése / szélének húzása.
