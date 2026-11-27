@@ -128,3 +128,16 @@
   hibajelentés gomb (napló, videó nélkül), automatikus frissítés.
 * Határidő: nincs – inkább legyen jó, mint gyors.
 * **Termék neve: VideoCutCoach** (egy helyen átírható legyen).
+
+## Hosszanti (kapu fölötti) kamera – később
+* A kapus-elemzéshez a **kapu mögött, magasan (4–6 m+)** álló, a pályát hosszában látó kamera a legjobb
+  (szögzárás, fellépés, lábmunka a kapus szemszögéből); álló kamera → egyszeri kalibráció, pontosabb.
+* Térfélcsere: a program **a kiválasztott kapust mindkét félidőben követi** (csapat / mezszín alapján).
+  Három szint (béta-útmutatóba is):
+  * **áthelyezés nélkül, 1080p:** a távoli félidő durva (gól, támadás a kapu előtt, nagy kifutások; „?” jellel,
+    bővebb ablakkal, a szerkesztő felajánlja a nagyítást);
+  * **áthelyezés nélkül, 4K:** közepes (gól, lövés, kifutás jól; technika nem);
+  * **szünetben áthelyezve / két kamera:** pontos mindkét félidőben.
+* Ha van Veo-felvétel is: a program szinkronizálja, a távoli félidőhöz azt használja.
+* Ajánlott kamera: 4K (vagy jobb), 50 fps, nagy látószög halszem-torzítás nélkül, rögzített (nem követő)
+  kép, kikapcsolt képstabilizálás, magas állvány / rúd, a kép közepén a kapu, a vonalak látszódjanak.
