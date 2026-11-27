@@ -98,3 +98,33 @@
 4. **Meccs elemzés:** opció-lista, válogatások (külön + összesített), riport (lap, PDF, CSV).
 5. Később: angol nyelv, más kamerák (kapu mögötti, telefon), kisebb pályák / futsal, felhő vagy laptop-mód,
    feltöltés, mezszám.
+
+## Részletek (harmadik kérdéskör)
+### Kapus mód felülete
+* Jelenetlista: **kártyák kis képpel** (típus, meccsidő, ✓ / ✗ / ⭐ / „?”), kattintásra lejátszás.
+* Szűrés: **kalap szerint**.
+* Kapus kijelölése: **gyors előkeresés után, az elemzés elején** (1–2 perc), utána felügyelet nélkül fut.
+* Sebesség: **Gyors / Kiegyensúlyozott / Pontos**, mellette becsült idő az adott gépen.
+
+### Szerkesztő
+* Kimerevítés alapból **3 mp** (állítható).
+* Rajz: szín és vastagság, szaggatott nyíl (futás), terület kiemelése (átlátszó zóna), reflektor.
+* Nagyítás: **opció, az edző jelöli ki** a területet.
+* Projekt **automatikus mentéssel**, visszavonással (Ctrl+Z), később újra megnyitható és exportálható.
+
+### Export
+* Felbontás választható, alap: **eredeti** (1080p / 720p is).
+* Telefonos változat: **opció**, az edző választja (Messenger / WhatsApp méretkorlát vagy minőség + link).
+* Logó: helye, mérete, átlátszósága **választható**.
+* Fájlnév: **Dátum_Csapatok_Tartalom** (pl. 2026-11-28_FCValami-Ellenfel_Kapus1_Vedesek.mp4).
+
+### Tanítás, béta, név
+* A nagy címkézés a fejlesztő feladata; a vásárlóknak csak a ✓ / ✗ / ⭐ opció.
+* Címkéző csomag: **minden jelölt + kétes + véletlen jelenet**, a **kapusos jelenetek elöl**; a haladás
+  mentődik, bármikor félbehagyható és folytatható.
+* Felvételek a tanításhoz: saját csapat (klub engedélyével) + nyilvános Veo-meccsek (tanításhoz érdemes a
+  klubtól engedélyt kérni, főleg utánpótlásnál).
+* Béta-tesztelők (van néhány edző): egyszerű telepítő (setup.exe, Python nélkül), rövid útmutató,
+  hibajelentés gomb (napló, videó nélkül), automatikus frissítés.
+* Határidő: nincs – inkább legyen jó, mint gyors.
+* **Termék neve: VideoCutCoach** (egy helyen átírható legyen).
